@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpic-eval"
+version = "0.1.0"
+description = "Image generation evaluation metrics"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "torch",
+    "torchvision",
+    "tqdm",
+    "Pillow",
+    "requests",
+]
+
+[project.optional-dependencies]
+all = [
+    "tensorflow",
+]
+
+[project.scripts]
+gpic-eval = "gpic_eval.__main__:main"
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["gpic_eval", "gpic_eval.*"]

@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html>
+<meta property='og:title' content="PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss"/>
+<meta property='og:description' content="PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss"/>
+<meta property='og:url' content='https://Zehong-Ma.github.io/PixelGen/'/>
+<meta property='og:image:width' content='1200' />
+<meta property='og:image:height' content='663' />
+<!-- TYPE BELOW IS PROBABLY: 'website' or 'article' or look on https://ogp.me/#types -->
+<meta property="og:type" content='website'/>
+<head>
+  <meta charset="utf-8">
+  <meta name="description"
+        content="PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss">
+  <meta name="keywords" content="PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss</title>
+
+  <link rel="stylesheet" href="./static/css/bulma.min.css">
+  <link rel="stylesheet" href="./static/css/bulma-carousel.min.css">
+  <link rel="stylesheet" href="./static/css/bulma-slider.min.css">
+  <link rel="stylesheet" href="./static/css/tab_gallery.css">
+  <link rel="stylesheet" href="./static/css/fontawesome.all.min.css">
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+  <link rel="stylesheet" href="./static/css/index.css">
+  <link rel="icon" href="./static/images/favicon.svg">
+  <link rel="stylesheet" href="juxtapose/css/juxtapose.css">
+
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+  <script defer src="./static/js/fontawesome.all.min.js"></script>
+  <script src="./static/js/bulma-carousel.min.js"></script>
+  <script src="./static/js/bulma-slider.min.js"></script>
+  <script src="./static/js/index.js"></script>
+  <script src="./static/js/magnifier.js"></script>
+  <link href="https://fonts.cdnfonts.com/css/menlo" rel="stylesheet">
+  <link rel="stylesheet" href="./static/css/image_card_fader.css">
+  <link rel="stylesheet" href="./static/css/image_card_slider.css">
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css?family=Patrick+Hand|Google+Sans|Noto+Sans|Castoro|Lato|Open+Sans&effect=shadow-multiple|emboss|3d"> 
+  <link rel="icon" href="./static/images/clock.png" type="image/x-icon">
+  <link rel="shortcut icon" href="./static/images/clock.png" type="image/x-icon">
+  <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+
+<style>
+  @import url('https://fonts.cdnfonts.com/css/menlo');
+
+  .video-table td, .video-table th {
+    padding-top: 2px;
+    padding-bottom: 2px;
+    padding-left: 4px;
+    padding-right: 4px;
+    font-weight: normal;
+  }
+  .first-col {
+    width: 7%;
+    vertical-align: middle;
+  }
+  .other-col {
+    width: 31%;
+  }
+  body {
+    font-family: "Lato", sans-serif;
+    font-size: 1.1em;
+  }
+  .title.is-3 {
+    font-weight: 900;
+    font-size: 2.0rem;
+  }
+  .title.is-4 {
+    font-weight: 700;
+    font-size: 1.7rem;
+  }
+  .custom-emoji {
+    width: 1em;
+    height: 1em;
+    display: inline-block;
+    background-image: url('./static/images/clock.png');
+    background-size: cover;
+    vertical-align: middle;
+    line-height: 1;
+}
+
+</style>
+
+
+<body>
+
+  <section class="hero is-small">
+  <div class="hero-body">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column has-text-centered">
+          <br><br>
+          <h1 class="title is-2 publication-title" style="font-size: 2.15rem">
+            PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss
+          </h1>
+        
+          <div class="is-size-5 publication-authors">
+            <span class="author-block">
+              <a href="https://zehong-ma.github.io/" target="_blank">Zehong Ma</a><sup>1</sup>,&nbsp;
+            </span>
+            <span class="author-block">
+              <a href="https://xuruihan.github.io/" target="_blank">Ruihan Xu</a><sup>1</sup>,&nbsp;
+            </span>
+            <span class="author-block">
+              <a href="https://www.pkuvmc.com/" target="_blank">Shiliang Zhang</a><sup>1</sup><sup>*</sup>,&nbsp;
+            </span>
+          </div>
+
+          <div class="is-size-5 publication-authors">
+            <span class="author-block"><sup>1</sup>State Key Laboratory of Multimedia Information Processing, School of Computer Science,&nbsp;</span>
+            <span class="author-block">Peking University&nbsp;</span>
+          </div>
+
+          <!-- <div class="is-size-5 publication-venue">
+            in XXX
+          </div> -->
+
+          <div class="column has-text-centered">
+            <div class="publication-links">
+              <!-- Code Link. -->
+              <span class="link-block">
+                <a href="https://github.com/Zehong-Ma/PixelGen" target="_blank"
+                   class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                      <i class="fab fa-github"></i>
+                  </span>
+                  <span>Code</span>
+                  </a>
+              </span>
+              <!-- paper -->
+              <span class="link-block">
+                <a href="https://arxiv.org/pdf/2602.02493" class="external-link button is-normal is-rounded is-dark" target="_blank">
+                  <span class="icon">
+                      <i class="fas fa-file-pdf"></i>
+                  </span>
+                  <span>Paper</span>
+                </a>
+              </span>
+              <span class="link-block">
+                <a href="https://dd0d187fc54e4b00ee.gradio.live" target="_blank"
+                   class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                      &#129303;
+                  </span>
+                  <span>Demo</span>
+                </a>
+              </span>
+              <!-- bibtex -->
+              <span class="link-block">
+                <a href="#bibtex"
+                   class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                      <i class="ai ai-obp"></i>
+                  </span>
+                  <span>BibTex</span>
+                </a>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+
+
+  <!-- Teaser video-->
+  <section class="hero teaser">
+    <div class="hero-body">
+      <div class="container is-max-desktop">
+        <div class="content has-text-centered">
+          <img src="./static/images/t2i_vis1.jpg" style="width: 100%;"><br>
+          <span style="font-size: 0.8em; width: 100%; display: inline-block;">Figure 1: Visualization of images generated by our PixelGen. All images are at a 512x512 resolution. </span>
+        </div>
+      </div>
+      <!-- </div> -->
+    </div>
+  </section>
+  <!-- End teaser video -->
+
+  <!-- Paper abstract -->
+  <section class="section hero is-light">
+    <div class="hero-body">
+      <div class="container is-max-desktop is-centered has-text-centered">
+        <!-- <div class="columns is-centered has-text-centered"> -->
+        <!-- <div class="column is-four-fifths"> -->
+        <h2 class="title is-3">Abstract</h2>
+        <!-- <h2 class="title is-3">Abstract</h2> -->
+        <div class="content has-text-justified">
+          <p>
+            Pixel diffusion generates images directly in pixel space in an end-to-end manner, avoiding the artifacts and bottlenecks introduced by VAEs in two-stage latent diffusion. However, it is challenging to optimize high-dimensional pixel manifolds that contain many perceptually irrelevant signals, leaving existing pixel diffusion methods lagging behind latent diffusion models. We propose <b><span style="color: blue;">PixelGen</span></b>, a simple pixel diffusion framework with perceptual supervision. Instead of modeling the full image manifold, PixelGen introduces two complementary perceptual losses to guide diffusion model towards learning a more meaningful perceptual manifold. An LPIPS loss facilitates learning better local patterns, while a DINO-based perceptual loss strengthens global semantics. With perceptual supervision, PixelGen surpasses strong latent diffusion baselines. It achieves an FID of 5.11 on ImageNet-256 without classifier-free guidance using only 80 training epochs, and demonstrates favorable scaling performance on large-scale text-to-image generation with a GenEval score of 0.79. PixelGen requires no VAEs, no latent representations, and no auxiliary stages, providing a simpler yet more powerful generative paradigm.
+          </p>
+        </div>
+        <!-- </div> -->
+        <!-- </div> -->
+      </div>
+    </div>
+  </section>
+  <!-- End paper abstract -->
+
+
+  
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered">
+      <div class="column is-full-width">
+        <!-- <h2 class="title is-3">Frequency-PixelGenupled Pixel Diffusion (PixelGen)</h2> -->
+        <h2 class="title is-4">Motivation</h2>
+        <div class="content has-text-justified">
+          <p>
+            It is challenging to optimize high-dimensional pixel manifolds that contain many perceptually irrelevant signals, leaving existing pixel diffusion methods lagging behind latent diffusion models. We introduce PixelGen, a simple pixel diffusion framework with perceptual loss. <b><span style="color: blue;">Instead of modeling the full image manifold, PixelGen introduces two complementary perceptual losses to guide diffusion model towards learning a more meaningful perceptual manifold.</span></b> An LPIPS loss facilitates learning better local patterns, while a DINO-based perceptual loss strengthens global semantics. 
+          </p>
+          
+          <div class="content">
+            <img src="./static/images/intro.jpg" style="width: 100%;"><br>
+            <span style="font-size: 0.8em; width: 100%; display: inline-block;">Figure 2: This work shows that pixel diffusion with perceptual loss outperforms latent diffusion. (a) A traditional two-stage latent diffusion denoises in the latent space, which is influenced by the artifacts of the VAE. (b) PixelGen introduces perceptual loss to encourage the diffusion model to focus on the perceptual manifold, enabling the pixel diffusion to learn a meaningful manifold rather than the complex full image manifold. (c) PixelGen outperforms the latent diffusion models using only 80 training epochs on ImageNet without CFG.</span>
+          </div>
+        </div>
+        
+        <h2 class="title is-4">Illustration of Perceptual Manifold</h2>
+        <div class="content has-text-centered">
+          <div class="content">
+            <img src="./static/images/manifold.jpg"  style="width: 50%; display: block; margin: 0 auto;"><br>
+            <span style="font-size: 0.8em; width: 75%; display: inline-block;">Figure 3: Illustration of different manifolds within the pixel space. The image manifold is a large manifold containing both perceptually significant information and imperceptible signals. The perceptual manifold contains perceptually important signals, providing a better target for pixel space diffusion. P-DINO and LPIPS are the two complementary perceptual supervision utilized in PixelGen.</span>
+          </div>
+        </div>
+
+        <h2 class="title is-4">Implementation</h2>
+        <div class="content has-text-justified">
+          <p>
+            We propose PixelGen, a simple yet effective pixel diffusion framework with perceptual supervision. PixelGen directly operates in the pixel domain without relying on latent representations, VAEs, or auxiliary stages. Following the x-prediction paradigm, the diffusion model predicts clean images instead of noise or velocity. To retain the benefits of flow matching, the predicted image is converted into velocity, resulting in a flow-matching objective.
+            PixelGen focuses on the perceptual manifold rather than the full image manifold. To this end, we introduce two complementary perceptual losses. An LPIPS loss emphasizes local textures and fine-grained details, while a Perceptual DINO (P-DINO) loss aligns global semantics using patch-level features from a frozen DINOv2 encoder.
+          </p>
+          <div class="content has-text-centered">
+            <img src="./static/images/method.jpg"  style="width: 55%; display: block; margin: 0 auto;"><br>
+            <span style="font-size: 0.8em; width: 75%; display: inline-block;">Figure 4: Overview of PixelGen. The diffusion model directly predicts the image x instead of velocity or noise to simplify the prediction target. A flow-matching diffusion loss is retained to keep the advantages of flow matching via velocity conversion. Two complementary perceptual losses are introduced to encourage the diffusion model to focus on the perceptual manifold.</span>
+          </div>
+        </div>
+
+        <h2 class="title is-4">Empirically Analysis</h2>
+        <div class="content has-text-justified">
+          <p>
+            Perceptual supervision improves pixel diffusion by enhancing local details and global semantics. Starting from the JiT baseline, we progressively introduce the LPIPS loss and the P-DINO loss. As shown in Figure 5, the baseline model produces blurry images with weak structural consistency. After adding the LPIPS loss, local textures become sharper, and fine details are better preserved. This indicates that LPIPS effectively emphasizes perceptually important local patterns. When the P-DINO loss is further introduced, the generated images exhibit improved global structure and better semantics. These qualitative improvements are supported by quantitative results. The baseline model achieves an FID of 23.67 on ImageNet without classifier-free guidance. With LPIPS loss, the FID decreases to 10.00. After adding the P-DINO loss, it further drops to 7.46. This confirms that LPIPS and P-DINO provide complementary supervision. LPIPS focuses on local perceptual fidelity, while P-DINO enhances global semantics. Together, they guide the diffusion model toward a perceptually meaningful manifold.
+          </p>
+          <div class="content has-text-centered">
+            <img src="./static/images/empirical_vis.jpg"  style="width: 50%; display: block; margin: 0 auto;"><br>
+            <span style="font-size: 0.8em; width: 60%; display: inline-block;">Figure 5: Effectiveness of perceptual supervision in PixelGen. LPIPS and P-DINO losses are progressively added to a baseline pixel diffusion model. The LPIPS loss improves local texture fidelity, while P-DINO further enhances global semantics.
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered">
+      <div class="column is-full-width">
+        <h2 class="title is-3">Evaluations</h2>
+        <h2 class="title is-4">Quantitative Results</h2>
+        <div class="content has-text-centered">
+          <img src="./static/images/ablation_result.jpg", style="width: 50%;">
+          <br>
+          <br>
+          <img src="./static/images/imagenet_results.jpg", style="width: 100%;">
+          <br>
+          <br>
+          <img src="./static/images/t2i_results.jpg", style="width: 100%;">
+        </div>
+
+        <h2 class="title is-4">Qualitative Results</h2>
+        <div class="content has-text-centered">
+          <img src="./static/images/t2i_vis2.jpg", style="width: 80%;">
+          <span style="font-size: 0.8em; width: 80%; display: inline-block;">Figure 6: More Qualitative results of text-to-image generation at a 512x512 resolution. Our PixelGen supports multiple languages with the Qwen3 text encoder, such as Chinese and English.
+          </span>
+          <br>
+          <br>
+          <img src="./static/images/c2i_vis1.jpg", style="width: 80%;">
+          <span style="font-size: 0.8em; width: 80%; display: inline-block;">Figure 7: Qualitative results of class-to-image generation at a 256x256 resolution.
+          </span>
+          <br>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="BibTeX">
+  <div class="container is-max-desktop content">
+    <h2 class="title"><a id="bibtex">BibTeX</a></h2>
+    <pre><code>@misc{ma2025PixelGenfrequencyPixelGenupledpixeldiffusion,
+      title={PixelGen: Pixel Diffusion Beats Latent Diffusion with Perceptual Loss}, 
+      author={Zehong Ma and Ruihan Xu and Shiliang Zhang},
+      year={2025},
+      eprint={2602.02493},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2602.02493}, 
+    }</code></pre>
+  </div>
+</section>
+
+
+<footer class="footer">
+    <div class="columns is-centered">
+      <div class="column is-8">
+        <div class="content">
+          <p>
+            This website is licensed under a <a rel="license"
+                                                href="http://creativecommons.org/licenses/by-sa/4.0/">Creative
+            Commons Attribution-ShareAlike 4.0 International License</a>.
+          </p>
+          <p>
+            Website adapted from the following <a href="https://nerfies.github.io">source code</a>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</footer>
+
+
+<script src="juxtapose/js/juxtapose.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/popper.js@1.12.9/dist/umd/popper.min.js" integrity="sha384-ApNbgh9B+Y1QKtv3Rn7W3mgPxhU9K/ScQsAP7hUibX39j7fakFPskvXusvfa0b4Q" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@3.3.7/dist/js/bootstrap.min.js"></script>    
+
+</body>
+</html>
