@@ -18,6 +18,10 @@ export TORCHINDUCTOR_CACHE_DIR=$WC/cache/inductor/gpic
 export TRITON_CACHE_DIR=$WC/cache/triton/gpic
 export WANDB_DIR=$WC/runs/gpic-speed/wandb
 export WANDB_PROJECT=gpic-speed
+# wandb >= 0.31 defaults to api.forge.coreweave.com, which proxy does not allow (w826 hung in init, 2026-11-01).
+export WANDB_BASE_URL=https://api.wandb.ai
+# proxy passes metrics but not file uploads (memory: reference_h100_wandb_proxy_uploads)
+export WANDB_IGNORE_GLOBS='*' WANDB_DISABLE_CODE=true WANDB_CONSOLE=off WANDB_X_DISABLE_META=true
 mkdir -p "$WANDB_DIR"
 export PYTHONPATH=$PIXGEN
 export PYTHONUNBUFFERED=1
