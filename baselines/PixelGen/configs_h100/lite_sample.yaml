@@ -158,10 +158,7 @@ model:
         class_path: src.diffusion.flow_matching.scheduling.LinearScheduler
       guidance_fn: src.diffusion.base.guidance.simple_guidance_fn
       num_steps: 50
-      # guidance: 4.0
-      # guidance: 1.75
-      guidance: 4.00
-      # guidance: 6.25
+      guidance: 1.0   # owner 2026-11-01: CFG fixed at 1.0 for every model (conditional branch only)
   ema_tracker:
     class_path: src.callbacks.simple_ema.SimpleEMA
     init_args:
