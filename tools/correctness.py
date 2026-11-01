@@ -107,15 +107,15 @@ def record(out):
     for k in range(K_STEPS):
         torch.manual_seed(100 + k)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = trainer(den, ema, sampler, x, cond, uncond, {})
-        out["loss"].backward()
+            res = trainer(den, ema, sampler, x, cond, uncond, {})
+        res["loss"].backward()
         gn = torch.nn.utils.clip_grad_norm_(den.parameters(), 1.0)
         if hasattr(ema_cb, "_join"):
             ema_cb._join()
         opt.step(); opt.zero_grad(set_to_none=True)
         ema_cb.ema_step()
         torch.cuda.synchronize()
-        losses.append(out["loss"].item()); gnorms.append(gn.item())
+        losses.append(res["loss"].item()); gnorms.append(gn.item())
     rec["loss"], rec["gnorm"] = torch.tensor(losses), torch.tensor(gnorms)
     with torch.no_grad():
         rec["p_sum"] = torch.tensor([p.float().sum().item() for p in den.parameters()])
