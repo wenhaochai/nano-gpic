@@ -4,7 +4,11 @@ torch_hub_dir: /scratch/gpfs/GROUP/USER/.cache/torch/hub
 huggingface_cache_dir: /scratch/gpfs/GROUP/USER/cache/huggingface/hub
 trainer:
   accelerator: auto
-  strategy: ddp
+  strategy:   # perf C2: buffers are constant (no per-step broadcast); gradients are views of the DDP buckets (no copies)
+    class_path: lightning.pytorch.strategies.DDPStrategy
+    init_args:
+      broadcast_buffers: false
+      gradient_as_bucket_view: true
   devices: '8'
   num_nodes: 1
   precision: bf16-mixed
@@ -28,7 +32,7 @@ trainer:
   num_sanity_val_steps: 0
   log_every_n_steps: 100
   enable_checkpointing: false
-  enable_progress_bar: null
+  enable_progress_bar: false
   enable_model_summary: null
   accumulate_grad_batches: 1
   gradient_clip_val: 1.0

@@ -200,7 +200,11 @@ class LightningModel(pl.LightningModule):
         caption_types = metadata.get("caption_type", None)
         loss_per_sample = loss.pop("loss_per_sample", None)
 
-        if caption_types is not None and loss_per_sample is not None:
+        # perf C2: the per-caption-type losses need host syncs (index tensors from Python lists) and four sync_dist
+        # all-reduces; compute them only on steps whose on_step logs are written (Lightning's own condition), so the
+        # logged values are unchanged and every other step runs without them
+        log_now = self.logger is not None and self.trainer._logger_connector.should_update_logs
+        if log_now and caption_types is not None and loss_per_sample is not None:
             CAPTION_TYPES = ["tag", "short", "medium", "long"]
             for ct in CAPTION_TYPES:
                 mask = [i for i, t in enumerate(caption_types) if t == ct]
@@ -212,7 +216,7 @@ class LightningModel(pl.LightningModule):
 
         # --- end per-caption-type ---
 
-        self.log_dict(loss, prog_bar=True, on_step=True, sync_dist=False)
+        self.log_dict(loss, prog_bar=False, on_step=True, sync_dist=False)   # perf C2: no per-step .item() for the bar
         self.log("train/lr", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, sync_dist=False)
         # if self.trainer.global_rank == 0:
         #     print(f"[step {self.global_step}] loss={loss['loss'].item():.4f}")
