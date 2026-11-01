@@ -138,7 +138,7 @@ model:
       foreach: null
       capturable: false
       differentiable: false
-      fused: null
+      fused: true   # perf C3: fused AdamW kernel (same update rule)
   lr_scheduler:
     class_path: src.utils.lr_scheduler.WarmupFlatCooldown
     init_args:

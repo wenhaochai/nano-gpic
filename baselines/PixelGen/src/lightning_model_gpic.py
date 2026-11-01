@@ -114,6 +114,16 @@ class LightningModel(pl.LightningModule):
         self.ema_denoiser.compile()
         print("Model compilation done.")
 
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
+        """perf C3: Lightning's mixed-precision plugin refuses to clip when the optimizer is fused (it assumes the
+        optimizer unscales gradients), although bf16 autocast has no gradient scaler. Clip exactly as Lightning's
+        'norm' algorithm does: the global 2-norm over every parameter of the optimizer."""
+        if not gradient_clip_val:
+            return
+        assert gradient_clip_algorithm in (None, "norm"), gradient_clip_algorithm
+        params = [p for g in optimizer.param_groups for p in g["params"]]
+        torch.nn.utils.clip_grad_norm_(params, gradient_clip_val, foreach=True)
+
     def configure_callbacks(self) -> Union[Sequence[Callback], Callback]:
         return [self.ema_tracker]
 
