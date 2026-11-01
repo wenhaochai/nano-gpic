@@ -73,6 +73,15 @@ def build(compile_models=True):
     return te, den, ema, trainer, sampler
 
 
+def _den_ctx():
+    try:
+        from src.models.layers.attention_op import denoiser_sdpa
+        return denoiser_sdpa()
+    except ImportError:
+        import contextlib
+        return contextlib.nullcontext()
+
+
 def record(out):
     if os.environ.get("CORR_SDPA") == "math":   # kernel-swap envelope: same math, different attention kernel
         torch.backends.cuda.enable_flash_sdp(False)
@@ -90,7 +99,7 @@ def record(out):
     g = torch.Generator(device="cuda").manual_seed(1)
     t = torch.rand(x.shape[0], device="cuda", generator=g)
     xt = (1 - t.view(-1, 1, 1, 1)) * torch.randn(x.shape, device="cuda", generator=g) + t.view(-1, 1, 1, 1) * x
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16), _den_ctx():
         rec["den_out"] = den(xt, t, cond).float().cpu()
 
     # the job's own optimizer settings (CORR_CONFIG, default the bench config of the code under test) and its own
@@ -106,7 +115,7 @@ def record(out):
     losses, gnorms = [], []
     for k in range(K_STEPS):
         torch.manual_seed(100 + k)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=torch.bfloat16), _den_ctx():
             res = trainer(den, ema, sampler, x, cond, uncond, {})
         res["loss"].backward()
         gn = torch.nn.utils.clip_grad_norm_(den.parameters(), 1.0)
@@ -123,7 +132,7 @@ def record(out):
         rec["ema_sum"] = torch.tensor([p.sum().item() for p in ema.parameters()])
         gs = torch.Generator(device="cuda").manual_seed(7)
         noise = torch.randn(4, 3, 256, 256, device="cuda", generator=gs)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=torch.bfloat16), _den_ctx():
             img = sampler(ema, noise, cond[:4], uncond[:4].expand(4, -1, -1))
         rec["samples"] = ((img.float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8).cpu().float()
     torch.save(rec, out)
