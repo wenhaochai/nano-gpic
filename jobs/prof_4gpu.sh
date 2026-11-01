@@ -20,6 +20,8 @@ WS=$WT/workspace-who-ate-my-flops
 SHA=$(git -C $WT rev-parse --short HEAD)
 R=$WS/runs/prof4_$SHA
 export BENCH_DEVICES=4
+# logical GPU k -> the physical id this job was given (never a fixed id: neighbours share the node)
+GPUS=(${CUDA_VISIBLE_DEVICES//,/ }); [ ${#GPUS[@]} -ge 4 ] || GPUS=(0 1 2 3)
 mkdir -p $R
 log() { echo "[$(date +%T)] $*" | tee -a $R/phases.log; }
 phase() { local name=$1; shift; local t0=$(date +%s); log "START $name"; "$@"; local rc=$?; log "END $name rc=$rc $(( $(date +%s) - t0 ))s"; }
@@ -35,7 +37,7 @@ probe() {
     free -g | head -2
     module load nsight-systems/2025.3.1 && nsys --version
     NCU=$(ls /usr/local/cuda-13*/bin/ncu /usr/local/cuda-12.9/bin/ncu 2>/dev/null | sort -V | tail -1); echo "NCU=$NCU"; $NCU --version | tail -1
-    CUDA_VISIBLE_DEVICES=0 timeout 180 $NCU --metrics gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed -c 1 \
+    CUDA_VISIBLE_DEVICES=${GPUS[0]} timeout 180 $NCU --metrics gpu__time_duration.sum,sm__throughput.avg.pct_of_peak_sustained_elapsed -c 1 \
       python -c "import torch;x=torch.ones(4096,4096,device='cuda');print((x@x).sum().item())" 2>&1 | tail -15
   } > $R/probe.txt 2>&1
 }
@@ -60,21 +62,21 @@ phase p3_nsys env BENCH_CUDA_PROFILER=100:103 BENCH_WRAP="nsys profile -o $R/p3_
   --cuda-graph-trace=node --capture-range=cudaProfilerApi --capture-range-end=stop --sample=process-tree \
   --cpuctxsw=process-tree $GM" bash $WT/jobs/bench_train.sh $R/p3_nsys
 
-p4_inductor() { env CUDA_VISIBLE_DEVICES=0 MASTER_PORT=29610 BENCH_DEVICES=1 BENCH_STEPS=20 TORCHINDUCTOR_PROFILE=1 \
+p4_inductor() { env CUDA_VISIBLE_DEVICES=${GPUS[0]} MASTER_PORT=29610 BENCH_DEVICES=1 BENCH_STEPS=20 TORCHINDUCTOR_PROFILE=1 \
   TORCHINDUCTOR_PROFILE_OUTPUT=$R/p4_inductor_bandwidth.txt TORCHINDUCTOR_CACHE_DIR=$R/cache/ind_prof \
   TRITON_CACHE_DIR=$R/cache/tri_prof bash $WT/jobs/bench_train.sh $R/p4_inductor; }
-p4_compiledebug() { env CUDA_VISIBLE_DEVICES=1 MASTER_PORT=29611 BENCH_DEVICES=1 BENCH_STEPS=20 \
+p4_compiledebug() { env CUDA_VISIBLE_DEVICES=${GPUS[1]} MASTER_PORT=29611 BENCH_DEVICES=1 BENCH_STEPS=20 \
   TORCH_LOGS="graph_breaks,recompiles,ddp_graphs,perf_hints" TORCH_COMPILE_DEBUG=1 TORCH_COMPILE_DEBUG_DIR=$R/p4_compiledebug/debug \
   TORCHINDUCTOR_CACHE_DIR=$R/cache/ind_dbg TRITON_CACHE_DIR=$R/cache/tri_dbg bash $WT/jobs/bench_train.sh $R/p4_compiledebug; }
-p4_eval() { CUDA_VISIBLE_DEVICES=2 python $WT/tools/prof/eval_phase_prof.py $R/p4_evalphase > $R/p4_evalphase.log 2>&1; }
-p4_micro() { CUDA_VISIBLE_DEVICES=3 python $WT/tools/prof/microbench.py $R/p2_torchprof/trace/rank0.json $R/p4_microbench.json \
+p4_eval() { CUDA_VISIBLE_DEVICES=${GPUS[2]} python $WT/tools/prof/eval_phase_prof.py $R/p4_evalphase > $R/p4_evalphase.log 2>&1; }
+p4_micro() { CUDA_VISIBLE_DEVICES=${GPUS[3]} python $WT/tools/prof/microbench.py $R/p2_torchprof/trace/rank0.json $R/p4_microbench.json \
   > $R/p4_microbench.log 2>&1; }
 p4_corr() {
   cd $WT/baselines/PixelGen; export PYTHONPATH=$PWD; mkdir -p $R/corr
-  for i in 1 2 3; do CUDA_VISIBLE_DEVICES=$((i - 1)) python $WT/tools/correctness.py record $R/corr/base$i.pt > $R/corr/base$i.log 2>&1 & done
-  CUDA_VISIBLE_DEVICES=3 CORR_SDPA=math python $WT/tools/correctness.py record $R/corr/sdpa_math.pt > $R/corr/sdpa_math.log 2>&1 &
+  for i in 1 2 3; do CUDA_VISIBLE_DEVICES=${GPUS[$((i - 1))]} python $WT/tools/correctness.py record $R/corr/base$i.pt > $R/corr/base$i.log 2>&1 & done
+  CUDA_VISIBLE_DEVICES=${GPUS[3]} CORR_SDPA=math python $WT/tools/correctness.py record $R/corr/sdpa_math.pt > $R/corr/sdpa_math.log 2>&1 &
   wait
-  CUDA_VISIBLE_DEVICES=0 CORR_COMPILE=0 python $WT/tools/correctness.py record $R/corr/eager.pt > $R/corr/eager.log 2>&1
+  CUDA_VISIBLE_DEVICES=${GPUS[0]} CORR_COMPILE=0 python $WT/tools/correctness.py record $R/corr/eager.pt > $R/corr/eager.log 2>&1
   python $WT/tools/correctness.py derive $R/corr/tol.json $R/corr/base1.pt $R/corr/base2.pt $R/corr/base3.pt > $R/corr/derive_3runs.log 2>&1
   python $WT/tools/correctness.py derive $R/corr/tol_kernelswap.json $R/corr/base1.pt $R/corr/base2.pt $R/corr/base3.pt \
     $R/corr/sdpa_math.pt > $R/corr/derive_kernelswap.log 2>&1
@@ -87,7 +89,7 @@ phase p5_nccl torchrun --standalone --nproc_per_node 4 $WT/tools/prof/nccl_bench
 
 p6_ncu_shard() {  # one GPU, one kernel class, one profiled step
   local gpu=$1 tag=$2 rx=$3
-  env CUDA_VISIBLE_DEVICES=$gpu MASTER_PORT=$((29620 + gpu)) BENCH_DEVICES=1 BENCH_STEPS=42 BENCH_CUDA_PROFILER=40:41 \
+  env CUDA_VISIBLE_DEVICES=${GPUS[$gpu]} MASTER_PORT=$((29620 + gpu)) BENCH_DEVICES=1 BENCH_STEPS=42 BENCH_CUDA_PROFILER=40:41 \
     BENCH_WRAP="timeout 55m $NCU --profile-from-start off --target-processes all --kernel-name regex:$rx --set roofline \
     --section Occupancy --section LaunchStats --section MemoryWorkloadAnalysis --metrics \
     sm__pipe_tensor_op_hmma_cycles_active.avg.pct_of_peak_sustained_active,dram__bytes.sum,gpu__time_duration.sum \
