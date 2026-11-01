@@ -93,7 +93,16 @@ def record(out):
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         rec["den_out"] = den(xt, t, cond).float().cpu()
 
-    opt = torch.optim.AdamW(den.parameters(), lr=1e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
+    # the job's own optimizer settings (CORR_CONFIG, default the bench config of the code under test) and its own
+    # EMA callback, so optimizer/EMA changes are exercised, not re-implemented here
+    import yaml
+    cfg = yaml.safe_load(open(os.environ.get("CORR_CONFIG", "configs_h100/lite_bench.yaml")))
+    oa = dict(cfg["model"]["optimizer"]["init_args"])
+    opt = torch.optim.AdamW(den.parameters(), lr=oa["lr"], betas=tuple(oa["betas"]), eps=oa["eps"],
+                            weight_decay=oa["weight_decay"], fused=oa.get("fused") or None, foreach=oa.get("foreach"))
+    from src.callbacks.simple_ema import SimpleEMA
+    ema_cb = SimpleEMA(decay=0.9999)
+    ema_cb.setup_models(net=den, ema_net=ema)
     losses, gnorms = [], []
     for k in range(K_STEPS):
         torch.manual_seed(100 + k)
@@ -101,10 +110,11 @@ def record(out):
             out = trainer(den, ema, sampler, x, cond, uncond, {})
         out["loss"].backward()
         gn = torch.nn.utils.clip_grad_norm_(den.parameters(), 1.0)
+        if hasattr(ema_cb, "_join"):
+            ema_cb._join()
         opt.step(); opt.zero_grad(set_to_none=True)
-        with torch.no_grad():
-            for pe, pn in zip(ema.parameters(), den.parameters()):
-                pe.mul_(0.9999).add_(pn.float(), alpha=1e-4)
+        ema_cb.ema_step()
+        torch.cuda.synchronize()
         losses.append(out["loss"].item()); gnorms.append(gn.item())
     rec["loss"], rec["gnorm"] = torch.tensor(losses), torch.tensor(gnorms)
     with torch.no_grad():
