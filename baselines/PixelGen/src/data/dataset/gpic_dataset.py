@@ -190,10 +190,15 @@ class GPICWebDataset(IterableDataset):
 
     def build_dataloader(self, batch_size, num_workers):
         dataset = self.create_dataset()
+        # pinned host batches: the image copy to the GPU becomes asynchronous (Lightning moves batches with
+        # non_blocking=True), so it overlaps the previous step instead of stalling the device (perf C1)
         loader = wds.WebLoader(
             dataset,
             batch_size=batch_size,
             num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
+            prefetch_factor=4 if num_workers > 0 else None,
         )
         return loader
 
