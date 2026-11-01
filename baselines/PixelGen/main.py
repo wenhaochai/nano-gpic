@@ -6,8 +6,8 @@ from typing import Any, Union
 from src.utils.patch_bugs import *
 from lightning import Trainer, LightningModule
 
-from src.lightning_data_keshik import DataModule
-from src.lightning_model_keshik import LightningModel
+from src.lightning_data_gpic import DataModule
+from src.lightning_model_gpic import LightningModel
 from lightning.pytorch.cli import LightningCLI, LightningArgumentParser, SaveConfigCallback
 
 import logging
