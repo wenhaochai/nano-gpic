@@ -66,7 +66,7 @@ trainer:
   - class_path: src.callbacks.save_images.SaveImagesHook
     init_args:
       save_dir: val
-      save_compressed: false
+      save_compressed: true   # perf E4: all samples to one output.npz (first 10 also as PNG); no 50K PNG round trip
   fast_dev_run: false
   max_epochs: null
   min_epochs: null
