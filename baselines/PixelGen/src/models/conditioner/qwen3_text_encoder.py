@@ -9,8 +9,9 @@ class Qwen3TextEncoder(BaseConditioner):
     def __init__(self, weight_path: str, embed_dim:int=None, max_length=128):
         super().__init__()
         self.tokenizer = Qwen2Tokenizer.from_pretrained(weight_path, max_length=max_length, padding_side="right")
-        # self.model = Qwen3Model.from_pretrained(weight_path, attn_implementation="flex_attention").to(torch.bfloat16)
-        self.model = Qwen3Model.from_pretrained(weight_path).to(torch.bfloat16)
+        # perf C6: FlexAttention for the causal + padding mask (same masking; SDPA had to fall back to the
+        # memory-efficient kernel for this mask, 24% tensor-core active under ncu)
+        self.model = Qwen3Model.from_pretrained(weight_path, attn_implementation="flex_attention").to(torch.bfloat16)
         self.model.compile()
         self.uncondition_embedding = None
         self.embed_dim = embed_dim
