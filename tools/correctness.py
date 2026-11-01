@@ -153,15 +153,28 @@ def derive(tol_out, runs):
     print(json.dumps(tol, indent=1))
 
 
+# Per-tensor checksums are fp32 sums (.sum().item()), so one of them cannot resolve a change smaller than its own
+# rounding: a sum of 1.8e5 moves in steps of 2**-6. Each element of these keys may differ by up to 2 ulps of the base
+# value on top of the derived tolerance (C3's EMA failed on one ulp of tensor 0's sum, 2026-11-01).
+CHECKSUM_KEYS = ("p_sum", "p_abs", "ema_sum")
+
+
 def compare(tol_file, base, cand):
     tol = json.load(open(tol_file))["tol"]
     a, b = torch.load(base), torch.load(cand)
     bad = 0
     for key, t in tol.items():
-        d = _diff(a[key], b[key])
-        ok = d <= t
+        d = (a[key].double() - b[key].double()).abs()
+        if key in CHECKSUM_KEYS:
+            ulp = torch.nextafter(a[key].float().abs(), torch.tensor(float("inf"))).double() - a[key].float().abs().double()
+            lim = torch.clamp(2 * ulp, min=t)
+            ok = bool((d <= lim).all())
+            note = f" (ulp floor; worst element {int((d - lim).argmax())})"
+        else:
+            ok = d.max().item() <= t
+            note = ""
         bad += not ok
-        print(f"{'PASS' if ok else 'FAIL'} {key:10s} maxabs {d:.3e} tol {t:.3e}")
+        print(f"{'PASS' if ok else 'FAIL'} {key:10s} maxabs {d.max().item():.3e} tol {t:.3e}{note}")
     sys.exit(1 if bad else 0)
 
 
