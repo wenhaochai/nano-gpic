@@ -4,7 +4,7 @@ import numpy as np
 
 from functools import lru_cache
 from src.models.layers.attention_op import attention
-from src.models.layers.rope import apply_rotary_emb, precompute_freqs_cis_ex2d as precompute_freqs_cis_2d
+from src.models.layers.rope import apply_rotary_emb, apply_rotary_emb_real, precompute_freqs_cis_ex2d as precompute_freqs_cis_2d
 from src.models.layers.time_embed import TimestepEmbedder as TimestepEmbedder
 from src.models.layers.patch_embed import Embed as Embed
 from src.models.layers.swiglu import SwiGLU as FeedForward
@@ -80,7 +80,7 @@ class Attention(nn.Module):
         q, kx, vx = qkv_x[0], qkv_x[1], qkv_x[2]
         q = self.q_norm(q.contiguous())
         kx = self.k_norm(kx.contiguous())
-        q, kx = apply_rotary_emb(q, kx, freqs_cis=pos)
+        q, kx = apply_rotary_emb_real(q, kx, pos[0], pos[1])   # perf C4: pos = (cos, sin)
         kv_y = self.kv_y(y).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         ky, vy = kv_y[0], kv_y[1]
         ky = self.k_norm(ky.contiguous())
@@ -290,12 +290,12 @@ class JiT_T2I(nn.Module):
         self.load_ema = load_ema
 
     def fetch_pos(self, height, width, device):
-        if (height, width) in self.precompute_pos:
-            return self.precompute_pos[(height, width)].to(device)
-        else:
-            pos = precompute_freqs_cis_2d(self.hidden_size // self.num_groups, height, width).to(device)
-            self.precompute_pos[(height, width)] = pos
-            return pos
+        """(cos, sin) of the 2D RoPE angles, [N, Hc/2] float32 each (perf C4: real parts of freqs_cis)."""
+        if (height, width) not in self.precompute_pos:
+            pos = precompute_freqs_cis_2d(self.hidden_size // self.num_groups, height, width)
+            self.precompute_pos[(height, width)] = (pos.real.contiguous().float(), pos.imag.contiguous().float())
+        cos, sin = self.precompute_pos[(height, width)]
+        return cos.to(device), sin.to(device)
 
     def initialize_weights(self):
         # Basic initialization
