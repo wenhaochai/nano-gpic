@@ -20,7 +20,7 @@ R=$WS/runs/prof_$SHA
 mkdir -p $R
 log() { echo "[$(date +%T)] $*" | tee -a $R/phases.log; }
 phase() { local name=$1; shift; local t0=$(date +%s); log "START $name"; "$@"; local rc=$?; log "END $name rc=$rc $(( $(date +%s) - t0 ))s"; }
-export TORCHINDUCTOR_CACHE_DIR=$TMPDIR/inductor TRITON_CACHE_DIR=$TMPDIR/triton   # P1 = cold first run
+export TORCHINDUCTOR_CACHE_DIR=$R/cache/inductor TRITON_CACHE_DIR=$R/cache/triton   # P1 = cold first run; kept: kernel sources
 
 probe() {
   {
@@ -58,11 +58,11 @@ phase p3_nsys env BENCH_CUDA_PROFILER=100:103 BENCH_WRAP="nsys profile -o $R/p3_
   --cpuctxsw=process-tree $GM" bash $WT/jobs/bench_train.sh $R/p3_nsys
 
 p4_inductor() { env CUDA_VISIBLE_DEVICES=0 MASTER_PORT=29610 BENCH_DEVICES=1 BENCH_STEPS=20 TORCHINDUCTOR_PROFILE=1 \
-  TORCHINDUCTOR_PROFILE_OUTPUT=$R/p4_inductor_bandwidth.txt TORCHINDUCTOR_CACHE_DIR=$TMPDIR/ind_prof \
-  TRITON_CACHE_DIR=$TMPDIR/tri_prof bash $WT/jobs/bench_train.sh $R/p4_inductor; }
+  TORCHINDUCTOR_PROFILE_OUTPUT=$R/p4_inductor_bandwidth.txt TORCHINDUCTOR_CACHE_DIR=$R/cache/ind_prof \
+  TRITON_CACHE_DIR=$R/cache/tri_prof bash $WT/jobs/bench_train.sh $R/p4_inductor; }
 p4_compiledebug() { env CUDA_VISIBLE_DEVICES=1 MASTER_PORT=29611 BENCH_DEVICES=1 BENCH_STEPS=20 \
   TORCH_LOGS="graph_breaks,recompiles,ddp_graphs,perf_hints" TORCH_COMPILE_DEBUG=1 TORCH_COMPILE_DEBUG_DIR=$R/p4_compiledebug/debug \
-  TORCHINDUCTOR_CACHE_DIR=$TMPDIR/ind_dbg TRITON_CACHE_DIR=$TMPDIR/tri_dbg bash $WT/jobs/bench_train.sh $R/p4_compiledebug; }
+  TORCHINDUCTOR_CACHE_DIR=$R/cache/ind_dbg TRITON_CACHE_DIR=$R/cache/tri_dbg bash $WT/jobs/bench_train.sh $R/p4_compiledebug; }
 p4_eval() { CUDA_VISIBLE_DEVICES=2 python $WT/tools/prof/eval_phase_prof.py $R/p4_evalphase > $R/p4_evalphase.log 2>&1; }
 p4_micro() { CUDA_VISIBLE_DEVICES=3 python $WT/tools/prof/microbench.py $R/p2_torchprof/trace/rank0.json $R/p4_microbench.json \
   > $R/p4_microbench.log 2>&1; }
