@@ -1,4 +1,5 @@
 import os
+import os
 import json, re, math
 import webdataset as wds
 import torch
@@ -162,8 +163,19 @@ class GPICWebDataset(IterableDataset):
                 and "caption_type" in s
             )
 
+        # ladder: with GPIC_SHARD_SEED set (one value per launch, shared by all ranks through the environment), the
+        # shard list is shuffled before the node/worker split, so a resumed run does not re-read the same leading
+        # shards of every worker. Unset: the official fixed order.
+        shards = wds.SimpleShardList(shard_spec)
+        seed = os.environ.get("GPIC_SHARD_SEED")
+        if seed:
+            import braceexpand, random
+            urls = list(braceexpand.braceexpand(shard_spec)) if isinstance(shard_spec, str) else list(shard_spec)
+            random.Random(int(seed)).shuffle(urls)
+            shards = wds.SimpleShardList(urls)
+            print(f"GPIC_SHARD_SEED={seed}: {len(urls)} shards shuffled, first {urls[0].rsplit('/', 1)[-1]}")
         dataset = wds.DataPipeline(
-            wds.SimpleShardList(shard_spec),
+            shards,
             wds.split_by_node,
             wds.split_by_worker,
 
