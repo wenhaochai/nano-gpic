@@ -1,0 +1,83 @@
+{
+ "budget": 14258090174054400000,
+ "mean_padded_T": 79.34426229508196,
+ "T_hist": {
+  "64": 0.8909,
+  "128": 0.0118,
+  "192": 0.0671,
+  "256": 0.0272,
+  "320": 0.0031
+ },
+ "runs": [
+  {
+   "size": "d640",
+   "d": 640,
+   "nb": 9,
+   "nt": 2,
+   "heads": 10,
+   "params_M": 109.4,
+   "gflop_per_img": 108.3,
+   "max_steps": 516000,
+   "ms_every": 129000,
+   "tpp": 309.0,
+   "lite_epochs": 13.08,
+   "budget_flops": 1.4311598306816872e+19
+  },
+  {
+   "size": "d768",
+   "d": 768,
+   "nb": 10,
+   "nt": 2,
+   "heads": 12,
+   "params_M": 171.1,
+   "gflop_per_img": 169.9,
+   "max_steps": 328000,
+   "ms_every": 82000,
+   "tpp": 125.6,
+   "lite_epochs": 8.31,
+   "budget_flops": 1.426465161231471e+19
+  },
+  {
+   "size": "d896",
+   "d": 896,
+   "nb": 11,
+   "nt": 2,
+   "heads": 14,
+   "params_M": 251.5,
+   "gflop_per_img": 250.6,
+   "max_steps": 224000,
+   "ms_every": 56000,
+   "tpp": 58.4,
+   "lite_epochs": 5.68,
+   "budget_flops": 1.4369697359165878e+19
+  },
+  {
+   "size": "d1024",
+   "d": 1024,
+   "nb": 12,
+   "nt": 3,
+   "heads": 16,
+   "params_M": 376.2,
+   "gflop_per_img": 361.1,
+   "max_steps": 156000,
+   "ms_every": 39000,
+   "tpp": 27.2,
+   "lite_epochs": 3.95,
+   "budget_flops": 1.4419261563398916e+19
+  },
+  {
+   "size": "d1280",
+   "d": 1280,
+   "nb": 14,
+   "nt": 3,
+   "heads": 20,
+   "params_M": 665.1,
+   "gflop_per_img": 645.4,
+   "max_steps": 88000,
+   "ms_every": 22000,
+   "tpp": 8.7,
+   "lite_epochs": 2.23,
+   "budget_flops": 1.4539682483462816e+19
+  }
+ ]
+}

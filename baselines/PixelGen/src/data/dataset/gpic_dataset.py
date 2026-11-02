@@ -32,6 +32,25 @@ print("Defined val_transform function (from dataset.augmentation import center_c
 # Utils
 # -------------------------
 
+class EpochShuffledShards(IterableDataset):
+    """ladder: the shard list, reshuffled at every pass with Random(seed * 100003 + pass). Every rank and worker holds
+    its own copy and makes exactly one pass per epoch (persistent workers call iter() once per epoch), so in epoch e
+    every copy uses the same permutation and the node/worker split still reads each shard exactly once per epoch.
+    A fixed order (wds.SimpleShardList, with or without its seed) repeats the same shard order in every epoch."""
+
+    def __init__(self, urls, seed):
+        super().__init__()
+        self.urls, self.seed, self.passes = list(urls), int(seed), 0
+
+    def __iter__(self):
+        import random
+        urls = list(self.urls)
+        random.Random(self.seed * 100003 + self.passes).shuffle(urls)
+        self.passes += 1
+        for u in urls:
+            yield dict(url=u)
+
+
 def load_bad_keys(csv_path):
     bad_keys = set()
     with open(csv_path, newline="") as f:
@@ -197,12 +216,13 @@ class GPICWebDataset(IterableDataset):
         buf = []
 
         def flush(items):
+            # only full chunks: a window is a whole number of chunks, so the only partial chunk is the tail of a
+            # worker's stream (< group_batch samples per worker per epoch), which is dropped. Every per-GPU batch is
+            # then one full chunk, and no odd batch size reaches the compiled graphs.
             items.sort(key=lambda s: len(s["input_ids"]))
-            chunks = [items[i:i + self.group_batch] for i in range(0, len(items), self.group_batch)]
-            full = [c for c in chunks if len(c) == self.group_batch]
-            rest = [c for c in chunks if len(c) != self.group_batch]
+            full = [items[i:i + self.group_batch] for i in range(0, len(items) - self.group_batch + 1, self.group_batch)]
             rng.shuffle(full)
-            for c in full + rest:   # a partial chunk only at the very end of a window flush
+            for c in full:
                 yield from c
 
         for s in src:
@@ -244,16 +264,16 @@ class GPICWebDataset(IterableDataset):
             )
 
         # ladder: with GPIC_SHARD_SEED set (one value per launch, shared by all ranks through the environment), the
-        # shard list is shuffled before the node/worker split, so a resumed run does not re-read the same leading
-        # shards of every worker. Unset: the official fixed order.
+        # shard list is shuffled before the node/worker split, with a new permutation in every epoch, so a resumed
+        # run does not re-read the same leading shards of every worker and no two epochs read the shards in the same
+        # order. Unset: the official fixed order.
         shards = wds.SimpleShardList(shard_spec)
         seed = os.environ.get("GPIC_SHARD_SEED")
         if seed:
-            import braceexpand, random
+            import braceexpand
             urls = list(braceexpand.braceexpand(shard_spec)) if isinstance(shard_spec, str) else list(shard_spec)
-            random.Random(int(seed)).shuffle(urls)
-            shards = wds.SimpleShardList(urls)
-            print(f"GPIC_SHARD_SEED={seed}: {len(urls)} shards shuffled, first {urls[0].rsplit('/', 1)[-1]}")
+            shards = EpochShuffledShards(urls, seed)
+            print(f"GPIC_SHARD_SEED={seed}: {len(urls)} shards, reshuffled every epoch")
         if self.group_text_len:
             assert isinstance(self.transform, T.Compose) and len(self.transform.transforms) >= 2
             self._pre = self.transform.transforms[0]                        # random crop (PIL)
@@ -302,6 +322,7 @@ class GPICWebDataset(IterableDataset):
 
     def build_dataloader(self, batch_size, num_workers):
         self.group_batch = batch_size   # ladder: one length-sorted chunk per per-GPU batch, whatever the config says
+        assert not self.group_text_len or self.group_window % batch_size == 0, (self.group_window, batch_size)
         dataset = self.create_dataset()
         # pinned host batches: the image copy to the GPU becomes asynchronous (Lightning moves batches with
         # non_blocking=True), so it overlaps the previous step instead of stalling the device (perf C1)

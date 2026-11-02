@@ -194,7 +194,9 @@ model:
     init_args:
       num_warmup_steps: 4000
       num_cooldown_steps: 4000
-      max_steps: 400000
+      # flat after warmup in every ladder run (owner-approved plan). The reference's 400000 would start the cooldown
+      # inside d640's 516k steps and make the LR negative after step 400000 (1 - (step - 396000)/4000).
+      max_steps: 1000000000
   eval_original_model: false
   sample_every: 0
 data:
