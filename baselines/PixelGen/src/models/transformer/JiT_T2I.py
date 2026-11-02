@@ -74,7 +74,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor, y, pos) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y, pos, mask=None) -> torch.Tensor:
         B, N, C = x.shape
         qkv_x = self.qkv_x(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, kx, vx = qkv_x[0], qkv_x[1], qkv_x[2]
@@ -92,7 +92,7 @@ class Attention(nn.Module):
         k = k.view(B, self.num_heads, -1, C // self.num_heads).contiguous()  # B, H, N, Hc
         v = v.view(B, self.num_heads, -1, C // self.num_heads).contiguous()
 
-        x = attention(q, k, v)
+        x = attention(q, k, v) if mask is None else attention(q, k, v, attn_mask=mask)   # mask: [B,1,1,N+T]
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -110,9 +110,9 @@ class FlattenDiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, y, c, pos):
+    def forward(self, x, y, c, pos, mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), y, pos)
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), y, pos, mask)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -138,7 +138,7 @@ class TextRefineAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         B, N, C = x.shape
         qkv_x = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv_x[0], qkv_x[1], qkv_x[2]
@@ -147,7 +147,7 @@ class TextRefineAttention(nn.Module):
         q = q.view(B, self.num_heads, -1, C // self.num_heads)  # B, H, N, Hc
         k = k.view(B, self.num_heads, -1, C // self.num_heads).contiguous()  # B, H, N, Hc
         v = v.view(B, self.num_heads, -1, C // self.num_heads).contiguous()
-        x = attention(q, k, v)
+        x = attention(q, k, v) if mask is None else attention(q, k, v, attn_mask=mask)   # mask: [B,1,1,T]
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -166,9 +166,9 @@ class TextRefineBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), mask)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -349,23 +349,29 @@ class JiT_T2I(nn.Module):
         )
         return x
     
-    def forward(self, x, t, y, return_layer=None):
+    def forward(self, x, t, y, return_layer=None, y_mask=None):
+        """y_mask (ladder option B): [B, T] bool, True = a real caption token, T <= txt_max_length; None = the
+        official unmasked path (y padded to txt_max_length)."""
         B, _, H, W = x.shape
         x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
-        ypos = self.y_pos_embedding
+        ypos = self.y_pos_embedding if y_mask is None else self.y_pos_embedding[:, :y.shape[1]]
+        text_mask = full_mask = None
+        if y_mask is not None:   # SDPA boolean masks, True = attend
+            text_mask = y_mask[:, None, None, :]
+            full_mask = torch.cat([torch.ones(B, 1, 1, x.shape[1], dtype=torch.bool, device=x.device), text_mask], dim=-1)
         t = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
         y = self.y_embedder(y).view(B, -1, self.hidden_size) + ypos.to(y.dtype)
         condition = nn.functional.silu(t)
         for i, block in enumerate(self.text_refine_blocks):
-            y = block(y, condition)
+            y = block(y, condition) if text_mask is None else block(y, condition, text_mask)
 
         x = self.x_embedder(x)
         x += self.pos_embed
         for i, block in enumerate(self.blocks):
             if return_layer is not None and i==return_layer:
                 feat = x
-            x = block(x, y, condition, xpos)
+            x = block(x, y, condition, xpos) if full_mask is None else block(x, y, condition, xpos, full_mask)
             
         x = self.final_layer(x)
         output = self.unpatchify(x, H, W)

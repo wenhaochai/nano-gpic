@@ -15,6 +15,10 @@ class BaseTrainer(nn.Module):
         bsz = x.shape[0]
         if self.null_condition_p > 0:
             mask = torch.rand((bsz), device=condition.device) < self.null_condition_p
+            if isinstance(metadata, dict) and metadata.get("y_mask") is not None:   # ladder option B (masked text)
+                ym = metadata["y_mask"]
+                null_row = torch.zeros_like(ym[:1]); null_row[:, 0] = True       # the null caption: one token
+                metadata["y_mask"] = torch.where(mask[:, None], null_row, ym)
             mask = mask.view(-1, *([1] * (len(condition.shape) - 1))).to(condition.dtype)
             condition = condition*(1-mask)  + uncondition*mask
         return x, condition, metadata

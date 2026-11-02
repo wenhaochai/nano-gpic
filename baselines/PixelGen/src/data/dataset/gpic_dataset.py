@@ -1,5 +1,5 @@
 import os
-import os
+import numpy as np
 import json, re, math
 import webdataset as wds
 import torch
@@ -88,10 +88,23 @@ class GPICWebDataset(IterableDataset):
         output_fields=None,
         caption_types=None,
         caption_keys_pkl_file=None,
+        group_text_len=False,
+        group_window=1024,
+        group_batch=32,
+        text_max_length=320,
+        pad_multiple=64,
+        tokenizer_path="Qwen/Qwen3-1.7B",
     ):
         self.tar_dir = tar_dir
         self.tar_pattern = tar_pattern
         self.shuffle_buffer = shuffle_buffer
+        # ladder (option B): tokenize captions in the workers, group samples of similar caption length into the same
+        # per-GPU batch, pad each batch only to its longest caption (rounded up to pad_multiple). Off by default.
+        self.group_text_len = group_text_len
+        self.group_window, self.group_batch = group_window, group_batch
+        self.text_max_length, self.pad_multiple = text_max_length, pad_multiple
+        self.tokenizer_path = tokenizer_path
+        self._tok = None
         self.samples_per_tar = samples_per_tar
 
         # print("samples_per_tar:", samples_per_tar)
@@ -151,6 +164,73 @@ class GPICWebDataset(IterableDataset):
                 break
         return sample
 
+    # ---- ladder option B: grouped, padded-to-batch-max captions -------------------------------------------------
+    def _tokenizer(self):
+        if self._tok is None:   # one per worker process; the same class and call as Qwen3TextEncoder
+            from transformers import Qwen2Tokenizer
+            self._tok = Qwen2Tokenizer.from_pretrained(self.tokenizer_path, padding_side="right")
+        return self._tok
+
+    def _crop_uint8(self, sample):
+        """The transform's first step (random crop) on the decoded image, kept as a uint8 array until after
+        grouping, so a 1024-sample window holds ~200 MB instead of ~800 MB of float tensors."""
+        for k in ("jpg", "jpeg", "png", "webp", "JPG", "JPEG", "PNG", "WEBP"):
+            if k in sample:
+                img = sample[k]
+                if img is None:
+                    raise Exception("Decode failed — drop this sample")
+                sample["image_u8"] = np.asarray(self._pre(img.convert("RGB")), dtype=np.uint8)
+                break
+        return sample
+
+    def _tokenize(self, sample):
+        ids = self._tokenizer()(sample["caption"], truncation=True, max_length=self.text_max_length)["input_ids"]
+        sample["input_ids"] = ids
+        return sample
+
+    def _group(self, src):
+        """Buffer group_window samples, sort by token length, cut into chunks of group_batch, shuffle the chunk
+        order, emit chunk by chunk (each chunk becomes one per-GPU batch of the DataLoader)."""
+        import random
+        wi = torch.utils.data.get_worker_info()
+        rng = random.Random(hash((os.environ.get("GPIC_SHARD_SEED", "0"), wi.id if wi else 0, os.getpid())))
+        buf = []
+
+        def flush(items):
+            items.sort(key=lambda s: len(s["input_ids"]))
+            chunks = [items[i:i + self.group_batch] for i in range(0, len(items), self.group_batch)]
+            full = [c for c in chunks if len(c) == self.group_batch]
+            rest = [c for c in chunks if len(c) != self.group_batch]
+            rng.shuffle(full)
+            for c in full + rest:   # a partial chunk only at the very end of a window flush
+                yield from c
+
+        for s in src:
+            buf.append(s)
+            if len(buf) == self.group_window:
+                yield from flush(buf)
+                buf = []
+        if buf:
+            yield from flush(buf)
+
+    def _finish(self, s):
+        return (self._post(s["image_u8"]), s["caption"], {"caption_type": s["caption_type"], "input_ids": s["input_ids"]})
+
+    def _collate_grouped(self, samples):
+        imgs = torch.stack([s[0] for s in samples])
+        caps = [s[1] for s in samples]
+        ids = [s[2]["input_ids"] for s in samples]
+        T = max(len(i) for i in ids)
+        T = min(-(-T // self.pad_multiple) * self.pad_multiple, self.text_max_length)
+        pad_id = self._tokenizer().pad_token_id
+        input_ids = torch.full((len(ids), T), pad_id, dtype=torch.long)
+        text_mask = torch.zeros((len(ids), T), dtype=torch.bool)
+        for r, i in enumerate(ids):
+            input_ids[r, :len(i)] = torch.tensor(i, dtype=torch.long)
+            text_mask[r, :len(i)] = True
+        return imgs, caps, {"caption_type": [s[2]["caption_type"] for s in samples], "input_ids": input_ids,
+                            "text_mask": text_mask}
+
     def create_dataset(self):
         shard_spec = make_shard_spec(self.tar_dir, self.tar_pattern)
         print("Using shard_spec:", shard_spec)
@@ -174,6 +254,26 @@ class GPICWebDataset(IterableDataset):
             random.Random(int(seed)).shuffle(urls)
             shards = wds.SimpleShardList(urls)
             print(f"GPIC_SHARD_SEED={seed}: {len(urls)} shards shuffled, first {urls[0].rsplit('/', 1)[-1]}")
+        if self.group_text_len:
+            assert isinstance(self.transform, T.Compose) and len(self.transform.transforms) >= 2
+            self._pre = self.transform.transforms[0]                        # random crop (PIL)
+            self._post = T.Compose(self.transform.transforms[1:])          # ToTensor + Normalize
+            return wds.DataPipeline(
+                shards,
+                wds.split_by_node,
+                wds.split_by_worker,
+                wds.tarfile_to_samples(handler=wds.warn_and_continue),
+                wds.decode("pil", handler=wds.warn_and_continue),
+                wds.select(self._has_caption),
+                wds.map(self._add_caption, handler=wds.warn_and_continue),
+                wds.map(self._crop_uint8, handler=wds.warn_and_continue),
+                wds.select(lambda s: s is not None and "image_u8" in s),
+                wds.map(self._tokenize, handler=wds.warn_and_continue),
+                wds.shuffle(self.shuffle_buffer),
+                self._group,                                               # nothing after this drops a sample
+                wds.map(self._finish),
+            )
+
         dataset = wds.DataPipeline(
             shards,
             wds.split_by_node,
@@ -201,6 +301,7 @@ class GPICWebDataset(IterableDataset):
         return dataset
 
     def build_dataloader(self, batch_size, num_workers):
+        self.group_batch = batch_size   # ladder: one length-sorted chunk per per-GPU batch, whatever the config says
         dataset = self.create_dataset()
         # pinned host batches: the image copy to the GPU becomes asynchronous (Lightning moves batches with
         # non_blocking=True), so it overlaps the previous step instead of stalling the device (perf C1)
@@ -211,6 +312,7 @@ class GPICWebDataset(IterableDataset):
             pin_memory=True,
             persistent_workers=num_workers > 0,
             prefetch_factor=4 if num_workers > 0 else None,
+            **({"collate_fn": self._collate_grouped} if self.group_text_len else {}),
         )
         return loader
 

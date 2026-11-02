@@ -242,14 +242,21 @@ class LightningModel(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx):
         xT, y, metadata = batch
+        meta = {}   # a fresh dict: the conditioner writes the text mask into it (masked mode)
         with torch.no_grad():
-            condition, uncondition = self.conditioner(y)
+            condition, uncondition = self.conditioner(y, meta)
 
         # sample images
-        if self.eval_original_model:
-            samples = self.diffusion_sampler(self.denoiser, xT, condition, uncondition)
-        else:
-            samples = self.diffusion_sampler(self.ema_denoiser, xT, condition, uncondition)
+        net = self.denoiser if self.eval_original_model else self.ema_denoiser
+        y_mask = meta.get("y_mask")
+        if y_mask is not None:   # ladder option B: masked text; with CFG != 1 the sampler's batch is [uncond, cond]
+            null = torch.zeros_like(y_mask)
+            null[:, 0] = True
+            base = net
+
+            def net(x, t, c, _base=base, _m=y_mask, _n=null):
+                return _base(x, t, c, y_mask=_m if x.shape[0] == _m.shape[0] else torch.cat([_n, _m], dim=0))
+        samples = self.diffusion_sampler(net, xT, condition, uncondition)
 
         samples = self.vae.decode(samples)
         # fp32 -1,1 -> uint8 0,255
