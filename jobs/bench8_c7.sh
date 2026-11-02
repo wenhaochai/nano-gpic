@@ -5,6 +5,7 @@
 #SBATCH --time=00:55:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
+#SBATCH --comment=fetchable-partial
 #FETCHABLE
 # The official 8-GPU shape: base and C7 at 32 images per GPU (global 256), a profile window of C7, then on one node side
 # by side 4-GPU C7 at 64 images per GPU (global 256) and at 32 (global 128), for the cost per image.
@@ -13,6 +14,9 @@ source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 G=/scratch/gpfs/GROUP/USER/project/gpic-wt
 R=$G/perf-opt/workspace-runs/bench8_$(date +%m%d_%H%M)
 mkdir -p $R
+# GPU health gate: a throttled GPU slows every DDP rank (node-k17g3, node-k12g1 on 2026-11-01); exit 98 = requeue
+python $G/perf-opt/tools/gpu_health.py > $R/gpu_health.txt 2>&1 || { cat $R/gpu_health.txt; echo "unhealthy GPU on $(hostname); exit 98"; exit 98; }
+cat $R/gpu_health.txt
 GPUS=(${CUDA_VISIBLE_DEVICES//,/ }); [ ${#GPUS[@]} -ge 8 ] || GPUS=(0 1 2 3 4 5 6 7)
 A="${GPUS[0]},${GPUS[1]},${GPUS[2]},${GPUS[3]}"; B="${GPUS[4]},${GPUS[5]},${GPUS[6]},${GPUS[7]}"
 log() { echo "[$(date +%T)] $*" | tee -a $R/phases.log; }
