@@ -116,8 +116,8 @@ model:
       weight_path: Qwen/Qwen3-1.7B
       embed_dim: 2048
       max_length: 320
-      text_mode: masked   # ladder option B: each prompt batch padded to its longest caption (multiple of 64), masked
-      pad_multiple: 64
+      text_mode: masked   # ladder option B: each prompt batch padded to its longest caption (multiple of 8), masked
+      pad_multiple: 8
       attn_implementation: sdpa   # as in lite_ladder.yaml
   denoiser:
     class_path: src.models.transformer.JiT_T2I.JiT_T2I

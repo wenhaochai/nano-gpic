@@ -61,10 +61,14 @@ def main():
     # a GPU already running someone else's process would measure slow for that reason alone: check failed, node unknown
     idx_uuid = dict(l.split(", ") for l in subprocess.run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
                                                            capture_output=True, text=True).stdout.strip().splitlines())
-    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"],
-                          capture_output=True, text=True).stdout.strip().splitlines()
-    busy = {g: [l.split(", ")[1] for l in apps if l.split(", ")[0] == idx_uuid.get(g)] for g in gpus}
-    busy = {g: p for g, p in busy.items() if p}
+    for _ in range(13):   # the previous job's last rank can take seconds to exit (w919: one rank, 1 s after the job)
+        apps = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"],
+                              capture_output=True, text=True).stdout.strip().splitlines()
+        busy = {g: [l.split(", ")[1] for l in apps if l.split(", ")[0] == idx_uuid.get(g)] for g in gpus}
+        busy = {g: p for g, p in busy.items() if p}
+        if not busy:
+            break
+        time.sleep(5)
     if busy:
         print(f"check failed, node unknown: GPUs busy before the test {busy}", flush=True)
         sys.exit(1)

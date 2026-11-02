@@ -1,6 +1,6 @@
 """Ladder sizes, FLOPs per image and steps for an iso-FLOP budget, with the padded text length measured on real
 captions under the option-B grouping (windows of 1024 in stream order, sorted, cut into per-GPU batches of 32, each
-padded to its longest caption rounded up to 64, at most 320).
+padded to its longest caption rounded up to a multiple of 8, at most 320).
 
 python tools/ladder_flops.py [--shards 0 200 400 600 800] [--budget 1.426e19] [--out docs/ladder_runs.json]
 FLOPs: the denoiser's training FLOPs (forward x 3) from its matmuls and attention, as in docs/ladder_plan.md
@@ -60,6 +60,7 @@ def main():
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--out", default="docs/ladder_runs.json")
     ap.add_argument("--check", action="store_true", help="only compare the formulas with the real module")
+    ap.add_argument("--pad-multiple", type=int, default=8)
     a = ap.parse_args()
     if a.check:
         return check()
@@ -76,7 +77,7 @@ def main():
     for w in range(0, len(lens) - 1023, 1024):
         win = sorted(lens[w:w + 1024])
         for c in range(0, 1024, 32):
-            Ts.append(min(-(-max(win[c:c + 32]) // 64) * 64, 320))
+            Ts.append(min(-(-max(win[c:c + 32]) // a.pad_multiple) * a.pad_multiple, 320))
     ET = sum(Ts) / len(Ts)
     ET2 = sum(t * t for t in Ts) / len(Ts)
     hist = {t: round(Ts.count(t) / len(Ts), 4) for t in sorted(set(Ts))}

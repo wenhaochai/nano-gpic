@@ -113,8 +113,8 @@ model:
       embed_dim: 2048
       max_length: 320
       text_mode: masked   # ladder option B: pad to the batch's longest caption, mask the padding
-      pad_multiple: 64
-      # the official kernel. FlexAttention (perf C6) compiles minutes per new T on each rank, in turn (w916); at T ~ 64
+      pad_multiple: 8
+      # the official kernel. FlexAttention (perf C6) compiles minutes per new T on each rank, in turn (w916); at T ~ 50
       # its gain is small
       attn_implementation: sdpa
   denoiser:
@@ -213,7 +213,7 @@ data:
       group_text_len: true   # ladder option B: captions tokenized in the workers, batches grouped by length
       group_window: 1024
       text_max_length: 320
-      pad_multiple: 64
+      pad_multiple: 8
       corrupted_csv: null
       output_fields:
       - image
