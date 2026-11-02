@@ -46,6 +46,12 @@ class EpochShuffledShards(IterableDataset):
         import random
         urls = list(self.urls)
         random.Random(self.seed * 100003 + self.passes).shuffle(urls)
+        wi = torch.utils.data.get_worker_info()
+        if wi is None or wi.id == 0:   # one line per rank and epoch: every rank must print the same shards
+            dist = torch.distributed
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            print(f"[shards] rank {rank} pass {self.passes}: {' '.join(u.rsplit('/', 1)[-1] for u in urls[:3])}",
+                  flush=True)
         self.passes += 1
         for u in urls:
             yield dict(url=u)
