@@ -1,0 +1,17 @@
+# Smoke overlay for the ablation (use last): short run, checkpoints and validation loss every 100 steps.
+trainer:
+  max_steps: 300
+  callbacks:
+  - class_path: src.callbacks.model_checkpoint.CheckpointHook
+    init_args:
+      filename: resume-{step:06d}
+      monitor: null
+      save_last: true
+      save_top_k: 0
+      every_n_train_steps: 100
+  - class_path: src.callbacks.val_loss.FixedValLoss
+    init_args:
+      every: 100
+      num_images: 128
+      num_t: 8
+      batch_size: 32
