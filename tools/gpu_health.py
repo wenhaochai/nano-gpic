@@ -58,6 +58,16 @@ def main():
     vis = os.environ.get("CUDA_VISIBLE_DEVICES")
     gpus = vis.split(",") if vis else [str(i) for i in range(int(subprocess.run(
         ["nvidia-smi", "-L"], capture_output=True, text=True).stdout.count("GPU ")))]
+    # a GPU already running someone else's process would measure slow for that reason alone: check failed, node unknown
+    idx_uuid = dict(l.split(", ") for l in subprocess.run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+                                                           capture_output=True, text=True).stdout.strip().splitlines())
+    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"],
+                          capture_output=True, text=True).stdout.strip().splitlines()
+    busy = {g: [l.split(", ")[1] for l in apps if l.split(", ")[0] == idx_uuid.get(g)] for g in gpus}
+    busy = {g: p for g, p in busy.items() if p}
+    if busy:
+        print(f"check failed, node unknown: GPUs busy before the test {busy}", flush=True)
+        sys.exit(1)
     procs = {}
     for g in gpus:
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=g, HEALTH_GPU=g)
@@ -69,7 +79,13 @@ def main():
         try:
             res[g] = json.loads(out.strip().splitlines()[-1])
         except Exception:
-            res[g] = {"tflops": 0.0, "clock": 0, "temp": 0, "reasons": 0, "error": err[-300:]}
+            res[g] = {"error": (err or out)[-400:]}
+    errors = {g: r["error"] for g, r in res.items() if "error" in r}
+    if errors:   # an exception, OOM or CUDA init error says nothing about the hardware: requeue, do not list the node
+        for g, e in errors.items():
+            print(f"GPU {g}: worker failed: {e}", flush=True)
+        print("check failed, node unknown", flush=True)
+        sys.exit(1)
     med = statistics.median(r["tflops"] for r in res.values())
     bad = []
     for g, r in res.items():
