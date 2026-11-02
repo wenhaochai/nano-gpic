@@ -9,6 +9,7 @@ trainer:
     init_args:
       broadcast_buffers: false
       gradient_as_bucket_view: true
+      ddp_comm_hook: src.utils.ddp_hooks.allreduce_avg_hook   # perf C8: average inside NCCL, not per parameter
   devices: '8'
   num_nodes: 1
   precision: bf16-mixed
