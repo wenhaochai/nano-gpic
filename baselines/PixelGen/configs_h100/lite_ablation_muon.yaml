@@ -1,0 +1,19 @@
+# Muon for the hidden matrices of the transformer blocks, AdamW (official settings) for the rest; use after
+# lite_ablation.yaml: --config configs_h100/lite_ablation.yaml --config configs_h100/lite_ablation_muon.yaml
+model:
+  optimizer:
+    class_path: src.optim.muon.MuonAdamW
+    init_args:
+      lr: 0.0001            # AdamW part: official
+      betas:
+      - 0.9
+      - 0.95
+      eps: 1.0e-08
+      weight_decay: 0.0
+      muon_lr: 0.0001       # Moonlight scaling: AdamW's lr and weight decay carry over
+      muon_weight_decay: 0.0
+      muon_momentum: 0.95
+      muon_nesterov: true
+      ns_steps: 5
+      split: false          # true: orthogonalize the parts of fused matrices separately (CMuon)
+      fused_adamw: true

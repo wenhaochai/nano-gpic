@@ -128,6 +128,9 @@ class LightningModel(pl.LightningModule):
         return [self.ema_tracker]
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
+        # Muon ablation: mark the hidden matrices of the transformer blocks (MuonAdamW reads the marks; AdamW ignores them)
+        from src.optim.muon import tag_muon_params
+        tag_muon_params(self.denoiser)
         params_denoiser = filter_nograd_tensors(self.denoiser.parameters())
         params_trainer = filter_nograd_tensors(self.diffusion_trainer.parameters())
         params_sampler = filter_nograd_tensors(self.diffusion_sampler.parameters())
