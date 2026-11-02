@@ -155,7 +155,9 @@ class EulerSamplerJiT(BaseSampler):
         """
         batch_size = noise.shape[0]
         steps = self.timesteps.to(noise.device, noise.dtype)
-        cfg_condition = torch.cat([uncondition, condition], dim=0)
+        # CFG 1.0 (owner, 2026-11-01): the guided velocity is the conditional one, so skip the unconditional half
+        cfg_on = float(self.guidance) != 1.0
+        cfg_condition = torch.cat([uncondition, condition], dim=0) if cfg_on else None
         x = noise
         x_trajs = [noise,]
         v_trajs = []
@@ -171,18 +173,22 @@ class EulerSamplerJiT(BaseSampler):
             else:
                 w = 0.0
 
-            cfg_x = torch.cat([x, x], dim=0)
-            cfg_t = t_cur.repeat(2)
-            out = net(cfg_x, cfg_t, cfg_condition)
-            # out = out.clamp(min=-1, max=1)
-            out = (out - cfg_x)/(1.0-cfg_t.view(-1, 1, 1, 1)).clamp_min(self.t_eps) # pred v
+            if cfg_on:
+                cfg_x = torch.cat([x, x], dim=0)
+                cfg_t = t_cur.repeat(2)
+                out = net(cfg_x, cfg_t, cfg_condition)
+                # out = out.clamp(min=-1, max=1)
+                out = (out - cfg_x)/(1.0-cfg_t.view(-1, 1, 1, 1)).clamp_min(self.t_eps) # pred v
 
-            # print(t_cur[0])
-            if t_cur[0] > self.guidance_interval_min and t_cur[0] <= self.guidance_interval_max:
-                guidance = self.guidance
-                out = self.guidance_fn(out, guidance)
+                # print(t_cur[0])
+                if t_cur[0] > self.guidance_interval_min and t_cur[0] <= self.guidance_interval_max:
+                    guidance = self.guidance
+                    out = self.guidance_fn(out, guidance)
+                else:
+                    out = self.guidance_fn(out, 1.0)
             else:
-                out = self.guidance_fn(out, 1.0)
+                out = net(x, t_cur, condition)
+                out = (out - x)/(1.0-t_cur.view(-1, 1, 1, 1)).clamp_min(self.t_eps) # pred v (conditional only)
             v = out
             s = ((1/dalpha_over_alpha)*v - x)/(sigma**2 - (1/dalpha_over_alpha)*dsigma_mul_sigma)
             if i < self.num_steps -1 :
