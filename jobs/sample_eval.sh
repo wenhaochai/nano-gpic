@@ -9,16 +9,18 @@
 # EMA net, shared seed-0 noise) -> all samples in one output.npz -> FD-DINOv2/PRDC/MMD vs test_stats.npz with
 # tools/fast_eval.py (gpic_eval's own model, preprocessing, extractor and metrics, sharded over the 8 GPUs; FD equal to
 # the CLI). Phases are timed.
-# usage: sample_eval.sh <run_dir with *.ckpt (latest is used) or a .ckpt> <out_dir>
+# usage: sample_eval.sh <run_dir with *.ckpt (latest is used) or a .ckpt> <out_dir> [extra predict arguments...]
+#   e.g. --model.eval_original_model true samples the raw denoiser instead of the EMA (owner 2026-11-02: short runs
+#   are evaluated with both)
 set -eo pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-SRC=$1; OUT=$2
+SRC=$1; OUT=$2; shift 2
 if [ -d "$SRC" ]; then CKPT=$(ls -t $(find "$SRC" -name "*.ckpt") | head -1); else CKPT=$SRC; fi
-mkdir -p "$OUT"; echo "ckpt=$CKPT" | tee $OUT/ckpt.txt
+mkdir -p "$OUT"; echo "ckpt=$CKPT args=$*" | tee $OUT/ckpt.txt
 cd $PIXGEN
 t0=$(date +%s)
 WANDB_MODE=disabled python main.py predict --config configs_h100/lite_sample.yaml --trainer.devices 8 \
-  --trainer.default_root_dir "$OUT/pred" --ckpt_path "$CKPT" > $OUT/predict.log 2>&1
+  --trainer.default_root_dir "$OUT/pred" --ckpt_path "$CKPT" "$@" > $OUT/predict.log 2>&1
 t1=$(date +%s)
 NPZ=$(find "$OUT/pred" -name output.npz | head -1)
 echo "samples: $NPZ"
