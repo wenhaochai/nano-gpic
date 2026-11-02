@@ -65,6 +65,10 @@ def main():
         peak = max(json.load(open(p))["rows"][-1]["max_alloc_gb"]
                    for p in glob.glob(os.path.join(smk, "bench", tags[-1], "steps_rank*.json")))
         graphs = bench["compile"].get("counters", {}).get("stats", {}).get("unique_graphs")
+        log = open(os.path.join(smk, f"{tags[-1]}.log")).read()
+        warm = re.findall(r"\[warmup\] T=\d+: ([\d.]+) s", log)
+        late = log.split("[warmup] done")[-1].count("Recompiling function")
+        print(f"     {size}: warm-up {warm} s; recompilations after the warm-up (all ranks): {late}", flush=True)
         hours = runs[size]["max_steps"] * med / 3.6e6
         rows.append((size, med, 256 / med * 1e3, peak, graphs, runs[size]["max_steps"], hours))
         if size == "d640":

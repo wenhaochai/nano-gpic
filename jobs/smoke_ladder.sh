@@ -22,6 +22,7 @@ SMK=$WC/runs/gpic-speed/ladder_smoke_$TS
 mkdir -p $SMK
 git -C $WT rev-parse HEAD > $SMK/commit.txt
 export LADDER_WT=$WT LADDER_RUN_ROOT=$SMK
+export TORCH_LOGS=recompiles   # the checker counts the recompilations after the warm-up
 fail=0
 log() { echo "[$(date +%T)] $*" | tee -a $SMK/phases.log; }
 run() {   # run <tag> <wandb id suffix> <train_ladder.sh arguments...>

@@ -33,7 +33,7 @@ LASTCK=$(ls -t $RUN/last*.ckpt 2>/dev/null | head -1)
 if [ -n "$LASTCK" ]; then CKPT_ARGS=(--ckpt_path "$LASTCK"); echo "resuming from $LASTCK"; fi
 BENCH_CB=""
 if [ -n "${BENCH_OUT:-}" ]; then BENCH_CB=',{"class_path":"src.callbacks.bench.BenchTimer"}'; fi
-CB='[{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"resume-{step:06d}","monitor":null,"save_last":true,"save_top_k":0,"every_n_train_steps":'$LAST'}},{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"ms-{step:06d}","monitor":null,"save_last":false,"save_top_k":-1,"every_n_train_steps":'$MS'}}'$BENCH_CB']'
+CB='[{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"resume-{step:06d}","monitor":null,"save_last":true,"save_top_k":0,"every_n_train_steps":'$LAST'}},{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"ms-{step:06d}","monitor":null,"save_last":false,"save_top_k":-1,"every_n_train_steps":'$MS'}},{"class_path":"src.callbacks.compile_warmup.CompileWarmup"}'$BENCH_CB']'
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
 export GPIC_SHARD_SEED=$(date +%s)   # shard order shuffled per launch and per epoch, shared by all ranks
