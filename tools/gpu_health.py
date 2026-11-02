@@ -4,8 +4,11 @@ are compared. Exit 1 if any GPU is below --min-frac of the median throughput or 
 slowdown; the job then exits 98 so wq requeues it (two nodes, node-k17g3 and node-k12g1, each had one GPU throttled
 to ~60% clock on 2026-11-01, which slowed every DDP rank to its pace).
 
-python tools/gpu_health.py [--seconds 8] [--min-frac 0.85]
+python tools/gpu_health.py [--seconds 8] [--min-frac 0.85] [--bad-nodes-file PATH]
+Inside a Slurm job a failing node is also appended to tools/bad_nodes.txt (node, evidence, who, date; under a file
+lock, once), so pilot_manager excludes it and no host there takes wq jobs (controller, 2026-11-01).
 """
+import fcntl
 import argparse
 import json
 import os
@@ -47,6 +50,8 @@ def main():
     ap.add_argument("--seconds", type=float, default=8)
     ap.add_argument("--min-frac", type=float, default=0.85)
     ap.add_argument("--worker", action="store_true")
+    ap.add_argument("--bad-nodes-file", default="/scratch/gpfs/GROUP/USER/tools/bad_nodes.txt"
+                    if os.environ.get("SLURM_JOB_ID") else "")
     a = ap.parse_args()
     if a.worker:
         return worker(a.seconds)
@@ -76,6 +81,20 @@ def main():
             bad.append(g)
     host = os.uname().nodename.split(".")[0]
     print(f"{host}: median {med:.0f} TFLOP/s; {'UNHEALTHY GPUs ' + ','.join(bad) if bad else 'healthy'}", flush=True)
+    if bad and a.bad_nodes_file:
+        ev = "; ".join(f"GPU {g} {res[g]['tflops']:.0f} TFLOP/s, {res[g]['clock']:.0f} MHz, {res[g]['temp']} C, "
+                       f"reasons 0x{res[g]['reasons']:x}" for g in bad)
+        line = (f"{host}   # {ev}; median {med:.0f} TFLOP/s under shared bf16 GEMM load (gpu_health.py in job "
+                f"{os.environ.get('FETCHED_JOB_ID') or os.environ.get('SLURM_JOB_ID')}, genmodel, "
+                f"{time.strftime('%Y-%m-%d %H:%M')})\n")
+        with open(a.bad_nodes_file, "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            listed = {ln.split()[0] for ln in f if ln.strip() and not ln.startswith("#")}
+            if host not in listed:
+                f.write(line)
+                print(f"appended {host} to {a.bad_nodes_file}", flush=True)
+            fcntl.flock(f, fcntl.LOCK_UN)
     sys.exit(1 if bad else 0)
 
 
