@@ -210,7 +210,7 @@ class GPICWebDataset(IterableDataset):
 
     def _tokenize(self, sample):
         ids = self._tokenizer()(sample["caption"], truncation=True, max_length=self.text_max_length)["input_ids"]
-        sample["input_ids"] = ids
+        sample["input_ids"] = ids or [self._tokenizer().eos_token_id]   # never a caption with no valid token
         return sample
 
     def _group(self, src):

@@ -34,7 +34,7 @@ run() {   # run <tag> <wandb id suffix> <train_ladder.sh arguments...>
   log "END $tag rc=$rc"
   [ $rc -eq 0 ] || fail=1
 }
-run d640_a d640 d640 640 9 2 320 --trainer.max_steps 160
+LADDER_PARTIAL_OK=1 run d640_a d640 d640 640 9 2 320 --trainer.max_steps 160
 run d640_b d640 d640 640 9 2 320
 run d768 d768 d768 768 10 2 320
 run d896 d896 d896 896 11 2 320

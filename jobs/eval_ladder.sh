@@ -5,6 +5,7 @@
 #SBATCH --time=00:45:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
+#SBATCH --comment=fetchable
 #FETCHABLE
 # GPIC evaluation of one ladder checkpoint with the ladder's own code (gpic-wt/ladder_run): 50K test captions, the
 # official predict (EMA net, 50 Euler steps, CFG 1.0, the official per-prompt noise) with the masked text path, all
@@ -20,6 +21,15 @@ CKPT=$(ls -t $RUN/ms-*$STEP*.ckpt 2>/dev/null | head -1); [ -n "$CKPT" ] || { ec
 OUT=$RUN/eval_$STEP; mkdir -p $OUT; echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD)" | tee $OUT/ckpt.txt
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
+# the checkpoint loads with strict=False, so wrong sizes would give a wrong FD and no error (review N3)
+python - "$CKPT" $D $NB $NT <<'PY'
+import re, sys, torch
+sd = torch.load(sys.argv[1], map_location="cpu", mmap=True, weights_only=False)["state_dict"]
+d, nb, nt = map(int, sys.argv[2:])
+n = lambda part: len({m.group(1) for k in sd for m in [re.match(rf"ema_denoiser\.{part}\.(\d+)\.", k)] if m})
+got = (sd["ema_denoiser.y_pos_embedding"].shape[-1], n("blocks"), n("text_refine_blocks"))
+assert got == (d, nb, nt), f"checkpoint has d, nb, nt = {got}, arguments {(d, nb, nt)}"
+PY
 t0=$(date +%s)
 WANDB_MODE=disabled python main.py predict --config configs_h100/lite_ladder_sample.yaml --trainer.devices 8 \
   --trainer.default_root_dir "$OUT/pred" --ckpt_path "$CKPT" \

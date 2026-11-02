@@ -33,8 +33,11 @@ class CompileWarmup(Callback):
                 with torch.no_grad():
                     x = pl_module.vae.encode(x)
                     condition, uncondition = pl_module.conditioner([""] * B, metadata)
-                loss = pl_module.diffusion_trainer(pl_module.denoiser, pl_module.ema_denoiser,
-                                                   pl_module.diffusion_sampler, x, condition, uncondition, metadata)
+                # inside DDP's forward context: dynamo checks it at compile time, and only then splits the graph at
+                # the DDP buckets (DDPOptimizer), so these are the graphs a real step would compile (review S2)
+                with trainer.strategy.model._inside_ddp_forward():
+                    loss = pl_module.diffusion_trainer(pl_module.denoiser, pl_module.ema_denoiser,
+                                                       pl_module.diffusion_sampler, x, condition, uncondition, metadata)
             loss["loss"].backward()
             pl_module.denoiser.zero_grad(set_to_none=True)
             torch.cuda.synchronize()

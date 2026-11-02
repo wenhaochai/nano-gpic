@@ -89,7 +89,7 @@ def main():
         g = 3 * fwd(d, nb, nt, ET, ET2)
         N = params(d, nb, nt)
         steps = a.budget / (a.batch * g)
-        steps = int(round(steps / 4000) * 4000)
+        steps = int(round(steps / 800) * 800)   # a multiple of 32 (train_ladder.sh), budget within 0.5% of C0
         imgs = steps * a.batch
         r = {"size": name, "d": d, "nb": nb, "nt": nt, "heads": d // 64, "params_M": round(N / 1e6, 1),
              "gflop_per_img": round(g / 1e9, 1), "max_steps": steps, "ms_every": steps // 4,
