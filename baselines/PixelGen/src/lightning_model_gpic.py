@@ -227,7 +227,8 @@ class LightningModel(pl.LightningModule):
         # --- end per-caption-type ---
 
         self.log_dict(loss, prog_bar=False, on_step=True, sync_dist=False)   # perf C2: no per-step .item() for the bar
-        self.log("train/lr", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, sync_dist=False)
+        if log_now:   # perf C7: a Python float becomes a device tensor through a pageable copy (a host sync)
+            self.log("train/lr", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, sync_dist=False)
         # if self.trainer.global_rank == 0:
         #     print(f"[step {self.global_step}] loss={loss['loss'].item():.4f}")
 

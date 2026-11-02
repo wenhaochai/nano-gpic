@@ -291,11 +291,13 @@ class JiT_T2I(nn.Module):
 
     def fetch_pos(self, height, width, device):
         """(cos, sin) of the 2D RoPE angles, [N, Hc/2] float32 each (perf C4: real parts of freqs_cis)."""
-        if (height, width) not in self.precompute_pos:
+        # perf C7: cached on the device. A CPU cache made every forward copy both tables from pageable memory, and a
+        # pageable copy blocks the host until the GPU has drained its queue (35-41 ms per step, 2026-11-01 profile).
+        key = (height, width, torch.device(device))
+        if key not in self.precompute_pos:
             pos = precompute_freqs_cis_2d(self.hidden_size // self.num_groups, height, width)
-            self.precompute_pos[(height, width)] = (pos.real.contiguous().float(), pos.imag.contiguous().float())
-        cos, sin = self.precompute_pos[(height, width)]
-        return cos.to(device), sin.to(device)
+            self.precompute_pos[key] = (pos.real.contiguous().float().to(device), pos.imag.contiguous().float().to(device))
+        return self.precompute_pos[key]
 
     def initialize_weights(self):
         # Basic initialization

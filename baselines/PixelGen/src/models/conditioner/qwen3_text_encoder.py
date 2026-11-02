@@ -20,8 +20,9 @@ class Qwen3TextEncoder(BaseConditioner):
 
     def _impl_condition(self, y, metadata:dict={}):
         tokenized = self.tokenizer(y, truncation=True, max_length=self.max_length, padding="max_length", return_tensors="pt")
-        input_ids = tokenized.input_ids.cuda()
-        attention_mask = tokenized.attention_mask.cuda()
+        # perf C7: pinned, asynchronous copies (a pageable copy blocks the host until the GPU queue drains)
+        input_ids = tokenized.input_ids.pin_memory().cuda(non_blocking=True)
+        attention_mask = tokenized.attention_mask.pin_memory().cuda(non_blocking=True)
         metadata["valid_length_y"] = torch.sum(attention_mask, dim=-1)
         y = self.model(input_ids=input_ids, attention_mask=attention_mask)[0]
         if y.shape[2] < self.embed_dim:
