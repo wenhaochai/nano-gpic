@@ -15,7 +15,7 @@ source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 ARM=$1; STEP=$2
 WT=/scratch/gpfs/GROUP/USER/project/gpic-wt/abl_run
 RUN=$WC/runs/gpic-speed/exp_abl_$ARM
-CKPT=$(ls $RUN/ms-*$STEP*.ckpt 2>/dev/null | head -1); [ -n "$CKPT" ] || { echo "no ms checkpoint for step $STEP in $RUN"; exit 2; }
+CKPT=$(ls -t $RUN/ms-*$STEP*.ckpt 2>/dev/null | head -1); [ -n "$CKPT" ] || { echo "no ms checkpoint for step $STEP in $RUN"; exit 2; }
 OUT=$RUN/eval_$STEP; mkdir -p $OUT; echo "ckpt=$CKPT" | tee $OUT/ckpt.txt
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD

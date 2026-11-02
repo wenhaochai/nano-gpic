@@ -80,8 +80,8 @@ class MuonAdamW(torch.optim.Optimizer):
             ps = list(g["params"])
             muon_params += [p for p in ps if hasattr(p, "_muon_parts")]
             rest = [p for p in ps if not hasattr(p, "_muon_parts")]
-            if rest:
-                adam_groups.append({**g, "params": rest, "use_muon": False})
+            if rest:   # "fused" in the group makes torch's load_state_dict put the step tensors on the param device
+                adam_groups.append({**g, "params": rest, "use_muon": False, "fused": fused_adamw})
         all_groups = adam_groups
         if muon_params:
             all_groups = all_groups + [{
@@ -178,6 +178,8 @@ class MuonAdamW(torch.optim.Optimizer):
                               else torch.tensor(0.0, dtype=torch.float32))
                 st["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                 st["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+            if self.fused_adamw and st["step"].device != p.device:   # Lightning restores optimizer state on the CPU
+                st["step"] = st["step"].to(p.device, torch.float32)
             params.append(p); grads.append(p.grad); m1.append(st["exp_avg"]); m2.append(st["exp_avg_sq"])
             steps.append(st["step"])
         if not params:

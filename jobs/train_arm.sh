@@ -2,7 +2,7 @@
 #SBATCH -J gpic-abl
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=02:00:00
+#SBATCH --time=03:00:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable-partial
@@ -19,11 +19,15 @@ WT=/scratch/gpfs/GROUP/USER/project/gpic-wt/abl_run
 RUN=$WC/runs/gpic-speed/exp_abl_$ARM
 mkdir -p $RUN
 git -C $WT rev-parse HEAD > $RUN/commit.txt
+# GPU health gate: the GPU-hours comparison needs healthy GPUs; exit 98 = requeue elsewhere
+python $WT/tools/gpu_health.py > $RUN/gpu_health_$(date +%s).txt 2>&1 || { tail -3 $RUN/gpu_health_*.txt; echo "unhealthy GPU on $(hostname); exit 98"; exit 98; }
 CKPT_ARGS=()
-if [ -f "$RUN/last.ckpt" ]; then CKPT_ARGS=(--ckpt_path "$RUN/last.ckpt"); echo "resuming from $RUN/last.ckpt"; fi
+LAST=$(ls -t $RUN/last*.ckpt 2>/dev/null | head -1)
+if [ -n "$LAST" ]; then CKPT_ARGS=(--ckpt_path "$LAST"); echo "resuming from $LAST"; fi
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
-python main.py fit --config configs_h100/lite_ablation.yaml "$@" --exp abl_$ARM \
+export GPIC_SHARD_SEED=$(date +%s)   # shard order shuffled per launch, shared by all ranks (review S4)
+python main.py fit --config configs_h100/lite_ablation.yaml "$@" --tags.exp abl_$ARM \
   --trainer.logger.init_args.name abl_$ARM --trainer.logger.init_args.id abl-$ARM "${CKPT_ARGS[@]}"
 rc=$?
 echo "main.py exit $rc"

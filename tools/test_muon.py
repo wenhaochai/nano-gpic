@@ -120,6 +120,21 @@ def main():
         ok &= d == 0
         say(f"split={split}: state_dict round trip max |diff| {d:.2e}  {'ok' if d == 0 else 'FAIL'}")
 
+        # resume through CPU storage, as Lightning does (review B2): save, load on the CPU, load_state_dict, step
+        import io
+        buf = io.BytesIO(); torch.save(opt.state_dict(), buf); buf.seek(0)
+        sd_cpu = torch.load(buf, map_location="cpu", weights_only=False)
+        f = copy.deepcopy(a); tag_muon_params(f)
+        opt3 = MuonAdamW([{"params": list(f.parameters())}], lr=lr, muon_lr=lr, split=split, ns_dtype="float32")
+        opt3.load_state_dict(sd_cpu)
+        set_grads(f, 11)
+        try:
+            opt3.step(); ok_cpu = True
+        except RuntimeError as e:
+            ok_cpu = False; say("   ", str(e)[:200])
+        ok &= ok_cpu
+        say(f"split={split}: step after a CPU-storage resume: {'ok' if ok_cpu else 'FAIL'}")
+
         if ddp:   # identical weights on every rank, and close to a single-process run of the same steps
             ws = [None] * dist.get_world_size()
             dist.all_gather_object(ws, [p.detach().cpu() for p in a.parameters()])

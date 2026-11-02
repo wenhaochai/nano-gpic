@@ -9,6 +9,13 @@ trainer:
       save_last: true
       save_top_k: 0
       every_n_train_steps: 100
+  - class_path: src.callbacks.model_checkpoint.CheckpointHook   # two hooks as in the real config (review B1)
+    init_args:
+      filename: ms-{step:06d}
+      monitor: null
+      save_last: false
+      save_top_k: -1
+      every_n_train_steps: 200
   - class_path: src.callbacks.val_loss.FixedValLoss
     init_args:
       every: 100

@@ -12,10 +12,12 @@ set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 J=/scratch/gpfs/GROUP/USER/project/gpic-wt/abl_run/jobs/train_arm.sh
 M=configs_h100/lite_ablation_muon.yaml; S=configs_h100/lite_ablation_smoke.yaml
-for a in smoke_adamw smoke_muon smoke_cmuon; do d=$WC/runs/gpic-speed/exp_abl_$a; case "$d" in */exp_abl_smoke_*) rm -rf -- "$d";; esac; done
 log() { echo "[$(date +%T)] $*"; }
-log START smoke_adamw; bash $J smoke_adamw --config $S; log "END smoke_adamw rc=$?"
-log START smoke_muon_200; bash $J smoke_muon --config $M --config $S --trainer.max_steps 200; log "END smoke_muon_200 rc=$?"
-log START smoke_muon_resume; bash $J smoke_muon --config $M --config $S; log "END smoke_muon_resume rc=$?"
-log START smoke_cmuon; bash $J smoke_cmuon --config $M --config $S --model.optimizer.init_args.split true; log "END smoke_cmuon rc=$?"
-log DONE
+FAIL=0; step() { local name=$1; shift; log START $name; "$@"; local rc=$?; log "END $name rc=$rc"; [ $rc -eq 0 ] || FAIL=1; }
+SID=$(date +%m%d%H%M)   # unique W&B ids per smoke (review N6)
+step smoke_adamw bash $J smoke_adamw_$SID --config $S
+step smoke_muon_200 bash $J smoke_muon_$SID --config $M --config $S --trainer.max_steps 200
+step smoke_muon_resume bash $J smoke_muon_$SID --config $M --config $S
+step smoke_cmuon bash $J smoke_cmuon_$SID --config $M --config $S --model.optimizer.init_args.split true
+python3 -c "import torch; c=torch.load('$WC/runs/gpic-speed/exp_abl_smoke_muon_$SID/last.ckpt', map_location='cpu', weights_only=False); print('resumed last.ckpt step', c['global_step'], 'keys', sorted(c))" || FAIL=1
+log "DONE fail=$FAIL"; exit $FAIL
