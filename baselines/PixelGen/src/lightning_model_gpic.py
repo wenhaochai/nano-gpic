@@ -110,7 +110,11 @@ class LightningModel(pl.LightningModule):
 
         # torch.compile
         print("Compiling models...")
-        # GPIC_PROF_DEN_COMPILE_MODE: profiling switch (jobs/prof_ladder.sh), unset in every production run
+        # GPIC_PROF_*: profiling switches (jobs/prof_ladder.sh, jobs/smoke_ladder_kernels.sh), unset in every production run
+        if os.environ.get("GPIC_PROF_AGGRESSIVE_FUSION") == "1":
+            torch._inductor.config.aggressive_fusion = True
+        if os.environ.get("GPIC_PROF_NO_DDP_SPLIT") == "1":
+            torch._dynamo.config.optimize_ddp = False
         self.denoiser.compile(**({"mode": os.environ["GPIC_PROF_DEN_COMPILE_MODE"]} if "GPIC_PROF_DEN_COMPILE_MODE" in os.environ else {}))
         self.ema_denoiser.compile()
         print("Model compilation done.")

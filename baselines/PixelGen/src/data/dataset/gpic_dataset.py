@@ -63,6 +63,17 @@ class EpochShuffledShards(IterableDataset):
             yield dict(url=u)
 
 
+class _CycleBatches:
+    """Profiling only: the same batches forever, so a step has no data worker, pin thread or shared memory behind it."""
+
+    def __init__(self, batches):
+        self.batches = batches
+
+    def __iter__(self):
+        while True:
+            yield from self.batches
+
+
 def load_bad_keys(csv_path):
     bad_keys = set()
     with open(csv_path, newline="") as f:
@@ -407,6 +418,13 @@ class GPICWebDataset(IterableDataset):
             **({"collate_fn": self._collate_cached if self.emb_dir else self._collate_grouped} if self.group_text_len else {}),
         )
         self._dataloader = loader.pipeline[0]
+        n = int(os.environ.get("GPIC_PROF_CYCLE_BATCHES", 0))   # profiling switch (jobs/smoke_ladder_kernels.sh), unset in production
+        if n and self.group_text_len:
+            it = iter(loader)
+            batches = [next(it) for _ in range(n)]              # real, pinned batches, with their caption lengths
+            self.stop_workers()
+            print(f"[cycle] {n} batches in memory, no data workers from here on", flush=True)
+            return _CycleBatches(batches)
         return loader
 
     def stop_workers(self):
