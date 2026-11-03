@@ -19,6 +19,8 @@ def bind_to_gpu_socket(index):
     bus = dict(line.split(", ") for line in out.strip().splitlines())[uuid].lower()[4:]   # 00000000:e1:00.0 -> 0000:e1:00.0
     with open(f"/sys/bus/pci/devices/{bus}/numa_node") as f:
         node = int(f.read())
+    if node < 0:
+        raise ValueError(f"no NUMA node for {bus}")
     with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
         cpus = set()
         for part in f.read().strip().split(","):
@@ -32,9 +34,12 @@ def bind_to_gpu_socket(index):
 
 class HostTuning(Callback):
     def setup(self, trainer, pl_module, stage):
-        # before the dataloaders start, so the data workers follow the rank
+        # before the dataloaders start, so the data workers follow the rank; a few percent of speed never stops a run
         if stage == "fit" and trainer.strategy.root_device.type == "cuda":
-            bind_to_gpu_socket(trainer.strategy.root_device.index)
+            try:
+                bind_to_gpu_socket(trainer.strategy.root_device.index)
+            except Exception as e:
+                print(f"[numa] skipped: {e!r}", flush=True)
 
     def on_train_start(self, trainer, pl_module):
         gc.collect()

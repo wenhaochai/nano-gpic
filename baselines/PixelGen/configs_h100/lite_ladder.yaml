@@ -9,6 +9,7 @@ trainer:
     init_args:
       broadcast_buffers: false
       gradient_as_bucket_view: true
+      bucket_cap_mb: 1000   # fewer all-reduces and fewer DDPOptimizer graphs: d640 35.9 -> 32.3 ms, d1280 92.7 -> 88.4 ms (w974)
   devices: '8'
   num_nodes: 1
   precision: bf16-mixed

@@ -12,7 +12,8 @@
 # driver (tmp/ladder_prof/host_prof). At d1280 it is bound by the GPU, so this arm set shows what the levers do there.
 # Arms: Lightning's per-step SIGTERM broadcast off, gc.freeze after the warm-up, log_dict only on steps that write logs, tcmalloc,
 # the rank and its workers on the GPU's socket, DDP buckets of 100 MB and 1000 MB (fewer all-reduces, fewer DDPOptimizer subgraphs).
-# Measures only. No W&B.
+# Measures only. No W&B. Historical: run at ee4b972 as w974. The switches it sets are gone since a5ab18d: HostTuning, tcmalloc and
+# log_dict only on written steps are now the defaults of jobs/train_ladder.sh, and Lightning's broadcast stays (off changes nothing).
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 WT=$WC/project/gpic-wt/ladder_cache
