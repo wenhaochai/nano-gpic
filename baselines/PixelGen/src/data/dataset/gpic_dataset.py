@@ -228,6 +228,8 @@ class GPICWebDataset(IterableDataset):
         if shard != self._emb_shard:
             if self._emb_fd is not None:
                 os.close(self._emb_fd)
+            # before the opens: after a failed open the next sample retries, and no closed fd number stays in use
+            self._emb_shard, self._emb_fd, self._emb_index = None, None, None
             with np.load(os.path.join(self.emb_dir, shard + ".idx.npz")) as z:
                 self._emb_index = dict(zip(z["keys"].tolist(), zip(z["offsets"].tolist(), z["lengths"].tolist())))
             self._emb_fd = os.open(os.path.join(self.emb_dir, shard + ".emb"), os.O_RDONLY)

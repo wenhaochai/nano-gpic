@@ -87,6 +87,9 @@ def main():
     env = (y[mask] - y32[mask]).abs()
     print(f"     cached vs online: mean abs {mean_d:.5f}, max {max_d:.3f}; bf16 vs fp32 envelope: mean abs {env.mean():.5f}, max {env.max():.3f}")
     check(mean_d <= env.mean().item() * 1.5, "values: cached vs online within the bf16 rounding envelope")
+    eos = torch.tensor([[tok.eos_token_id]], device="cuda")
+    with torch.no_grad():
+        null32 = m32(input_ids=eos, attention_mask=torch.ones_like(eos))[0].cpu()
     del m32
 
     # 4. loader, one process (the real class and collate)
@@ -110,7 +113,11 @@ def main():
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         te.null_embedding = None
         te._impl_uncondition(["x"], {})
-    check((c.null_cpu.float() - te.null_embedding.cpu().float()).abs().max() < 1e-3, "null.pt equals the online null embedding")
+    # same code in tools/encode_captions.py and online; bf16 rounding differs across GPU types (A100 against A40: mean 0.046)
+    online = te.null_embedding.cpu().float()
+    d_null, env_null = (c.null_cpu.float() - online).abs().mean().item(), (online - null32).abs().mean().item()
+    print(f"     null.pt vs online: mean abs {d_null:.5f}; bf16 vs fp32 envelope of the null: mean abs {env_null:.5f}")
+    check(d_null <= env_null * 1.5, "null.pt vs the online null embedding within its bf16 rounding envelope")
     meta = {"text_emb": emb.cuda(), "text_mask": m.cuda()}
     cond, unc = c(list(cap), meta)
     check(cond.dtype == torch.bfloat16 and meta["y_mask"].dtype == torch.bool and (unc[:, 1:] == 0).all() and unc.shape == cond.shape,

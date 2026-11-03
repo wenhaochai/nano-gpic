@@ -5,22 +5,30 @@
 #SBATCH --time=02:00:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
-#SBATCH --comment=fetchable
+#SBATCH --comment=fetchable-partial
 #FETCHABLE
 # The text encoder's outputs for every GPIC Lite training shard (tools/encode_captions.py, docs/text_cache.md), one
 # process per GPU, every 8th shard each. A rerun skips finished shards, so a failed or stopped job is requeued as is.
 # Exit 0 only when tools/check_text_cache.py finds every shard complete.
+# The fileset is shared and the job writes 1.66 TiB, so it starts writing only with 3.5 TiB free, counting what an
+# earlier run has written (controller, 2026-11-03). Otherwise exit 98: wq puts it back in the queue for 30 min.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 WT=${CACHE_WT:-$WC/project/gpic-wt/ladder_cache}
 OUT=$WC/data/gpic/train_emb_qwen3_1.7b
 mkdir -p $OUT
+free_g=$(df -BG --output=avail $WC | tail -1 | tr -d ' G')
+written_g=$(du -s --apparent-size -BG $OUT | cut -f1 | tr -d G)
+echo "free ${free_g} GiB, already written ${written_g} GiB"
+[ $((free_g + written_g)) -ge 3584 ] || { echo "less than 3.5 TiB free: waiting"; exit 98; }
 git -C $WT rev-parse HEAD > $OUT/commit.txt
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
+# logical GPU r -> the id this job was given (a host may hand out any block of its GPUs)
+GPUS=(${CUDA_VISIBLE_DEVICES//,/ }); [ ${#GPUS[@]} -eq 8 ] || GPUS=(0 1 2 3 4 5 6 7)
 pids=()
 for r in 0 1 2 3 4 5 6 7; do
-  CUDA_VISIBLE_DEVICES=$r python $WT/tools/encode_captions.py --shards "$WC/data/gpic/train/gpic_train_*.tar" --out $OUT \
+  CUDA_VISIBLE_DEVICES=${GPUS[$r]} python $WT/tools/encode_captions.py --shards "$WC/data/gpic/train/gpic_train_*.tar" --out $OUT \
     --rank $r --world 8 > $OUT/encode_rank$r.log 2>&1 &
   pids+=($!)
 done

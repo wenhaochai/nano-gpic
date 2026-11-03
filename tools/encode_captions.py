@@ -68,6 +68,8 @@ def main():
     ap.add_argument("--max-length", type=int, default=320)
     ap.add_argument("--limit", type=int, default=0, help="only the first N shards of this process")
     a = ap.parse_args()
+    # small CPU copies only: OpenMP over every visible core spins for minutes in a 7-core cgroup (vis node, 2026-11-02)
+    torch.set_num_threads(1)
     from src.models.conditioner.qwen3_text_encoder import Qwen3TextEncoder
     os.makedirs(a.out, exist_ok=True)
     device = "cuda"

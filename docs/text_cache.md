@@ -24,4 +24,6 @@ the batch mix does not change the values beyond rounding. Padded tokens are zero
 the denoiser's masks keep them out of every attention (tools/test_text_cache.py check 5, bit-identical at fp32).
 The null caption is stored once. Prediction keeps the online encoder.
 
-**Cost.** Disk: see the job's totals. Reads: each sample adds its bytes to the data path.
+**Cost.** Disk: 1.66 TiB (shard 0: 12639 captions, mean 44.0 tokens, 2.12 GiB; 180 KB per caption). The bytes have 2.81 + 7.97 bits
+of entropy per 16 bits, so per-sample compression could save at most 33%, and raw bytes keep one code path. Compute: 28 s per
+shard on a vis A100, so 801 shards take about 30 minutes on 8 H100s, once. Reads: each sample adds 180 KB to the data path.

@@ -25,7 +25,8 @@ def main():
         log = os.path.join(out, f"{arm}.log")
         late = open(log, errors="replace").read().split("[warmup] done")[-1].count("Recompiling function") if os.path.exists(log) else "?"
         print(f"\n{arm}: steps {len(rows)}; step ms median {st.median(steps):.1f} mean {st.fmean(steps):.1f}; "
-              f"peak GB {w[-1]['max_alloc_gb']:.1f}; recompilations after the warm-up {late}")
+              f"data wait ms {1e3 * st.median(r['data_wait_s'] for r in w):.2f}; peak GB {w[-1]['max_alloc_gb']:.1f}; "
+              f"recompilations after the warm-up {late}")
         files = sorted(glob.glob(os.path.join(d, "stages_rank*.json")))
         if not files:
             continue
