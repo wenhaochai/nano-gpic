@@ -32,6 +32,9 @@ print("Defined val_transform function (from dataset.augmentation import center_c
 # Utils
 # -------------------------
 
+EMB_DIM = 2048                # the text encoder's output width
+EMB_TOKEN_BYTES = EMB_DIM * 2   # one token of bf16 outputs
+
 class EpochShuffledShards(IterableDataset):
     """ladder: the shard list, reshuffled at every pass with Random(seed * 100003 + pass). Every rank and worker holds
     its own copy and makes exactly one pass per epoch (persistent workers call iter() once per epoch), so in epoch e
@@ -119,6 +122,7 @@ class GPICWebDataset(IterableDataset):
         text_max_length=320,
         pad_multiple=64,
         tokenizer_path="Qwen/Qwen3-1.7B",
+        emb_dir=None,
     ):
         self.tar_dir = tar_dir
         self.tar_pattern = tar_pattern
@@ -130,6 +134,9 @@ class GPICWebDataset(IterableDataset):
         self.text_max_length, self.pad_multiple = text_max_length, pad_multiple
         self.tokenizer_path = tokenizer_path
         self._tok = None
+        # ladder: with emb_dir (tools/encode_captions.py) a sample carries its text encoder outputs, in place of token ids
+        self.emb_dir = emb_dir
+        self._emb_shard, self._emb_fd, self._emb_index = None, None, None
         self.samples_per_tar = samples_per_tar
 
         # print("samples_per_tar:", samples_per_tar)
@@ -211,6 +218,24 @@ class GPICWebDataset(IterableDataset):
     def _tokenize(self, sample):
         ids = self._tokenizer()(sample["caption"], truncation=True, max_length=self.text_max_length)["input_ids"]
         sample["input_ids"] = ids or [self._tokenizer().eos_token_id]   # never a caption with no valid token
+        sample["text_len"] = len(sample["input_ids"])
+        return sample
+
+    def _attach_emb(self, sample):
+        """The sample's real-token encoder outputs, as raw bf16 bytes, from its shard's file. Read here, in tar order,
+        so GPFS sees one sequential stream per worker. A key with no entry raises, and the handler drops the sample."""
+        shard = os.path.basename(sample["__url__"])[:-len(".tar")]
+        if shard != self._emb_shard:
+            if self._emb_fd is not None:
+                os.close(self._emb_fd)
+            with np.load(os.path.join(self.emb_dir, shard + ".idx.npz")) as z:
+                self._emb_index = dict(zip(z["keys"].tolist(), zip(z["offsets"].tolist(), z["lengths"].tolist())))
+            self._emb_fd = os.open(os.path.join(self.emb_dir, shard + ".emb"), os.O_RDONLY)
+            self._emb_shard = shard
+        off, n = self._emb_index[sample["__key__"]]
+        raw = os.pread(self._emb_fd, n * EMB_TOKEN_BYTES, off * EMB_TOKEN_BYTES)
+        assert len(raw) == n * EMB_TOKEN_BYTES, (shard, sample["__key__"], len(raw), n)
+        sample["text_emb"], sample["text_len"] = raw, n
         return sample
 
     def _group(self, src):
@@ -225,7 +250,7 @@ class GPICWebDataset(IterableDataset):
             # only full chunks: a window is a whole number of chunks, so the only partial chunk is the tail of a
             # worker's stream (< group_batch samples per worker per epoch), which is dropped. Every per-GPU batch is
             # then one full chunk, and no odd batch size reaches the compiled graphs.
-            items.sort(key=lambda s: len(s["input_ids"]))
+            items.sort(key=lambda s: s["text_len"])
             full = [items[i:i + self.group_batch] for i in range(0, len(items) - self.group_batch + 1, self.group_batch)]
             rng.shuffle(full)
             for c in full:
@@ -240,7 +265,20 @@ class GPICWebDataset(IterableDataset):
             yield from flush(buf)
 
     def _finish(self, s):
-        return (self._post(s["image_u8"]), s["caption"], {"caption_type": s["caption_type"], "input_ids": s["input_ids"]})
+        text = {"text_emb": s["text_emb"], "text_len": s["text_len"]} if self.emb_dir else {"input_ids": s["input_ids"]}
+        return (self._post(s["image_u8"]), s["caption"], {"caption_type": s["caption_type"], **text})
+
+    def _collate_cached(self, samples):
+        imgs = torch.stack([s[0] for s in samples])
+        lens = [s[2]["text_len"] for s in samples]
+        T = min(-(-max(lens) // self.pad_multiple) * self.pad_multiple, self.text_max_length)
+        emb = torch.zeros((len(samples), T, EMB_DIM), dtype=torch.bfloat16)
+        text_mask = torch.zeros((len(samples), T), dtype=torch.bool)
+        for r, (s, n) in enumerate(zip(samples, lens)):
+            emb[r, :n] = torch.frombuffer(bytearray(s[2]["text_emb"]), dtype=torch.bfloat16).view(n, EMB_DIM)
+            text_mask[r, :n] = True
+        return imgs, [s[1] for s in samples], {"caption_type": [s[2]["caption_type"] for s in samples], "text_emb": emb,
+                                               "text_mask": text_mask}
 
     def _collate_grouped(self, samples):
         imgs = torch.stack([s[0] for s in samples])
@@ -294,7 +332,7 @@ class GPICWebDataset(IterableDataset):
                 wds.map(self._add_caption, handler=wds.warn_and_continue),
                 wds.map(self._crop_uint8, handler=wds.warn_and_continue),
                 wds.select(lambda s: s is not None and "image_u8" in s),
-                wds.map(self._tokenize, handler=wds.warn_and_continue),
+                wds.map(self._attach_emb if self.emb_dir else self._tokenize, handler=wds.warn_and_continue),
                 wds.shuffle(self.shuffle_buffer),
                 self._group,                                               # nothing after this drops a sample
                 wds.map(self._finish),
@@ -339,7 +377,7 @@ class GPICWebDataset(IterableDataset):
             pin_memory=True,
             persistent_workers=num_workers > 0,
             prefetch_factor=4 if num_workers > 0 else None,
-            **({"collate_fn": self._collate_grouped} if self.group_text_len else {}),
+            **({"collate_fn": self._collate_cached if self.emb_dir else self._collate_grouped} if self.group_text_len else {}),
         )
         return loader
 

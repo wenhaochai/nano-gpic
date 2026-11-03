@@ -21,13 +21,17 @@ class CompileWarmup(Callback):
 
     def on_train_start(self, trainer, pl_module):
         B, dev = self.batch_size, pl_module.device
-        pad = pl_module.conditioner.tokenizer.pad_token_id
+        cached = not hasattr(pl_module.conditioner, "tokenizer")   # outputs read from the batch (cached_text.py)
         for T in self.lengths:
             t0 = time.time()
-            ids = torch.full((B, T), pad, dtype=torch.long, device=dev)
             mask = torch.zeros(B, T, dtype=torch.bool, device=dev)
             mask[:, :T // 2] = True   # with padding, as real batches have: HF skips the mask when nothing is padded
-            metadata = {"input_ids": ids, "text_mask": mask, "global_step": trainer.global_step}
+            if cached:
+                text = {"text_emb": torch.zeros(B, T, pl_module.conditioner.embed_dim, dtype=torch.bfloat16, device=dev)}
+            else:
+                pad = pl_module.conditioner.tokenizer.pad_token_id
+                text = {"input_ids": torch.full((B, T), pad, dtype=torch.long, device=dev)}
+            metadata = {**text, "text_mask": mask, "global_step": trainer.global_step}
             x = torch.zeros(B, 3, self.image_size, self.image_size, device=dev)
             with trainer.precision_plugin.train_step_context():
                 with torch.no_grad():

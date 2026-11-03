@@ -106,17 +106,11 @@ model:
     init_args:
       scale: 1.0
       shift: 0.0
-  conditioner:
-    class_path: src.models.conditioner.qwen3_text_encoder.Qwen3TextEncoder
+  conditioner:   # outputs of Qwen/Qwen3-1.7B, computed once by tools/encode_captions.py (docs/text_cache.md)
+    class_path: src.models.conditioner.cached_text.CachedTextConditioner
     init_args:
-      weight_path: Qwen/Qwen3-1.7B
+      emb_dir: /scratch/gpfs/GROUP/USER/data/gpic/train_emb_qwen3_1.7b
       embed_dim: 2048
-      max_length: 320
-      text_mode: masked   # ladder option B: pad to the batch's longest caption, mask the padding
-      pad_multiple: 8
-      # the official kernel. FlexAttention (perf C6) compiles minutes per new T on each rank, in turn (w916); at T ~ 50
-      # its gain is small
-      attn_implementation: sdpa
   denoiser:
     class_path: src.models.transformer.JiT_T2I.JiT_T2I
     init_args:
@@ -214,6 +208,7 @@ data:
       group_window: 1024
       text_max_length: 320
       pad_multiple: 8
+      emb_dir: /scratch/gpfs/GROUP/USER/data/gpic/train_emb_qwen3_1.7b
       corrupted_csv: null
       output_fields:
       - image
