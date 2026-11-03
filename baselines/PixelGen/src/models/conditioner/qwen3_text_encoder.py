@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 from src.models.conditioner.base import BaseConditioner
@@ -19,7 +21,11 @@ class Qwen3TextEncoder(BaseConditioner):
         # perf C6: FlexAttention for the causal + padding mask (same masking; SDPA had to fall back to the
         # memory-efficient kernel for this mask, 24% tensor-core active under ncu)
         self.model = Qwen3Model.from_pretrained(weight_path, attn_implementation=attn_implementation).to(torch.bfloat16)
-        self.model.compile()
+        # profiling switches (jobs/prof_ladder.sh), unset in every production run
+        self.model.compile(**({"mode": os.environ["GPIC_PROF_TE_COMPILE_MODE"]} if "GPIC_PROF_TE_COMPILE_MODE" in os.environ else {}))
+        self.cudagraphs = os.environ.get("GPIC_PROF_TE_COMPILE_MODE") == "reduce-overhead"
+        self.no_padding_mask = bool(os.environ.get("GPIC_PROF_TE_NO_MASK"))
+        self.extra = {"use_cache": False} if os.environ.get("GPIC_PROF_TE_NO_CACHE") else {}
         self.uncondition_embedding = None
         self.embed_dim = embed_dim
         self.max_length = max_length
@@ -37,7 +43,12 @@ class Qwen3TextEncoder(BaseConditioner):
                 tok = self.tokenizer(y, truncation=True, max_length=self.max_length, padding="longest",
                                      pad_to_multiple_of=self.pad_multiple, return_tensors="pt")
                 input_ids, mask = self._to_cuda(tok.input_ids), self._to_cuda(tok.attention_mask.bool())
-            out = self.model(input_ids=input_ids, attention_mask=mask.long())[0]
+            # with right padding the causal mask already keeps a real token from seeing padding (no_padding_mask)
+            if self.cudagraphs:
+                torch.compiler.cudagraph_mark_step_begin()
+            out = self.model(input_ids=input_ids, attention_mask=None if self.no_padding_mask else mask.long(), **self.extra)[0]
+            if self.cudagraphs:   # a CUDA graph's outputs live in its static memory, overwritten by the next call
+                out = out.clone()
             if isinstance(metadata, dict):
                 metadata["y_mask"] = mask.bool()
             return self._fit_dim(out)
@@ -65,7 +76,9 @@ class Qwen3TextEncoder(BaseConditioner):
             # null caption: one eos token at position 0, zeros after; the CFG-dropout code sets its mask row
             if self.null_embedding is None:
                 ids = torch.tensor([[self.tokenizer.eos_token_id]], device=self.model.device)
-                self.null_embedding = self._fit_dim(self.model(input_ids=ids, attention_mask=torch.ones_like(ids))[0])
+                if self.cudagraphs:
+                    torch.compiler.cudagraph_mark_step_begin()
+                self.null_embedding = self._fit_dim(self.model(input_ids=ids, attention_mask=torch.ones_like(ids), **self.extra)[0]).clone()
             T = metadata["y_mask"].shape[1] if isinstance(metadata, dict) and "y_mask" in metadata else 1
             out = torch.zeros(len(y), T, self.null_embedding.shape[2], device=self.null_embedding.device,
                               dtype=self.null_embedding.dtype)

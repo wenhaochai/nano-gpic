@@ -7,6 +7,9 @@ It changes nothing that the job computes. Environment switches (all off by defau
   BENCH_CUDA_PROFILER=a:b   cudaProfilerStart/Stop around steps [a, b) (capture window for nsys / ncu)
   BENCH_MARKERS=1           stage ranges (record_function + NVTX): stage:fwd, stage:bwd, stage:opt, stage:between
                             (on automatically when BENCH_PROFILE or BENCH_CUDA_PROFILER is set)
+  BENCH_STAGES=1            per-step GPU span and host time of each stage, from CUDA events and the host clock, with no
+                            profiler: before the text encoder, text encoder, denoiser forward, backward, the gap
+                            before the optimizer, clip + optimizer, between steps. Writes stages_rank<r>.json.
 Per rank it writes steps_rank<r>.json: per-step GPU span and start-to-start step time (CUDA events, read once at
 the end so CPU run-ahead is kept), host time, data wait, peak memory, RSS, startup times, and compile statistics.
 """
@@ -58,6 +61,8 @@ class BenchTimer(Callback):
         self.t_fit_start = self.t_last_end = None
         self.ev = None
         self.mark = None
+        self.stages_on = bool(os.environ.get("BENCH_STAGES"))
+        self.ticks, self.all_ticks = [], []
 
     # ------------------------------------------------------------------ stage markers
     def _stage(self, name):
@@ -67,12 +72,31 @@ class BenchTimer(Callback):
             self.mark.close()
         self.mark = _Marker(name) if name else None
 
+    def _tick(self, name):
+        if self.stages_on:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            self.ticks.append((name, ev, time.perf_counter()))
+
+    def _wrap_conditioner(self, pl_module):
+        cond = pl_module.conditioner
+        inner = cond._impl_condition
+
+        def timed(*args, **kwargs):
+            self._tick("cond_in")
+            out = inner(*args, **kwargs)
+            self._tick("cond_out")
+            return out
+        cond._impl_condition = timed
+
     def on_fit_start(self, trainer, pl_module):
         self.t_fit_start = time.time()
 
     def on_train_start(self, trainer, pl_module):
         self.t_train_start = time.time()
         torch.cuda.reset_peak_memory_stats()
+        if self.stages_on:
+            self._wrap_conditioner(pl_module)
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         now = time.time()
@@ -91,6 +115,11 @@ class BenchTimer(Callback):
                     "t_start": now - _T0}
         self.ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         self.ev[0].record()
+        if self.stages_on:
+            if self.ticks:
+                self.all_ticks.append(self.ticks)
+            self.ticks = []
+            self._tick("start")
         if self.prof is not None:
             self._rf = torch.profiler.record_function(f"ProfilerStep#{step}")
             self._rf.__enter__()
@@ -98,16 +127,20 @@ class BenchTimer(Callback):
 
     def on_before_backward(self, trainer, pl_module, loss):
         self._stage("stage:bwd")
+        self._tick("bwd_in")
 
     def on_after_backward(self, trainer, pl_module):
         self._stage("stage:after_bwd")
+        self._tick("bwd_out")
 
     def on_before_optimizer_step(self, trainer, pl_module, optimizer):
         self._stage("stage:opt")
+        self._tick("opt_in")
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self._stage(None)
         self.ev[1].record()
+        self._tick("end")
         if self.prof is not None:
             self._rf.__exit__(None, None, None)
         now = time.time()
@@ -148,6 +181,18 @@ class BenchTimer(Callback):
                 f.write(ka(group_by_stack_n=8).table(sort_by="self_cuda_time_total", row_limit=200,
                                                      max_name_column_width=70))
 
+    def _write_stages(self, r):
+        """Each step: GPU span (CUDA events) and host time between the ticks, the last span up to the next step's start."""
+        rows = []
+        for ticks, nxt in zip(self.all_ticks, self.all_ticks[1:]):
+            row = {}
+            seq = ticks + [("next", nxt[0][1], nxt[0][2])]
+            for (a, ea, ta), (b, eb, tb) in zip(seq, seq[1:]):
+                row[f"{a}>{b}"] = (ea.elapsed_time(eb), (tb - ta) * 1e3)
+            rows.append(row)
+        with open(os.path.join(self.out, f"stages_rank{r}.json"), "w") as f:
+            json.dump(rows, f)
+
     def on_train_end(self, trainer, pl_module):
         self._stage(None)
         torch.cuda.synchronize()
@@ -157,6 +202,8 @@ class BenchTimer(Callback):
                 row["step_ms"] = a.elapsed_time(self.events[i + 1][0])   # start-to-start: the steady step time
         os.makedirs(self.out, exist_ok=True)
         r = trainer.global_rank
+        if self.stages_on:
+            self._write_stages(r)
         compile_stats = {}
         try:
             import torch._dynamo.utils as du

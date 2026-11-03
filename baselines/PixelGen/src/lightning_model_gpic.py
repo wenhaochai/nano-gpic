@@ -110,7 +110,8 @@ class LightningModel(pl.LightningModule):
 
         # torch.compile
         print("Compiling models...")
-        self.denoiser.compile()
+        # GPIC_PROF_DEN_COMPILE_MODE: profiling switch (jobs/prof_ladder.sh), unset in every production run
+        self.denoiser.compile(**({"mode": os.environ["GPIC_PROF_DEN_COMPILE_MODE"]} if "GPIC_PROF_DEN_COMPILE_MODE" in os.environ else {}))
         self.ema_denoiser.compile()
         print("Model compilation done.")
 
