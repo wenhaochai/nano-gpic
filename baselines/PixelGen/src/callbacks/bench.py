@@ -13,32 +13,14 @@ It changes nothing that the job computes. Environment switches (all off by defau
 Per rank it writes steps_rank<r>.json: per-step GPU span and start-to-start step time (CUDA events, read once at
 the end so CPU run-ahead is kept), host time, data wait, peak memory, RSS, startup times, and compile statistics.
 """
-import gc
 import json
 import os
-import subprocess
 import time
 
 import torch
 from lightning.pytorch import Callback
 
 _T0 = float(os.environ.get("BENCH_T0", time.time()))  # process start (set by the launcher)
-
-
-def _bind_to_gpu_socket(index):
-    """This thread, its later threads and children on the CPUs of the GPU's NUMA node."""
-    uuid = f"GPU-{torch.cuda.get_device_properties(index).uuid}"
-    out = subprocess.check_output(["nvidia-smi", "--query-gpu=uuid,pci.bus_id", "--format=csv,noheader"], text=True)
-    bus = dict(line.split(", ") for line in out.strip().splitlines())[uuid].lower()[4:]   # 00000000:e1:00.0 -> 0000:e1:00.0
-    with open(f"/sys/bus/pci/devices/{bus}/numa_node") as f:
-        node = int(f.read())
-    with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
-        cpus = set()
-        for part in f.read().strip().split(","):
-            a, _, b = part.partition("-")
-            cpus.update(range(int(a), int(b or a) + 1))
-    os.sched_setaffinity(0, cpus & os.sched_getaffinity(0))
-    print(f"[numa] device {index} {bus} node {node}: {len(os.sched_getaffinity(0))} CPUs", flush=True)
 
 
 def _rss_gb():
@@ -109,18 +91,10 @@ class BenchTimer(Callback):
 
     def on_fit_start(self, trainer, pl_module):
         self.t_fit_start = time.time()
-        if os.environ.get("GPIC_PROF_NUMA"):   # before the data workers fork, so they follow the rank
-            _bind_to_gpu_socket(trainer.strategy.root_device.index)
 
     def on_train_start(self, trainer, pl_module):
         self.t_train_start = time.time()
         torch.cuda.reset_peak_memory_stats()
-        # profiling switches (jobs/smoke_ladder_host.sh), unset in production. After CompileWarmup in the callback order.
-        if os.environ.get("GPIC_PROF_NO_SIGTERM_BCAST"):
-            trainer.fit_loop.epoch_loop._broadcast_sigterm_tensor = lambda: None
-        if os.environ.get("GPIC_PROF_GC_FREEZE"):
-            gc.collect()
-            gc.freeze()
         if self.stages_on:
             self._wrap_conditioner(pl_module)
 

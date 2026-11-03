@@ -227,7 +227,7 @@ class LightningModel(pl.LightningModule):
 
         # --- end per-caption-type ---
 
-        if log_now or not os.environ.get("GPIC_PROF_LOG_ONLY_WHEN_WRITTEN"):   # profiling switch, jobs/smoke_ladder_host.sh
+        if log_now:   # about 0.7 ms of Python per step, for values that are written only on these steps (W&B and the logger get the same)
             self.log_dict(loss, prog_bar=False, on_step=True, sync_dist=False)   # perf C2: no per-step .item() for the bar
         if log_now:   # perf C7: a Python float becomes a device tensor through a pageable copy (a host sync)
             self.log("train/lr", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, sync_dist=False)
