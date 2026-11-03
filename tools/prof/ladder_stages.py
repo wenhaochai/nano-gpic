@@ -7,6 +7,7 @@ median stage spans on rank 0, GPU ms / host ms; the slowest stage median over al
 import glob
 import json
 import os
+import re
 import statistics as st
 import sys
 
@@ -30,10 +31,16 @@ def main():
         # the whole arm: a worker's window read comes once per 1024 steps, so the last 200 steps may not hold one
         full = [r for r in rows if "t_start" in r][32:]
         if len(full) > 1:
-            gaps = [b["t_start"] - a["t_start"] for a, b in zip(full, full[1:])]
-            stalls = [g for g in gaps if g > 0.5]
+            launches = glob.glob(os.path.join(out, arm, "exp_ladder_*", "launches.txt"))
+            every = re.findall(r"last_every=(\d+)", open(launches[0]).read()) if launches else []
+            last = int(every[-1]) if every else 0
+            pairs = [(a["step"], b["t_start"] - a["t_start"]) for a, b in zip(full, full[1:])]
+            gaps = [g for _, g in pairs]
+            saves = [g for s, g in pairs if last and (s + 1) % last == 0]   # a checkpoint save lands after that step
+            stalls = [(s, g) for s, g in pairs if g > 0.5 and not (last and (s + 1) % last == 0)]
             print(f"  whole arm: {len(gaps)} steps, {1e3 * st.fmean(gaps):.1f} ms per step, median {1e3 * st.median(gaps):.1f} ms; "
-                  f"{len(stalls)} stalls over 0.5 s, {sum(stalls):.1f} s of {sum(gaps):.1f} s; rank 0's own data wait {sum(r['data_wait_s'] for r in full):.1f} s")
+                  f"{len(saves)} last.ckpt saves {sum(saves):.1f} s; {len(stalls)} other stalls over 0.5 s, {sum(g for _, g in stalls):.1f} s of {sum(gaps):.1f} s "
+                  f"({' '.join(f'{s}:{g:.1f}' for s, g in stalls[:8])}); rank 0's own data wait {sum(r['data_wait_s'] for r in full):.1f} s")
         files = sorted(glob.glob(os.path.join(d, "stages_rank*.json")))
         if not files:
             continue

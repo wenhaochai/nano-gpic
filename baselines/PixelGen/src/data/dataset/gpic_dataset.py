@@ -140,7 +140,7 @@ class GPICWebDataset(IterableDataset):
         # ladder: with emb_dir (tools/encode_captions.py) a sample carries its text encoder outputs, in place of token ids
         self.emb_dir = emb_dir
         self._emb_shard, self._emb_fd, self._emb_index = None, None, None
-        self._last_sample = None
+        self._last_sample, self._repeats = None, 0
         if emb_dir:   # a hole in the cache stops the run here: every shard of the pattern has its two files
             names = [os.path.basename(u)[:-len(".tar")] for u in expand_pattern(tar_pattern)]
             missing = [n for n in names if not (os.path.exists(os.path.join(emb_dir, n + ".idx.npz"))
@@ -220,10 +220,7 @@ class GPICWebDataset(IterableDataset):
         crop, as a uint8 array."""
         for k in IMAGE_SUFFIXES:
             if k in sample:
-                img = _DECODE_PIL(k, sample[k])
-                if img is None:
-                    raise ValueError(f"no decoder for .{k}")
-                return np.asarray(self._pre(img.convert("RGB")), dtype=np.uint8)
+                return np.asarray(self._pre(_DECODE_PIL(k, sample[k]).convert("RGB")), dtype=np.uint8)
         raise ValueError("no image")
 
     def _tokenize(self, sample):
@@ -286,16 +283,18 @@ class GPICWebDataset(IterableDataset):
         """The image work, after grouping. A window needs only the text lengths to sort, so reading it is cheap, and a
         worker's CPU follows the batches it emits. With the images decoded in the window, every worker spends about 6 s
         of CPU at once, and the step waits for it every 1024 steps (docs/text_cache.md). Nothing after _group may drop
-        a sample, or a batch would lose its size: an image that fails to decode repeats the sample before it."""
+        a sample, or a batch would lose its size: an image that fails to decode repeats the sample before it. A fault
+        on every image must not train on one image, so 8 failures in a row stop the run."""
         text = {"text_emb": s["text_emb"], "text_len": s["text_len"]} if self.emb_dir else {"input_ids": s["input_ids"]}
         try:
             out = (self._post(self._crop_uint8(s)), s["caption"], {"caption_type": s["caption_type"], **text})
         except Exception as exn:
-            if self._last_sample is None:
+            self._repeats += 1
+            if self._last_sample is None or self._repeats > 8:
                 raise
             warnings.warn(f"{s.get('__key__')}: {exn!r}: repeating the sample before it")
             return self._last_sample
-        self._last_sample = out
+        self._last_sample, self._repeats = out, 0
         return out
 
     def _collate_cached(self, samples):

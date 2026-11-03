@@ -85,8 +85,8 @@ def passes():
 def drops(tag):
     def f():
         elog = open(f"{out}/{tag}.log", errors="replace").read()
-        n = len(re.findall(r"webdataset/handlers\.py|KeyError|Traceback", elog))
-        return n == 0, f"{n} dropped samples or errors"
+        n = len(re.findall(r"webdataset/handlers\.py|KeyError|Traceback|repeating the sample before it", elog))
+        return n == 0, f"{n} dropped or repeated samples or errors"
     return f
 
 
