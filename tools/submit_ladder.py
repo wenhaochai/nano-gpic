@@ -24,7 +24,7 @@ for r in runs:
     size, d, nb, nt, steps = r["size"], str(r["d"]), str(r["nb"]), str(r["nt"]), r["max_steps"]
     sec = int(1.25 * (steps * ms[size] / 1000 + 900))
     t = f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:00"
-    w = submit("--partial", "--time", t, "-J", f"gpic-ladder-{size}", f"{WT}/jobs/train_ladder.sh", size, d, nb, nt, str(steps))
-    ev = [submit("--after", f"ok:{w}", "-J", f"gpic-ladder-eval-{size}", f"{WT}/jobs/eval_ladder.sh", size, d, nb, nt, str(s))
+    w = submit("--partial", "--prio", "10", "--time", t, "-J", f"gpic-ladder-{size}", f"{WT}/jobs/train_ladder.sh", size, d, nb, nt, str(steps))
+    ev = [submit("--after", f"ok:{w}", "--prio", "1", "-J", f"gpic-ladder-eval-{size}", f"{WT}/jobs/eval_ladder.sh", size, d, nb, nt, str(s))
           for s in (steps // 4, steps // 2, 3 * steps // 4, steps)]
     print(json.dumps({"size": size, "train": w, "time": t, "evals": ev}), flush=True)

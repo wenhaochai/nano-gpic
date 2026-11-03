@@ -39,6 +39,7 @@ CB='[{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
 export GPIC_SHARD_SEED=$(date +%s)   # shard order shuffled per launch and per epoch, shared by all ranks
+export TORCHINDUCTOR_CPP_WRAPPER=1   # kernels launched from C++: d640 39.3 -> 32.6 ms; the same math up to bf16 rounding (tools/test_cpp_launcher.py)
 python main.py fit --config configs_h100/lite_ladder.yaml --trainer.default_root_dir $ROOT \
   --trainer.max_steps $STEPS --trainer.callbacks "$CB" \
   --model.denoiser.init_args.hidden_size $D --model.denoiser.init_args.num_groups $((D / 64)) \

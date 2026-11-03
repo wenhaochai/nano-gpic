@@ -75,7 +75,8 @@ def first_step():
 def passes():
     elog = open(f"{out}/epoch.log", errors="replace").read()
     seen = {}
-    for rank, p, shards in re.findall(r"\[shards\] rank (\d+) pass (\d+): (.+)", elog):
+    # ranks print on one line at times, so no greedy match to the end of the line
+    for rank, p, shards in re.findall(r"\[shards\] rank (\d+) pass (\d+): (\S+\.tar \S+\.tar \S+\.tar)", elog):
         seen.setdefault(int(p), {})[int(rank)] = shards.strip()
     full = {p: v for p, v in seen.items() if len(v) == 8}
     same = all(len(set(v.values())) == 1 for v in full.values())
