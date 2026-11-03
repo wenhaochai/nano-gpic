@@ -406,7 +406,16 @@ class GPICWebDataset(IterableDataset):
             prefetch_factor=4 if num_workers > 0 else None,
             **({"collate_fn": self._collate_cached if self.emb_dir else self._collate_grouped} if self.group_text_len else {}),
         )
+        self._dataloader = loader.pipeline[0]
         return loader
+
+    def stop_workers(self):
+        """The data workers in the right order: the pin thread, then the workers, which exit at once. Without this call, torch's
+        exit hook gives each persistent worker 5 s before it terminates it, because nobody told the worker to stop: 166 s of 8
+        idle GPUs at the end of every launch with 32 workers (tools/test_worker_exit.py)."""
+        it = getattr(getattr(self, "_dataloader", None), "_iterator", None)
+        if it is not None:
+            it._shutdown_workers()
 
     def test(self, dataset):
         print(f"Testing GPICWebDataset by iterating through first 5 samples...")
