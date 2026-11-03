@@ -137,6 +137,11 @@ class GPICWebDataset(IterableDataset):
         # ladder: with emb_dir (tools/encode_captions.py) a sample carries its text encoder outputs, in place of token ids
         self.emb_dir = emb_dir
         self._emb_shard, self._emb_fd, self._emb_index = None, None, None
+        if emb_dir:   # a hole in the cache stops the run here: every shard of the pattern has its two files
+            names = [os.path.basename(u)[:-len(".tar")] for u in expand_pattern(tar_pattern)]
+            missing = [n for n in names if not (os.path.exists(os.path.join(emb_dir, n + ".idx.npz"))
+                                                and os.path.exists(os.path.join(emb_dir, n + ".emb")))]
+            assert not missing, f"text cache {emb_dir}: {len(missing)} of {len(names)} shards missing, first {missing[:3]}"
         self.samples_per_tar = samples_per_tar
 
         # print("samples_per_tar:", samples_per_tar)
@@ -223,7 +228,8 @@ class GPICWebDataset(IterableDataset):
 
     def _attach_emb(self, sample):
         """The sample's real-token encoder outputs, as raw bf16 bytes, from its shard's file. Read here, in tar order,
-        so GPFS sees one sequential stream per worker. A key with no entry raises, and the handler drops the sample."""
+        so GPFS sees one sequential stream per worker. A failed open, a key with no entry or a short read raises through
+        the pipeline and stops the run: the map has no handler, so a hole in the cache never drops samples silently."""
         shard = os.path.basename(sample["__url__"])[:-len(".tar")]
         if shard != self._emb_shard:
             if self._emb_fd is not None:
@@ -334,7 +340,7 @@ class GPICWebDataset(IterableDataset):
                 wds.map(self._add_caption, handler=wds.warn_and_continue),
                 wds.map(self._crop_uint8, handler=wds.warn_and_continue),
                 wds.select(lambda s: s is not None and "image_u8" in s),
-                wds.map(self._attach_emb if self.emb_dir else self._tokenize, handler=wds.warn_and_continue),
+                wds.map(self._attach_emb) if self.emb_dir else wds.map(self._tokenize, handler=wds.warn_and_continue),
                 wds.shuffle(self.shuffle_buffer),
                 self._group,                                               # nothing after this drops a sample
                 wds.map(self._finish),
