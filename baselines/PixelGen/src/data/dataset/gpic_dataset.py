@@ -1,4 +1,5 @@
 import os
+import warnings
 import numpy as np
 import json, re, math
 import webdataset as wds
@@ -34,6 +35,8 @@ print("Defined val_transform function (from dataset.augmentation import center_c
 
 EMB_DIM = 2048                # the text encoder's output width
 EMB_TOKEN_BYTES = EMB_DIM * 2   # one token of bf16 outputs
+IMAGE_SUFFIXES = ("jpg", "jpeg", "png", "webp")   # webdataset lowers the suffixes
+_DECODE_PIL = wds.imagehandler("pil")
 
 class EpochShuffledShards(IterableDataset):
     """ladder: the shard list, reshuffled at every pass with Random(seed * 100003 + pass). Every rank and worker holds
@@ -137,6 +140,7 @@ class GPICWebDataset(IterableDataset):
         # ladder: with emb_dir (tools/encode_captions.py) a sample carries its text encoder outputs, in place of token ids
         self.emb_dir = emb_dir
         self._emb_shard, self._emb_fd, self._emb_index = None, None, None
+        self._last_sample = None
         if emb_dir:   # a hole in the cache stops the run here: every shard of the pattern has its two files
             names = [os.path.basename(u)[:-len(".tar")] for u in expand_pattern(tar_pattern)]
             missing = [n for n in names if not (os.path.exists(os.path.join(emb_dir, n + ".idx.npz"))
@@ -208,17 +212,19 @@ class GPICWebDataset(IterableDataset):
             self._tok = Qwen2Tokenizer.from_pretrained(self.tokenizer_path, padding_side="right")
         return self._tok
 
+    def _has_image(self, sample):
+        return any(k in sample for k in IMAGE_SUFFIXES)
+
     def _crop_uint8(self, sample):
-        """The transform's first step (random crop) on the decoded image, kept as a uint8 array until after
-        grouping, so a 1024-sample window holds ~200 MB instead of ~800 MB of float tensors."""
-        for k in ("jpg", "jpeg", "png", "webp", "JPG", "JPEG", "PNG", "WEBP"):
+        """Decode (wds's own handler, so the same pixels as wds.decode("pil")) and the transform's first step, the random
+        crop, as a uint8 array."""
+        for k in IMAGE_SUFFIXES:
             if k in sample:
-                img = sample[k]
+                img = _DECODE_PIL(k, sample[k])
                 if img is None:
-                    raise Exception("Decode failed — drop this sample")
-                sample["image_u8"] = np.asarray(self._pre(img.convert("RGB")), dtype=np.uint8)
-                break
-        return sample
+                    raise ValueError(f"no decoder for .{k}")
+                return np.asarray(self._pre(img.convert("RGB")), dtype=np.uint8)
+        raise ValueError("no image")
 
     def _tokenize(self, sample):
         ids = self._tokenizer()(sample["caption"], truncation=True, max_length=self.text_max_length)["input_ids"]
@@ -248,7 +254,9 @@ class GPICWebDataset(IterableDataset):
 
     def _group(self, src):
         """Buffer group_window samples, sort by token length, cut into chunks of group_batch, shuffle the chunk
-        order, emit chunk by chunk (each chunk becomes one per-GPU batch of the DataLoader)."""
+        order, emit chunk by chunk (each chunk becomes one per-GPU batch of the DataLoader). The first window of worker i
+        holds (i + 1) / num_workers of a window, so the workers read their windows from GPFS one after the other, not all
+        at once every 1024 steps."""
         import random
         wi = torch.utils.data.get_worker_info()
         rng = random.Random(hash((os.environ.get("GPIC_SHARD_SEED", "0"), wi.id if wi else 0, os.getpid())))
@@ -264,17 +272,31 @@ class GPICWebDataset(IterableDataset):
             for c in full:
                 yield from c
 
+        chunks = self.group_window // self.group_batch
+        size = self.group_window if wi is None else self.group_batch * max(1, chunks * (wi.id + 1) // wi.num_workers)
         for s in src:
             buf.append(s)
-            if len(buf) == self.group_window:
+            if len(buf) == size:
                 yield from flush(buf)
-                buf = []
+                buf, size = [], self.group_window
         if buf:
             yield from flush(buf)
 
     def _finish(self, s):
+        """The image work, after grouping. A window needs only the text lengths to sort, so reading it is cheap, and a
+        worker's CPU follows the batches it emits. With the images decoded in the window, every worker spends about 6 s
+        of CPU at once, and the step waits for it every 1024 steps (docs/text_cache.md). Nothing after _group may drop
+        a sample, or a batch would lose its size: an image that fails to decode repeats the sample before it."""
         text = {"text_emb": s["text_emb"], "text_len": s["text_len"]} if self.emb_dir else {"input_ids": s["input_ids"]}
-        return (self._post(s["image_u8"]), s["caption"], {"caption_type": s["caption_type"], **text})
+        try:
+            out = (self._post(self._crop_uint8(s)), s["caption"], {"caption_type": s["caption_type"], **text})
+        except Exception as exn:
+            if self._last_sample is None:
+                raise
+            warnings.warn(f"{s.get('__key__')}: {exn!r}: repeating the sample before it")
+            return self._last_sample
+        self._last_sample = out
+        return out
 
     def _collate_cached(self, samples):
         imgs = torch.stack([s[0] for s in samples])
@@ -335,15 +357,13 @@ class GPICWebDataset(IterableDataset):
                 wds.split_by_node,
                 wds.split_by_worker,
                 wds.tarfile_to_samples(handler=wds.warn_and_continue),
-                wds.decode("pil", handler=wds.warn_and_continue),
                 wds.select(self._has_caption),
                 wds.map(self._add_caption, handler=wds.warn_and_continue),
-                wds.map(self._crop_uint8, handler=wds.warn_and_continue),
-                wds.select(lambda s: s is not None and "image_u8" in s),
+                wds.select(self._has_image),
                 wds.map(self._attach_emb) if self.emb_dir else wds.map(self._tokenize, handler=wds.warn_and_continue),
                 wds.shuffle(self.shuffle_buffer),
                 self._group,                                               # nothing after this drops a sample
-                wds.map(self._finish),
+                wds.map(self._finish),                                     # the image work
             )
 
         dataset = wds.DataPipeline(

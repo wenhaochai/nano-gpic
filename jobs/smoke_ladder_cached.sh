@@ -2,7 +2,7 @@
 #SBATCH -J gpic-ladder-smoke3
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=02:15:00
+#SBATCH --time=02:50:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
@@ -12,9 +12,11 @@
 # 2. resume: d640 from a last.ckpt of the online path (step 320 of w920) to step 400;
 # 3. epoch ends: d640 on 16 shards with 2 workers per rank for 2400 steps: shard switches and 3 passes on the cached path;
 # 4. the eval path (online encoder) on the checkpoint of arm 1;
-# 5. d640 with the kernels launched from C++ and with CUDA graphs in the denoiser: without the encoder, a small model's step
-#    may be limited by the host launching kernels. These two only measure, and they run after the summary of parts 1-4,
-#    so a stop at the time limit costs nothing else.
+# 5. d640 for 3400 steps, three worker windows, with the image work after grouping and, from the worktree ladder_cache_old
+#    (151970f), with the images decoded in the window: the same arm of each, so the difference is the data path;
+# 6. d640 with the kernels launched from C++ and with CUDA graphs in the denoiser: without the encoder, a small model's step
+#    may be limited by the host launching kernels.
+# Parts 5 and 6 only measure, and they run after the summary of parts 1-4, so a stop at the time limit costs nothing else.
 # Exit 1 when a part of 1-4 fails or its checks fail. No W&B.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
@@ -103,8 +105,10 @@ for tag in ("d640", "d1024", "d1280", "resume", "epoch"):
 sys.exit(1 if bad else 0)
 PY
 [ $? -eq 0 ] || fail=1
-required=$fail   # the two arms below only measure: a failure there does not fail the smoke
+required=$fail   # the arms below only measure: a failure there does not fail the smoke
 log "PARTS 1-4 fail=$fail"
+arm d640_long d640 640 9 2 32000 3400
+LADDER_WT=$WC/project/gpic-wt/ladder_cache_old arm d640_long_old d640 640 9 2 32000 3400
 TORCHINDUCTOR_CPP_WRAPPER=1 arm d640_cpp d640 640 9 2 32000 600
 GPIC_PROF_DEN_COMPILE_MODE=reduce-overhead arm d640_graphs d640 640 9 2 32000 1200
 fail=$required
