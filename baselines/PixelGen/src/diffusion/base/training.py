@@ -1,3 +1,4 @@
+import os
 import time
 
 import torch
@@ -27,6 +28,8 @@ class BaseTrainer(nn.Module):
         raise NotImplementedError
 
     def __call__(self, net, ema_net, solver, x, condition, uncondition, metadata=None):
+        if os.environ.get("GPIC_PROF_DEN_COMPILE_MODE") == "reduce-overhead":   # profiling switch, unset in production
+            torch.compiler.cudagraph_mark_step_begin()
         x, condition, metadata = self.preproprocess(x, condition, uncondition, metadata)
         return self._impl_trainstep(net, ema_net, solver, x, condition, metadata)
 
