@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """CPU use and wait for a CPU of a training run's threads over some seconds, from /proc schedstat. Run on the job's node.
 usage: thread_wait.py <rank to print threads of, or -1 for all ranks> <seconds>
-Per rank: the four busiest threads with CPU %, wait %, involuntary context switches per second and CPUs allowed. Then the data
-workers together: CPUs used and summed wait."""
+Per rank: the four busiest threads with CPU % (of it system mode), wait %, involuntary context switches, minor page faults per
+second and CPUs allowed. Before them the data workers together: CPUs used and summed wait."""
 import os
 import subprocess
 import sys
@@ -22,6 +22,13 @@ def involuntary(path):
             if line.startswith("nonvoluntary_ctxt_switches"):
                 return int(line.split()[1])
     return 0
+
+
+def faults_sys(path):
+    """(minor page faults, system-mode ticks) of a task directory."""
+    with open(f"{path}/stat") as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+    return int(fields[7]), int(fields[12])
 
 
 def local_rank(pid):
@@ -50,7 +57,7 @@ def snapshot(pids):
                     cpu, delay = stat_of(path)
                     with open(f"{path}/comm") as f:
                         comm = f.read().strip()
-                    out[(pid, tid)] = (cpu, delay, involuntary(path), comm)
+                    out[(pid, tid)] = (cpu, delay, involuntary(path), comm, *faults_sys(path))
                 except (OSError, ValueError):
                     pass
         except OSError:
@@ -97,9 +104,11 @@ def main():
                     allowed = len(os.sched_getaffinity(int(key[1])))
                 except OSError:
                     allowed = -1
-                rows.append(((v[0] - u[0]) / 1e7 / dt, (v[1] - u[1]) / 1e7 / dt, (v[2] - u[2]) / dt, v[3], allowed))
+                tick = os.sysconf("SC_CLK_TCK")
+                rows.append(((v[0] - u[0]) / 1e7 / dt, (v[1] - u[1]) / 1e7 / dt, (v[2] - u[2]) / dt, v[3], allowed,
+                             100 * (v[5] - u[5]) / tick / dt, (v[4] - u[4]) / dt))
         rows.sort(reverse=True)
-        print(f"rank {rank} pid {pid}: " + "; ".join(f"{c} cpu {cp:.0f}% wait {w:.1f}% invol/s {nv:.0f} allowed {al}" for cp, w, nv, c, al in rows[:4]))
+        print(f"rank {rank} pid {pid}: " + "; ".join(f"{c} cpu {cp:.0f}% (sys {s:.0f}%) wait {w:.1f}% invol/s {nv:.0f} minflt/s {mf:.0f} allowed {al}" for cp, w, nv, c, al, s, mf in rows[:4]))
 
 
 if __name__ == "__main__":
