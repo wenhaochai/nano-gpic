@@ -97,6 +97,23 @@ The balance back-off hypothesis is refuted: a run queue with one thread each sta
 The cause is the pin thread (tools/prof/pin_queue.py). At a data wait over 150 ms: q_ready 0, q_raw 64-88 (median over the waits), q_ahead 42-50, the pin thread's run delay 128-143 ms in that step, the main thread's 0.1-0.5 ms. In the controls q_ready is 114 and q_raw 1 at all steps. So the workers have finished those batches and the rank's one pin thread has not copied them: it waits for a CPU 42-51% of the wall clock against 15-16% in the controls, at the same nice value as 128 workers on its socket. On this node the workers use 76 CPUs, against 58 on node-k13g1 at the same step time; the reason is not known. The CPUs are nearly full: 42-45 of 48 busy per socket in the controls.
 At d1280 the host has no lever, as before.
 
+## Pin with idle-class workers (2026-11-04, w1094, node-k13g1, code c4a5a29): the host's CPU budget sets the mean at d640
+Steps 100-2400 of d640 and 100-800 of d1280, without saves, all arms on one node:
+| arm | mean ms | median | p90 | p99 | steps over 0.3 s | stall s |
+|---|---|---|---|---|---|---|
+| d640 control | 29.3 | 26.3 | 41.5 | 70.4 | 0 | 0 |
+| d640 pin + SCHED_IDLE workers | 30.1 | 24.8 | 30.5 | 225.1 | 9 | 3.7 |
+| d640 split + SCHED_IDLE workers | 32.3 | 25.2 | 33.5 | 254.1 | 20 | 9.4 |
+| d640 control 2 | 29.4 | 26.5 | 41.1 | 73.5 | 0 | 0 |
+| d1280 control | 88.4 | 88.9 | 96.3 | 157.6 | 0 | 0 |
+| d1280 pin + SCHED_IDLE workers | 88.7 | 89.0 | 96.1 | 155.9 | 0 | 0 |
+
+The rule in the job header is not met: the mean is 2.6% above the control, and there are 9 steps over 0.3 s against 0. Neither lever is adopted.
+
+Why, in numbers. The control uses 89 of 96 CPUs: the workers 78.4, the rank threads about 10 (python 0.47, pin 0.44, autograd 0.35 per rank), at 8737 images/s. That is 8.97 ms of worker CPU per image. The pin arm's median of 24.8 ms is 10323 images/s, which needs 92.6 CPUs of workers and 10 for the rank threads: 103 of 96. So the median of the pin arm is not sustainable. In the pin arm 94.4 of 96 CPUs are busy, the workers' queue for a CPU is 93 CPU-equivalents, and q_ready falls from 114 to 61. When it reaches 0, the rank waits: 43 data waits over 150 ms, with q_ahead 46 and q_raw 59 at these waits (the batch it needs is behind others). Pinning moves CPU from the workers to the GPU side. It does not add CPU. The mean stays near 29 ms in all arms.
+
+The 96 CPUs set the limit at d640: (96 - 10) / 8.97 ms = 9587 images/s, or 26.7 ms per step. The GPU side alone can run at 24.8 ms or less. Only less worker CPU per image can move the mean: 20% less would put the limit at 21.4 ms. d1280 runs at 88 ms, far from this limit, so it gains nothing.
+
 ## Same seed on all ranks or one seed per rank (2026-11-04, w1053 and w1054, code 1882658, review docs/review_seed_2026-11-03.md)
 The official recipe seeds all ranks alike, so a global batch of 256 has 32 different (t, noise, CFG mask). `GPIC_RANK_SEED=1` gives each rank its own seed. d640 to C0/8 (66816 steps), both arms with GPIC_SHARD_SEED=1730000000, no resume in either arm (w1053's first launch died at NCCL init, before any checkpoint), EMA, 50K samples.
 | arm | checkpoint | FD-DINOv2 | fd_mu | fd_sigma | precision | recall | density | coverage | MMD |

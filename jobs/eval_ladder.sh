@@ -8,7 +8,7 @@
 #SBATCH --comment=fetchable
 #FETCHABLE
 # GPIC evaluation of one ladder checkpoint with the ladder's own code (gpic-wt/ladder_run): 50K test captions, the
-# official predict (EMA net, 50 Euler steps, CFG 1.0, the official per-prompt noise) with the masked text path, all
+# official predict (EMA net, 50 Euler steps, CFG 1.0, the official noise (one tensor for all prompts)) with the masked text path, all
 # samples in one output.npz, then FD-DINOv2 / PRDC / MMD against test_stats.npz with tools/fast_eval.py on 8 GPUs.
 # usage: eval_ladder.sh <size> <d> <nb> <nt> <step>      e.g. eval_ladder.sh d640 640 9 2 129000
 # Env (smoke tests only): LADDER_WT, LADDER_RUN_ROOT.
