@@ -15,7 +15,7 @@ from torch.utils.data import IterableDataset, Dataset
 from .augmentation import center_crop_arr, random_crop_arr, random_crop_arr_region
 global train_transform, val_transform
 
-_train_crop = random_crop_arr_region if os.environ.get("GPIC_REGION_CROP") == "1" else random_crop_arr   # jobs/smoke_ladder_crop.sh; unset in production until adopted
+_train_crop = random_crop_arr_region if os.environ.get("GPIC_REGION_CROP") == "1" else random_crop_arr   # docs/text_cache.md; jobs/train_ladder.sh sets it
 train_transform = T.Compose([
     T.Lambda(lambda pil_image: _train_crop(pil_image, 256)),
     T.ToTensor(),

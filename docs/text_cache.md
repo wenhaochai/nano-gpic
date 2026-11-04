@@ -114,6 +114,21 @@ Why, in numbers. The control uses 89 of 96 CPUs: the workers 78.4, the rank thre
 
 The 96 CPUs set the limit at d640: (96 - 10) / 8.97 ms = 9587 images/s, or 26.7 ms per step. The GPU side alone can run at 24.8 ms or less. Only less worker CPU per image can move the mean: 20% less would put the limit at 21.4 ms. d1280 runs at 88 ms, far from this limit, so it gains nothing.
 
+## A crop that resizes only the region it keeps (2026-11-04, w1117, node-k14g1, code a631349, review docs/review_crop_2026-11-04.md): adopted
+The official random crop resizes the whole image with BICUBIC and then cuts 256 x 256. `random_crop_arr_region` resizes only the region it keeps, with the same random draws. Pillow runs the vertical pass first only if (H - out_h) > 2 (W - out_w), and the order changes the 8-bit rounding, so each pass runs alone, in the official order. It takes 1.9 ms instead of 3.3 ms per image on one thread (tools/test_region_crop.py). It is not bit-identical, because Pillow reads the box as single-precision floats: 0.035% of the channel values differ, by at most 2 of 255.
+
+Steps 100-2400 of d640 and 100-800 of d1280, without saves, all arms on one node:
+| arm | mean ms | median | p90 | p99 | steps over 0.3 s |
+|---|---|---|---|---|---|
+| d640 control | 29.5 | 26.3 | 41.2 | 76.4 | 0 |
+| d640 region crop | 26.7 | 25.1 | 32.1 | 63.1 | 0 |
+| d640 region crop, pin, SCHED_IDLE workers | 26.4 | 24.7 | 29.8 | 64.1 | 0 |
+| d640 control 2 | 29.5 | 26.5 | 41.4 | 71.8 | 0 |
+| d1280 control | 88.5 | 88.9 | 95.7 | 159.1 | 0 |
+| d1280 region crop | 88.3 | 88.6 | 95.7 | 161.3 | 0 |
+
+By the rule in the job header the crop is adopted: 9.5% below both d640 controls, no stall, and d1280 unchanged. Pinning on top is not: 1.1% below the crop arm, under the 3% bar. This confirms the last section: with less CPU per image, procs_running falls from 93-96 to 80 and the p90 from 41 to 32 ms. The queue stays full (q_ready 115), and the crop arm has no data waits over 150 ms. jobs/train_ladder.sh sets GPIC_REGION_CROP=1.
+
 ## Same seed on all ranks or one seed per rank (2026-11-04, w1053 and w1054, code 1882658, review docs/review_seed_2026-11-03.md)
 The official recipe seeds all ranks alike, so a global batch of 256 has 32 different (t, noise, CFG mask). `GPIC_RANK_SEED=1` gives each rank its own seed. d640 to C0/8 (66816 steps), both arms with GPIC_SHARD_SEED=1730000000, no resume in either arm (w1053's first launch died at NCCL init, before any checkpoint), EMA, 50K samples.
 | arm | checkpoint | FD-DINOv2 | fd_mu | fd_sigma | precision | recall | density | coverage | MMD |

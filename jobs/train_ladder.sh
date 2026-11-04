@@ -39,6 +39,7 @@ CB='[{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
 export GPIC_SHARD_SEED=${GPIC_SHARD_SEED:-$(date +%s)}   # shard order shuffled per launch and per epoch, shared by all ranks; a test may fix it
+export GPIC_REGION_CROP=${GPIC_REGION_CROP:-1}   # the crop resizes only the region it keeps: d640 29.5 -> 26.7 ms (w1117); the same random draws; 0.035% of the channel values differ, by at most 2 of 255
 export TORCHINDUCTOR_CPP_WRAPPER=1   # kernels launched from C++: d640 39.3 -> 32.6 ms; the same math up to bf16 rounding (tools/test_cpp_launcher.py)
 # the main thread spent 14.5% of its CPU time in glibc malloc; the threshold keeps tcmalloc's large-alloc report out of the log
 [ -f /usr/lib64/libtcmalloc.so.4 ] && export LD_PRELOAD=/usr/lib64/libtcmalloc.so.4${LD_PRELOAD:+:$LD_PRELOAD} TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD=100000000000
