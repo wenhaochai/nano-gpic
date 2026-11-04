@@ -87,6 +87,16 @@ GPU work by launching op, from the w1048 trace (tools/prof/trace_phase.py; 16 ra
 
 Levers left: at d640 up to 4.3 ms (15%) for the data path, measured as production against the cycle arm of w1048 (a different node, and the cycle arm's 64 batches may not match the T distribution). At d1280 the host has no lever. Not tested: the cause of the pin arm's stalls (without them the pin arm would average 27.7 ms, 6% below production), an exact faster crop, and fewer kernels by hand.
 
+## Why the pin arm stalls (2026-11-04, w1093, node-j17g1, code c4a5a29, review docs/review_pin2_2026-11-04.md)
+Steps 100-2400, without saves. Mean / median / p90 / p99 ms, steps over 0.3 s (their sum):
+- d640 control 28.9 / 25.8 / 40.9 / 75.4, 0; repeat 29.3 / 26.3 / 41.5 / 74.1, 0.
+- d640 main and autograd on one shared CPU 30.3 / 25.0 / 32.9 / 157.5, 14 (6.3 s).
+- d640 main and autograd on one CPU each 32.3 / 24.4 / 39.7 / 236.4, 17 (8.0 s). Not adopted by the rule set before the run.
+- d1280 control 88.8 / 89.2 / 96.0 / 157.8; one CPU each 88.9 / 89.3 / 96.4 / 158.1.
+The balance back-off hypothesis is refuted: a run queue with one thread each stalls as well, and more. Waiting workers rarely coexist with idle CPUs: the share of intervals with at least 4 idle CPUs and more workers in state R than busy CPUs is 0.02-0.06 (0-0.01 in the controls), with 1-4 idle CPUs per socket.
+The cause is the pin thread (tools/prof/pin_queue.py). At a data wait over 150 ms: q_ready 0, q_raw 64-88 (median over the waits), q_ahead 42-50, the pin thread's run delay 128-143 ms in that step, the main thread's 0.1-0.5 ms. In the controls q_ready is 114 and q_raw 1 at all steps. So the workers have finished those batches and the rank's one pin thread has not copied them: it waits for a CPU 42-51% of the wall clock against 15-16% in the controls, at the same nice value as 128 workers on its socket. On this node the workers use 76 CPUs, against 58 on node-k13g1 at the same step time; the reason is not known. The CPUs are nearly full: 42-45 of 48 busy per socket in the controls.
+At d1280 the host has no lever, as before.
+
 ## Same seed on all ranks or one seed per rank (2026-11-04, w1053 and w1054, code 1882658, review docs/review_seed_2026-11-03.md)
 The official recipe seeds all ranks alike, so a global batch of 256 has 32 different (t, noise, CFG mask). `GPIC_RANK_SEED=1` gives each rank its own seed. d640 to C0/8 (66816 steps), both arms with GPIC_SHARD_SEED=1730000000, no resume in either arm (w1053's first launch died at NCCL init, before any checkpoint), EMA, 50K samples.
 | arm | checkpoint | FD-DINOv2 | fd_mu | fd_sigma | precision | recall | density | coverage | MMD |
