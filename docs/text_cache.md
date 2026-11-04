@@ -87,6 +87,48 @@ GPU work by launching op, from the w1048 trace (tools/prof/trace_phase.py; 16 ra
 
 Levers left: at d640 up to 4.3 ms (15%) for the data path, measured as production against the cycle arm of w1048 (a different node, and the cycle arm's 64 batches may not match the T distribution). At d1280 the host has no lever. Not tested: the cause of the pin arm's stalls (without them the pin arm would average 27.7 ms, 6% below production), an exact faster crop, and fewer kernels by hand.
 
+## Why the pin arm stalls (2026-11-04, w1093, node-j17g1, code c4a5a29, review docs/review_pin2_2026-11-04.md)
+Steps 100-2400, without saves. Mean / median / p90 / p99 ms, steps over 0.3 s (their sum):
+- d640 control 28.9 / 25.8 / 40.9 / 75.4, 0; repeat 29.3 / 26.3 / 41.5 / 74.1, 0.
+- d640 main and autograd on one shared CPU 30.3 / 25.0 / 32.9 / 157.5, 14 (6.3 s).
+- d640 main and autograd on one CPU each 32.3 / 24.4 / 39.7 / 236.4, 17 (8.0 s). Not adopted by the rule set before the run.
+- d1280 control 88.8 / 89.2 / 96.0 / 157.8; one CPU each 88.9 / 89.3 / 96.4 / 158.1.
+The balance back-off hypothesis is refuted: a run queue with one thread each stalls as well, and more. Waiting workers rarely coexist with idle CPUs: the share of intervals with at least 4 idle CPUs and more workers in state R than busy CPUs is 0.02-0.06 (0-0.01 in the controls), with 1-4 idle CPUs per socket.
+The cause is the pin thread (tools/prof/pin_queue.py). At a data wait over 150 ms: q_ready 0, q_raw 64-88 (median over the waits), q_ahead 42-50, the pin thread's run delay 128-143 ms in that step, the main thread's 0.1-0.5 ms. In the controls q_ready is 114 and q_raw 1 at all steps. So the workers have finished those batches and the rank's one pin thread has not copied them: it waits for a CPU 42-51% of the wall clock against 15-16% in the controls, at the same nice value as 128 workers on its socket. On this node the workers use 76 CPUs, against 58 on node-k13g1 at the same step time; the reason is not known. The CPUs are nearly full: 42-45 of 48 busy per socket in the controls.
+At d1280 the host has no lever, as before.
+
+## Pin with idle-class workers (2026-11-04, w1094, node-k13g1, code c4a5a29): the host's CPU budget sets the mean at d640
+Steps 100-2400 of d640 and 100-800 of d1280, without saves, all arms on one node:
+| arm | mean ms | median | p90 | p99 | steps over 0.3 s | stall s |
+|---|---|---|---|---|---|---|
+| d640 control | 29.3 | 26.3 | 41.5 | 70.4 | 0 | 0 |
+| d640 pin + SCHED_IDLE workers | 30.1 | 24.8 | 30.5 | 225.1 | 9 | 3.7 |
+| d640 split + SCHED_IDLE workers | 32.3 | 25.2 | 33.5 | 254.1 | 20 | 9.4 |
+| d640 control 2 | 29.4 | 26.5 | 41.1 | 73.5 | 0 | 0 |
+| d1280 control | 88.4 | 88.9 | 96.3 | 157.6 | 0 | 0 |
+| d1280 pin + SCHED_IDLE workers | 88.7 | 89.0 | 96.1 | 155.9 | 0 | 0 |
+
+The rule in the job header is not met: the mean is 2.6% above the control, and there are 9 steps over 0.3 s against 0. Neither lever is adopted.
+
+Why, in numbers. The control uses 89 of 96 CPUs: the workers 78.4, the rank threads about 10 (python 0.47, pin 0.44, autograd 0.35 per rank), at 8737 images/s. That is 8.97 ms of worker CPU per image. The pin arm's median of 24.8 ms is 10323 images/s, which needs 92.6 CPUs of workers and 10 for the rank threads: 103 of 96. So the median of the pin arm is not sustainable. In the pin arm 94.4 of 96 CPUs are busy, the workers' queue for a CPU is 93 CPU-equivalents, and q_ready falls from 114 to 61. When it reaches 0, the rank waits: 43 data waits over 150 ms, with q_ahead 46 and q_raw 59 at these waits (the batch it needs is behind others). Pinning moves CPU from the workers to the GPU side. It does not add CPU. The mean stays near 29 ms in all arms.
+
+The 96 CPUs set the limit at d640: (96 - 10) / 8.97 ms = 9587 images/s, or 26.7 ms per step. The GPU side alone can run at 24.8 ms or less. Only less worker CPU per image can move the mean: 20% less would put the limit at 21.4 ms. d1280 runs at 88 ms, far from this limit, so it gains nothing.
+
+## A crop that resizes only the region it keeps (2026-11-04, w1117, node-k14g1, code a631349, review docs/review_crop_2026-11-04.md): adopted
+The official random crop resizes the whole image with BICUBIC and then cuts 256 x 256. `random_crop_arr_region` resizes only the region it keeps, with the same random draws. Pillow runs the vertical pass first only if (H - out_h) > 2 (W - out_w), and the order changes the 8-bit rounding, so each pass runs alone, in the official order. It takes 1.9 ms instead of 3.3 ms per image on one thread (tools/test_region_crop.py). It is not bit-identical, because Pillow reads the box as single-precision floats: 0.035% of the channel values differ, by at most 2 of 255.
+
+Steps 100-2400 of d640 and 100-800 of d1280, without saves, all arms on one node:
+| arm | mean ms | median | p90 | p99 | steps over 0.3 s |
+|---|---|---|---|---|---|
+| d640 control | 29.5 | 26.3 | 41.2 | 76.4 | 0 |
+| d640 region crop | 26.7 | 25.1 | 32.1 | 63.1 | 0 |
+| d640 region crop, pin, SCHED_IDLE workers | 26.4 | 24.7 | 29.8 | 64.1 | 0 |
+| d640 control 2 | 29.5 | 26.5 | 41.4 | 71.8 | 0 |
+| d1280 control | 88.5 | 88.9 | 95.7 | 159.1 | 0 |
+| d1280 region crop | 88.3 | 88.6 | 95.7 | 161.3 | 0 |
+
+By the rule in the job header the crop is adopted: 9.5% below both d640 controls, no stall, and d1280 unchanged. Pinning on top is not: 1.1% below the crop arm, under the 3% bar. This confirms the last section: with less CPU per image, procs_running falls from 93-96 to 80 and the p90 from 41 to 32 ms. The queue stays full (q_ready 115), and the crop arm has no data waits over 150 ms. jobs/train_ladder.sh sets GPIC_REGION_CROP=1.
+
 ## Same seed on all ranks or one seed per rank (2026-11-04, w1053 and w1054, code 1882658, review docs/review_seed_2026-11-03.md)
 The official recipe seeds all ranks alike, so a global batch of 256 has 32 different (t, noise, CFG mask). `GPIC_RANK_SEED=1` gives each rank its own seed. d640 to C0/8 (66816 steps), both arms with GPIC_SHARD_SEED=1730000000, no resume in either arm (w1053's first launch died at NCCL init, before any checkpoint), EMA, 50K samples.
 | arm | checkpoint | FD-DINOv2 | fd_mu | fd_sigma | precision | recall | density | coverage | MMD |

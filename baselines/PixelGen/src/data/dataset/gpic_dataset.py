@@ -12,15 +12,16 @@ from torch.utils.data import IterableDataset, Dataset
 # Transforms
 # -------------------------
 
-from .augmentation import center_crop_arr, random_crop_arr
+from .augmentation import center_crop_arr, random_crop_arr, random_crop_arr_region
 global train_transform, val_transform
 
+_train_crop = random_crop_arr_region if os.environ.get("GPIC_REGION_CROP") == "1" else random_crop_arr   # docs/text_cache.md; jobs/train_ladder.sh sets it
 train_transform = T.Compose([
-    T.Lambda(lambda pil_image: random_crop_arr(pil_image, 256)),
+    T.Lambda(lambda pil_image: _train_crop(pil_image, 256)),
     T.ToTensor(),
     T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
 ])
-print("Defined train_transform function (from dataset.augmentation import random_crop_arr) :", train_transform)
+print(f"Defined train_transform function (from dataset.augmentation import {_train_crop.__name__}) :", train_transform)
 
 val_transform = T.Compose([
         T.Lambda(lambda pil_image: center_crop_arr(pil_image, 256)),
@@ -303,7 +304,7 @@ class GPICWebDataset(IterableDataset):
             self._repeats += 1
             if self._last_sample is None or self._repeats > 8:
                 raise
-            warnings.warn(f"{s.get('__key__')}: {exn!r}: repeating the sample before it")
+            print(f"[data] {s.get('__key__')}: {exn!r}: repeating the sample before it", flush=True)   # a print: patch_bugs.py filters every UserWarning
             return self._last_sample
         self._last_sample, self._repeats = out, 0
         return out
