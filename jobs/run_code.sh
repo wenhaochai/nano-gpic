@@ -9,12 +9,14 @@
 #FETCHABLE
 # Plan A at d640 to C0/8 at one rate, then FD at C0/16 and C0/8 (docs/distribution_step.md 5.2). Baseline: w1053 (same shard order): FD 2099 at C0/16, 1504 at C0/8.
 # Same FLOPs: 34.7 GFLOP forward + 0.34 for the encoder and the flow (tools/dist_step/test_code.py prints it), so 66816 x 104.15 / 105.17 = 66168, and 66176 steps (a multiple of 32, with a quarter a whole number).
-# Valid only if FD is below the baseline at both points by more than 5%, set before the run: the seed test shows 2-4% between two runs of one recipe.
+# Rule, set before the run. Plan A has randomness of its own per prompt (z0), and the official x_T is one tensor for all prompts, so the clean test of the code is with each prompt's own x_T in both arms (w1053's checkpoints re-evaluated by jobs/eval_noise.sh).
+# Valid only if FD is below that baseline at both points by more than 5%: the seed test shows 2-4% between two runs of one recipe. A pass of the best R counts only after a second run of it, with another seed_everything value, passes too.
+# The official x_T is also reported, against w1053's official FD.
 # usage: run_code.sh <R, nats>     Code: the frozen worktree gpic-wt/code_run.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 R=$1
-[ -n "$R" ] || { echo "usage: run_code.sh <R>"; exit 2; }
+python3 -Ic "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "$R" || { echo "usage: run_code.sh <R>, with R > 0"; exit 2; }
 WT=$WC/project/gpic-wt/code_run
 [ -d "$WT/baselines/PixelGen" ] || { echo "no worktree $WT"; exit 2; }
 ROOT=$WC/runs/gpic-speed/code_r$R
@@ -29,6 +31,7 @@ echo "train rc=$rc"
 fail=0
 for STEP in 33088 66176; do
   bash $WT/jobs/eval_code.sh d640 640 9 2 $STEP 50 > $ROOT/eval_$STEP.log 2>&1 || fail=1
+  EVAL_NOISE=prompt bash $WT/jobs/eval_code.sh d640 640 9 2 $STEP 50 > $ROOT/eval_${STEP}_prompt.log 2>&1 || fail=1
   echo "eval $STEP fail=$fail"
 done
 exit $fail

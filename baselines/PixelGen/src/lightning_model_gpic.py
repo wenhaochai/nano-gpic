@@ -1,5 +1,6 @@
 from typing import Callable, Iterable, Any, Optional, Union, Sequence, Mapping, Dict
 import os.path
+import zlib
 import copy
 import torch
 import torch.nn as nn
@@ -127,7 +128,12 @@ class LightningModel(pl.LightningModule):
             return
         assert gradient_clip_algorithm in (None, "norm"), gradient_clip_algorithm
         params = [p for g in optimizer.param_groups for p in g["params"]]
-        torch.nn.utils.clip_grad_norm_(params, gradient_clip_val, foreach=True)
+        trainer = self.diffusion_trainer
+        check = getattr(self.denoiser, "code_dim", 0) and trainer._calls % trainer._check_every == 0   # plan A: the flow's parameters get only the prior's gradient, the others only the main loss's
+        prior = torch.stack([p.grad.norm() for p in self.denoiser.code_prior.parameters() if p.grad is not None]).norm().item() if check else None
+        total = torch.nn.utils.clip_grad_norm_(params, gradient_clip_val, foreach=True)
+        if check:
+            print(f"[code] call {trainer._calls}: grad norm before the clip {total.item():.4f}, of which the flow {prior:.4f}, clip at {gradient_clip_val}", flush=True)
 
     def configure_callbacks(self) -> Union[Sequence[Callback], Callback]:
         return [self.ema_tracker]
@@ -257,7 +263,9 @@ class LightningModel(pl.LightningModule):
         y_mask = meta.get("y_mask")
         if getattr(net, "code_dim", 0):   # plan A (docs/distribution_step.md 5.2): one z per image, fixed along the path
             assert float(self.diffusion_sampler.guidance) == 1.0, "CFG is fixed at 1.0 (owner, 2026-11-01)"
-            z = net.code_sample(xT, condition, y_mask)
+            # z0 has its own seed, from the prompt's key: each prompt keeps its z on any rank, and z0 is independent of xT. The official xT is the same tensor for all prompts (gpic_jsonl_dataset.py), so z0 must not come from it.
+            z0 = torch.stack([torch.randn(net.code_dim, generator=torch.Generator().manual_seed(zlib.crc32(m["key"].encode()))) for m in metadata]).to(xT.device)
+            z = net.code_flow(z0, condition, y_mask)
             base = net
 
             def net(x, t, c, _base=base, _m=y_mask, _z=z):

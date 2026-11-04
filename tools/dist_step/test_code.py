@@ -53,6 +53,8 @@ for blk in list(c.blocks) + list(c.text_refine_blocks):   # the conditioning is 
     blk.adaLN_modulation[-1].weight.data.normal_(std=0.05)
 c.code_prior.out.weight.data.normal_(std=0.05)
 z = c.code_encode(x)
+assert (c.code_proj.weight == 0).all() and (c(x, t, y, y_mask=mask, z=z) == c(x, t, y, y_mask=mask, z=-z)).all(), "code_proj starts at zero, so the model starts as the point model"
+c.code_proj.weight.data.normal_(std=0.02)
 assert (c(x, t, y, y_mask=mask, z=z) - c(x, t, y, y_mask=mask, z=-z)).abs().max() > 1e-5
 tr = trainer(CodeJiTTrainer)
 torch.manual_seed(6)
@@ -84,14 +86,19 @@ with torch.no_grad():
     s = f.code_flow(torch.randn(256, 4), cap, m)
 assert abs(s.mean().item() - 1.5) < 0.1 and abs(s.std().item() - 0.3) < 0.1, (s.mean().item(), s.std().item())
 
-# 6. code_sample: the same noise gives the same z, another noise another z, and the start is 1 in N(0, 1) per dimension.
-n = torch.randn(4, 3, 64, 64)
-assert (f.code_sample(n, y, mask) == f.code_sample(n.clone(), y, mask)).all()
-assert (f.code_sample(n, y, mask) - f.code_sample(torch.randn(4, 3, 64, 64), y, mask)).abs().max() > 1e-4
-flat = torch.randn(1000, 3, 256, 256).flatten(1)
-d = 64
-start = flat[:, :: flat.shape[1] // d][:, :d]
-assert start.shape == (1000, d) and abs(start.std().item() - 1) < 0.05
+# 6. The evaluation noise: the official path gives all prompts one noise tensor; noise_per_prompt gives each prompt its own, and noise_seed moves both.
+import json, tempfile  # noqa: E402
+from src.data.dataset.gpic_jsonl_dataset import GPICJsonlDataset  # noqa: E402
+with tempfile.NamedTemporaryFile("w", suffix=".jsonl") as tmp:
+    for i in range(3):
+        tmp.write(json.dumps({"key": f"k{i}", "caption": "c", "caption_type": "short"}) + "\n")
+    tmp.flush()
+    ds = lambda **k: GPICJsonlDataset(tmp.name, 1, [3, 8, 8], **k)
+    off, prm, one = ds(), ds(noise_per_prompt=True), ds(noise_seed=1)
+    want = torch.randn([3, 8, 8], generator=torch.Generator().manual_seed(0), dtype=torch.float32)
+    assert (off[0][0] == want).all() and (off[1][0] == want).all() and (off[2][0] == want).all(), "official: seed 0 for all prompts"
+    assert (prm[0][0] == want).all() and (prm[1][0] != want).any() and (prm[1][0] != prm[2][0]).any()
+    assert (one[0][0] != want).any() and (one[0][0] == one[2][0]).all()
 
 # 7. FLOPs of the new parts at d640, in the counting of tools/ladder_flops.py (2 per multiply-add).
 from torch.utils.flop_counter import FlopCounterMode  # noqa: E402

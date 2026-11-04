@@ -9,6 +9,8 @@ Metrics, at 50 Euler calls with the official grid and t_eps, from the raw weight
   nn_rms    root mean square per pixel from each sample to its nearest training image, in [-1, 1] units; mean and 90th percentile
   near      share of samples with nn_rms below 0.1
   covered   share of training images that are the nearest of a sample with nn_rms below 0.1
+  distinct  share of training images that are the nearest of any sample (no threshold)
+The learning rate warms up over 500 steps. Production has 4000 warm-up steps (lite_ladder.yaml); this test has fewer steps in all.
 usage: overfit_code.py <N> <R, 0 for the point model> <out dir> [steps]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
 """
 import glob
@@ -30,8 +32,8 @@ from src.diffusion.flow_matching.training_JiT import constant
 from src.models.transformer.JiT_T2I import JiT_T2I
 
 N, RATE, OUT = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3]
-STEPS = int(sys.argv[4]) if len(sys.argv) > 4 else 8000
-EVALS = sorted({s for s in (500, 1000, 2000, 4000, 8000, 16000) if s < STEPS} | {STEPS})
+STEPS = int(sys.argv[4]) if len(sys.argv) > 4 else 24000
+EVALS = sorted({s for s in (1000, 2000, 4000, 8000, 16000) if s < STEPS} | {STEPS})
 WC = "/scratch/gpfs/GROUP/USER"
 TAG = f"n{N}_r{RATE:g}"
 os.makedirs(OUT, exist_ok=True)
@@ -72,7 +74,7 @@ def sample(n, calls):
     for i in range(0, n, B):
         x = torch.randn(B, 3, 256, 256, device=dev)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            extra = {"z": net.code_sample(x, y, mask)} if RATE else {}
+            extra = {"z": net.code_flow(torch.randn(B, net.code_dim, device=dev), y, mask)} if RATE else {}
             for j in range(calls):
                 t = ts[j].repeat(B)
                 pred = net(x, t, y, y_mask=mask, **extra).float()
@@ -84,13 +86,15 @@ def sample(n, calls):
 def measure(g):
     d = torch.cat([torch.cdist(g[i:i + 64].flatten(1), imgs.flatten(1)) for i in range(0, len(g), 64)]) / (3 * 256 * 256) ** 0.5
     nn, idx = d.min(1)
-    return dict(nn_rms=nn.mean().item(), nn_rms_p90=nn.quantile(0.9).item(), near=(nn < 0.1).float().mean().item(), covered=idx[nn < 0.1].unique().numel() / N, pixel_std=g.std(0).mean().item())
+    return dict(nn_rms=nn.mean().item(), nn_rms_p90=nn.quantile(0.9).item(), near=(nn < 0.1).float().mean().item(), covered=idx[nn < 0.1].unique().numel() / N, distinct=idx.unique().numel() / N, pixel_std=g.std(0).mean().item())
 
 
 rows = []
 t0 = time.time()
 ema_fm = None
 for step in range(1, STEPS + 1):
+    for group in opt.param_groups:
+        group["lr"] = 1e-4 * min(1.0, step / 500)
     x = imgs[torch.randint(N, (B,), device=dev)]
     with torch.autocast("cuda", dtype=torch.bfloat16):
         res = tr._impl_trainstep(net, None, None, x, y, {"y_mask": mask})
@@ -102,7 +106,7 @@ for step in range(1, STEPS + 1):
         fm = res["fm_loss"].item()
         ema_fm = fm if ema_fm is None else 0.9 * ema_fm + 0.1 * fm
     if step in EVALS:
-        row = dict(step=step, seconds=time.time() - t0, fm=ema_fm, **measure(sample(min(256, max(64, 4 * N)), 50)))
+        row = dict(step=step, seconds=time.time() - t0, fm=ema_fm, **measure(sample(max(64, 8 * N), 50)))
         one = measure(sample(64, 1))
         row.update(one_call_nn_rms=one["nn_rms"], one_call_near=one["near"])
         if RATE:

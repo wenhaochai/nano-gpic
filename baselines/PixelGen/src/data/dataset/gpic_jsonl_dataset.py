@@ -31,9 +31,13 @@ class GPICJsonlDataset(Dataset):
         jsonl_path:             Path to the JSONL file.
         num_samples_per_instance: Number of independent noise samples per prompt.
         latent_shape:           Shape of the initial noise tensor, e.g. [3, 256, 256].
+        noise_seed:             Added to the noise seed. 0 is the official noise.
+        noise_per_prompt:       False is the official noise: the seed is sample_idx, so with 1 sample per prompt ALL prompts share one noise tensor.
+                                True gives each prompt its own noise: the seed is the dataset index.
     """
 
-    def __init__(self, jsonl_path: str, num_samples_per_instance: int, latent_shape: list):
+    def __init__(self, jsonl_path: str, num_samples_per_instance: int, latent_shape: list, noise_seed: int = 0, noise_per_prompt: bool = False):
+        self.noise_seed, self.noise_per_prompt = noise_seed, noise_per_prompt
         self.jsonl_path = jsonl_path
         self.latent_shape = latent_shape
         self.num_samples_per_instance = num_samples_per_instance
@@ -54,7 +58,7 @@ class GPICJsonlDataset(Dataset):
         record = self.records[instance_idx]
 
         # Reproducible noise — same seed as GenEvalDataset convention
-        generator = torch.Generator().manual_seed(sample_idx)
+        generator = torch.Generator().manual_seed(self.noise_seed + (idx if self.noise_per_prompt else sample_idx))
         latent    = torch.randn(self.latent_shape, generator=generator, dtype=torch.float32)
 
         condition = record["caption"]

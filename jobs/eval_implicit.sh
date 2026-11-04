@@ -8,7 +8,7 @@
 #SBATCH --comment=fetchable
 #FETCHABLE
 # GPIC evaluation of one implicit sampler checkpoint at each number of network calls: jobs/eval_ladder.sh's protocol (50K test captions, EMA
-# net, CFG 1.0, the official per-prompt noise, FD-DINOv2 / PRDC / MMD), with configs_h100/implicit_sample.yaml. 50 calls is the main number.
+# net, CFG 1.0, the official noise (one tensor for all prompts), FD-DINOv2 / PRDC / MMD), with configs_h100/implicit_sample.yaml. 50 calls is the main number.
 # usage: eval_implicit.sh <name> <d> <nb> <nt> <step> <calls...>     e.g. eval_implicit.sh implicit_d640 640 9 2 101216 50 16 8 4 2 1
 # Env (smoke tests only): LADDER_WT, LADDER_RUN_ROOT.
 set -eo pipefail

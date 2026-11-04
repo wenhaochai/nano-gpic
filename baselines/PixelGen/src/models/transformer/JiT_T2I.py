@@ -403,7 +403,7 @@ class JiT_T2I(nn.Module):
                 nn.init.normal_(layer.weight, std=0.02)
                 nn.init.constant_(layer.bias, 0)
         if self.code_dim:
-            nn.init.normal_(self.code_proj.weight, std=0.02)   # as the timestep embedding's layers: z starts as a small part of the conditioning
+            nn.init.constant_(self.code_proj.weight, 0)   # the model starts as the point model. With std 0.02, ||z|| = sqrt(d) would put per-image noise about 3 times the timestep embedding into adaLN (review 2026-11-04)
             nn.init.constant_(self.code_proj.bias, 0)
             nn.init.constant_(self.code_prior.out.weight, 0)
             nn.init.constant_(self.code_prior.out.bias, 0)
@@ -432,12 +432,6 @@ class JiT_T2I(nn.Module):
         for j in range(steps):
             z = z + self.code_prior(z, torch.full((z.shape[0],), j / steps, device=z.device, dtype=z.dtype), c).float() / steps
         return z
-
-    def code_sample(self, noise, y, y_mask=None, steps=64):
-        """z for a batch of images, from the official per-prompt noise: code_dim pixels spread over the image, so each prompt keeps its z on any rank. They are 1 / 3000 of the
-        noise at d = 64, so the small dependence between z and x_0 does not matter."""
-        flat = noise.flatten(1)
-        return self.code_flow(flat[:, :: flat.shape[1] // self.code_dim][:, :self.code_dim], y, y_mask, steps)
 
     def unpatchify(self, x, H, W):
         """

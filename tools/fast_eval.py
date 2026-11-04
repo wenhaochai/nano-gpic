@@ -34,6 +34,7 @@ def main():
     ap.add_argument("samples"); ap.add_argument("ref"); ap.add_argument("out")
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--save-features", default=None, help="rank 0 also saves the features, in image order, as a .npy")
     a = ap.parse_args()
     from gpic_eval.backends.dino import build_dinov2, extract_features_from_npz, _dino_transform
     dist.init_process_group("nccl")
@@ -55,6 +56,8 @@ def main():
         from gpic_eval.eval import eval_from_embeddings
         from gpic_eval.models import FDStatistics
         allf = np.concatenate([f for _, f in sorted(obj, key=lambda x: x[0])])
+        if a.save_features:
+            np.save(a.save_features, allf)
         ref = np.load(a.ref)
         stats = {"dino": FDStatistics(ref["dino_mu"], ref["dino_sigma"])} if "dino_mu" in ref.files else {}
         emb = {"dino": ref["dino_embeddings"]} if "dino_embeddings" in ref.files else {}

@@ -23,21 +23,30 @@ log() { echo "[$(date +%T)] $*" | tee -a $OUT/phases.log; }
 log "START train to 800"
 BENCH_OUT=$OUT/bench/first timeout -k 60 600 bash $WT/jobs/train_ladder.sh d640 640 9 2 3200 --config configs_h100/code_train.yaml --model.denoiser.init_args.code_rate 64 \
   --trainer.max_steps 800 --trainer.log_every_n_steps 50 > $OUT/first.log 2>&1
-log "END train rc=$?"
+rc=$?; log "END train rc=$rc"; [ $rc -eq 0 ] || exit $rc
+fail=0
 python3 -I - $OUT/first.log <<'PY' | tee -a $OUT/phases.log
 import math, re, sys
 s = open(sys.argv[1], errors="replace").read()
-rows = re.findall(r"\[code\] call (\d+): fm (\S+) prior (\S+) z_var (\S+) flow_ed (\S+)", s)
+rows = re.findall(r"\[code\] call (\d+): fm (\S+) prior (\S+) z_var (\S+) proj_std (\S+) flow_ed (\S+) ema_flow_ed (\S+)", s)
+grads = re.findall(r"\[code\] call (\d+): grad norm before the clip (\S+), of which the flow (\S+),", s)
 last = rows[-1] if rows else None
-ok = bool(last) and all(math.isfinite(float(v)) for v in last[1:])
+a2 = 1 - math.exp(-2 * 64 / 64)
+ok = bool(last) and bool(grads) and all(math.isfinite(float(v)) for v in last[1:]) and all(math.isfinite(float(v)) for v in grads[-1][1:]) and 1 - a2 - 0.05 <= float(last[3]) <= 1.05
 after = s.split("[warmup] done")[-1] if "[warmup] done" in s else ""
-print("code check:", "PASS" if ok else "FAIL", "last", last, "lines", len(rows), "recompiles after warm-up", after.count("__recompiles"))
+print("code check:", "PASS" if ok else "FAIL", "last", last, "grad", grads[-1] if grads else None, "lines", len(rows), "recompiles after warm-up", after.count("__recompiles"))
+sys.exit(0 if ok else 1)
 PY
+[ $? -eq 0 ] || fail=1
 log "START resume to 1000"
 BENCH_OUT=$OUT/bench/resume timeout -k 60 420 bash $WT/jobs/train_ladder.sh d640 640 9 2 3200 --config configs_h100/code_train.yaml --model.denoiser.init_args.code_rate 64 \
   --trainer.max_steps 1000 --trainer.log_every_n_steps 50 > $OUT/resume.log 2>&1
-log "END resume rc=$?"
-log "START eval at 50 calls"
-timeout -k 60 900 bash $WT/jobs/eval_code.sh d640 640 9 2 800 50 > $OUT/eval.log 2>&1
-log "END eval rc=$?"
-log "DONE $OUT"
+rc=$?; log "END resume rc=$rc"; [ $rc -eq 0 ] || fail=1
+for noise in official prompt; do
+  log "START eval at 50 calls, $noise x_T"
+  EVAL_NOISE=$noise timeout -k 60 900 bash $WT/jobs/eval_code.sh d640 640 9 2 800 50 > $OUT/eval_$noise.log 2>&1
+  rc=$?; log "END eval rc=$rc"; [ $rc -eq 0 ] || fail=1
+done
+ls $OUT/exp_ladder_d640/eval_000800_calls50/metrics.json $OUT/exp_ladder_d640/eval_000800_calls50_prompt/metrics.json || fail=1
+log "DONE $OUT fail=$fail"
+exit $fail
