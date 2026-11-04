@@ -5,7 +5,7 @@
   near      share of samples with nn_rms below 0.1
   covered   share of training images that are the nearest of a sample with nn_rms below 0.1
   distinct  share of training images that are the nearest of any sample
-  tf_rms    the same distance when each patch is drawn given the true patches before it (teacher forcing). tf_rms far below nn_rms means that errors grow along the chain.
+  late      the same distances on the last quarter of the patches (rows 192 to 255), where the image is already decided: nn_late to the nearest training image of the whole sample, tf_late when each patch is drawn given the true patches before it (teacher forcing). tf_late far below nn_late means that errors grow along the chain. The reverse does not hold on early patches: a good model may draw another image's patch there, so only the late rows are read this way.
 Samples: 128 at the checks, 8 N (at least 64) at the last step. Raw weights.
 usage: overfit_ar.py <N> <out dir> [steps] [seed]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
 """
@@ -64,7 +64,8 @@ opt = torch.optim.AdamW(net.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_dec
 def measure(g):
     d = torch.cat([torch.cdist(g[i:i + 64].flatten(1), imgs.flatten(1)) for i in range(0, len(g), 64)]) / (3 * 256 * 256) ** 0.5
     nn, idx = d.min(1)
-    return dict(nn_rms=nn.mean().item(), nn_rms_p90=nn.quantile(0.9).item(), near=(nn < 0.1).float().mean().item(), covered=idx[nn < 0.1].unique().numel() / N, distinct=idx.unique().numel() / N, pixel_std=g.std(0).mean().item())
+    late = ((g[:, :, 192:] - imgs[idx][:, :, 192:]) ** 2).mean(dim=(1, 2, 3)).sqrt()
+    return dict(nn_rms=nn.mean().item(), nn_rms_p90=nn.quantile(0.9).item(), near=(nn < 0.1).float().mean().item(), covered=idx[nn < 0.1].unique().numel() / N, distinct=idx.unique().numel() / N, pixel_std=g.std(0).mean().item(), nn_late=late.mean().item())
 
 
 @torch.no_grad()
@@ -84,7 +85,7 @@ def teacher_forced():
     with torch.autocast("cuda", dtype=torch.bfloat16):
         z = net(tokens, y, y_mask=mask).float()
         drawn = net.draw_patch(z.reshape(-1, z.shape[-1])).view(tokens.shape)
-    return ((drawn - tokens) ** 2).mean(dim=(1, 2)).sqrt().mean().item()
+    return ((drawn[:, 192:] - tokens[:, 192:]) ** 2).mean(dim=(1, 2)).sqrt().mean().item()
 
 
 rows = []
@@ -106,7 +107,7 @@ for step in range(1, STEPS + 1):
     if step in CHECKS:
         train_s = time.time() - t0
         g = sample(max(64, 8 * N) if step == STEPS else 128)
-        row = dict(step=step, seconds=train_s, sample_s=time.time() - t0 - train_s, fm=ema_fm, tf_rms=teacher_forced(), **measure(g))
+        row = dict(step=step, seconds=train_s, sample_s=time.time() - t0 - train_s, fm=ema_fm, tf_late=teacher_forced(), **measure(g))
         rows.append(row)
         json.dump(rows, open(f"{OUT}/{TAG}.json", "w"))
         print(TAG, {k: round(v, 4) if isinstance(v, float) else v for k, v in row.items()}, flush=True)

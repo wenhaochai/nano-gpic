@@ -1,6 +1,6 @@
 """The autoregressive model's loss (docs/autoregressive.md): teacher forcing, as an LLM trains. One forward gives z at every position from the true patches before it, and the head trains on each position's patch. Each position has its own head time tau and noise.
 
-The head's recipe is the official one, per patch: x-prediction, L2 in v space with t_eps, except for a wider tau: logit-normal(-0.8, 1.6). In 768 dimensions a mode is decided at a very small tau, and the official std of 0.8 rarely samples there (tools/ar/head_modes.py: total variation of 8 modes' shares 0.040 against 0.027, rms to the mode 0.012 against 0.005). CFG dropout comes from BaseTrainer.
+The head's recipe is the official one, per patch: x-prediction, L2 in v space with t_eps, except for a wider tau: logit-normal(-0.8, 1.6). In tools/ar/head_modes.py (8 modes in 768 dimensions, one training seed) a draw lies closer to its mode: rms 0.005 against 0.012 at the official std of 0.8. The modes' shares do not separate the two: total variation 0.027 against 0.040, with a sampling noise of about 0.016. CFG dropout comes from BaseTrainer.
 """
 import torch
 

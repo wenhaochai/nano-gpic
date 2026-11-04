@@ -9,7 +9,8 @@
 #FETCHABLE
 # The autoregressive model at d640 to C0/8, then FD at C0/16 and C0/8 (docs/autoregressive.md). Same compute as the point model: 133.00 GFLOP per image against 104.15 (tools/ar/test_ar.py), so 66816 x 104.15 / 133.00 = 52322, and 52320 steps (a multiple of 32).
 # Rule, set before the run: valid only if FD is below the point model with each prompt's own noise, 1529.61 at C0/16 and 1083.94 at C0/8 (w1098, w1099), by more than 5% at both points. The seed test shows 2-4% between two runs of one recipe.
-# Code: the frozen worktree gpic-wt/ar_run. Same shard order as the baseline, w1053.
+# A known bias against this model at C0/16: at the same compute it takes fewer steps, so the EMA of 0.9999 still holds 7.3% of the initial weights there, against 3.5% for the baseline (0.53% and 0.13% at C0/8). The rule stays as written; a failure only at C0/16 is reported with this bias.
+# Code: the frozen worktree gpic-wt/ar_run. Same shard order and the same official crop as the baseline, w1053.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 WT=$WC/project/gpic-wt/ar_run
@@ -17,7 +18,7 @@ WT=$WC/project/gpic-wt/ar_run
 ROOT=$WC/runs/gpic-speed/ar_d640
 mkdir -p $ROOT
 export LADDER_WT=$WT LADDER_RUN_ROOT=$ROOT
-export GPIC_SHARD_SEED=1730000000
+export GPIC_SHARD_SEED=1730000000 GPIC_REGION_CROP=0
 bash $WT/jobs/train_ladder.sh d640 640 9 2 52320 --config configs_h100/ar_train.yaml --trainer.logger.init_args.name ar_d640 --trainer.logger.init_args.id ar-d640 >> $ROOT/train.log 2>&1
 rc=$?
 echo "train rc=$rc"

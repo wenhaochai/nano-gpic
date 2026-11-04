@@ -71,7 +71,7 @@ class ARJiT(JiT_T2I):
         for block in self.text_refine_blocks:
             y = block(y, condition) if text_mask is None else block(y, condition, text_mask)
         x = self.x_embedder(tokens[:, :-1])
-        x = torch.cat([self.bos.expand(B, 1, self.hidden_size).to(x.dtype), x], dim=1) + self.pos_embed
+        x = torch.cat([self.bos.expand(B, 1, self.hidden_size).to(x.dtype), x], dim=1) + self.pos_embed.to(x.dtype)   # bf16 under autocast, as the official in-place add keeps it (review 2026-11-04)
         causal = self.causal[None, None].expand(B, 1, N, N)   # SDPA boolean mask, True = attend
         words = torch.ones(B, 1, N, y.shape[1], dtype=torch.bool, device=x.device) if y_mask is None else y_mask[:, None, None, :].expand(B, 1, N, y.shape[1])
         mask = torch.cat([causal, words], dim=-1)

@@ -12,7 +12,7 @@
 # 1. N = 1: nn_rms under 0.05.
 # 2. N = 32: covered >= 0.6745 (the point model's 0.8125 minus 2 SE).
 # 3. N = 256: the mean covered of the two seeds >= 0.7594 (the point model's 0.8086 minus 2 SE).
-# Reported with no threshold: near, distinct, the sample time, and tf_rms against nn_rms, which shows whether errors grow along the chain.
+# Reported with no threshold: near, distinct, the sample time, and tf_late against nn_late, which shows whether errors grow along the chain.
 # Expected: about 30 min. Code: the frozen worktree gpic-wt/ar_run.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
