@@ -43,15 +43,15 @@ wait_arm() {   # wait_arm <tag>: 20 s after the warm-up, CPU use and wait of ran
 }
 
 wait_arm d640_control &
-d640 d640_control 420 2400
+d640 d640_control 300 2400
 wait
 wait_arm d640_idle &
-GPIC_WORKER_IDLE=1 d640 d640_idle 420 2400
+GPIC_WORKER_IDLE=1 d640 d640_idle 300 2400
 wait
 wait_arm d640_idle_b200 &
-GPIC_WORKER_IDLE=1 GPIC_SIGTERM_EVERY=200 d640 d640_idle_b200 420 2400
+GPIC_WORKER_IDLE=1 GPIC_SIGTERM_EVERY=200 d640 d640_idle_b200 300 2400
 wait
-d640 d640_control2 420 2400
+d640 d640_control2 300 2400
 d1280 d1280_control 420 800
 GPIC_WORKER_IDLE=1 GPIC_SIGTERM_EVERY=200 d1280 d1280_idle_b200 420 800
 

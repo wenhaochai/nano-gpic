@@ -81,11 +81,15 @@ def idle_workers(index, workers):
     done = 0
     for pid in workers:
         try:
-            for tid in os.listdir(f"/proc/{pid}/task"):
-                os.sched_setscheduler(int(tid), os.SCHED_IDLE, os.sched_param(0))
-            done += 1
-        except OSError:                     # a worker that ended, or a thread that just ended
-            pass
+            tids = [int(t) for t in os.listdir(f"/proc/{pid}/task")]
+        except OSError:                     # a worker that ended
+            continue
+        for tid in tids:
+            try:
+                os.sched_setscheduler(tid, os.SCHED_IDLE, os.sched_param(0))
+                done += tid == pid
+            except OSError:                 # a thread that just ended
+                pass
     print(f"[idle] device {index}: {done} of {len(workers)} workers under SCHED_IDLE", flush=True)
 
 
