@@ -57,5 +57,42 @@ The trace (3 steps per rank, first step dropped):
 - d1280: 88-89 ms busy of 92 ms in the clean step, 1760 kernels; 3 all-reduces, the first 5.6 ms after the last rank arrives.
 - All-reduce at d640: 438 MB in 1.75 ms after the last rank arrives, about 250 GB/s; the rest of its 2.2-2.7 ms kernel time is ranks arriving 1.2-2.0 ms apart. The kernel name RING_LL misleads: w874's TUNING logs (2026-11-01) show Ring/Simple, and NVLS for all-reduce gave no gain.
 Main thread by library (perf, 15 s, rank 3): python 32.7%, libcuda 19.3%, libtorch_cpu 9.9%, libtorch_python 8.7%, libc 8.5%, libtorch_cuda 4.9%, libc10_cuda 4.8%, tcmalloc 4.1%. Autograd thread: libcuda 27.2%, libc 17.9% (mutexes 9.2%), libtorch_cpu 17.0%, libc10_cuda 7.9%, cuBLAS 6.5%.
-One step in 50 costs about 30 ms at d640 and 55 ms at d1280: the SIGTERM broadcast of src/utils/patch_bugs.py, a host sync. That is 0.57 and 1.31 ms per step on average.
-Levers left, none tested: (1) the data path, up to 4.7 ms at d640: lower priority for workers instead of fewer CPUs, fewer workers, an exact faster crop; (2) one DDP bucket at d1024 and d1280: three buckets at d1280 take about 15 ms (estimate: the first takes 5.6 ms), and the flat rate of 272 GB/s (2026-11-01, tools/prof/nccl_bench.py) gives about 10 ms for 2.66 GB; (3) the broadcast every 200-500 steps.
+One step in 50 is slower by about 30 ms at d640 and 55 ms at d1280: the SIGTERM broadcast of src/utils/patch_bugs.py, a host sync. We first read this as 0.57 and 1.31 ms per step on average; w1055 refutes that reading (next section).
+Levers named here, all tested in the next section except the crop: lower priority for workers, fewer workers, one DDP bucket at d1280, the broadcast every 200 steps.
+
+## Host tests after the trace (2026-11-04, w1051 and w1055): no gain in the mean
+Steps from 100 on, without checkpoint saves. Mean / median / p90 / p99 ms per step.
+w1051 (node-k14g1, 2026-11-03 23:48, code de7eae1, review docs/review_host2_2026-11-03.md, tools: tmp/ladder_prof/arm_table.py):
+- d640 control 29.4 / 26.5 / 41.6 / 71.2, repeat 29.6 / 26.7 / 41.5 / 73.4. nice 10 for the main threads 29.6, 24 workers 29.5, 16 workers 29.6, 16 workers with nice 10 29.6.
+- d1280 control 88.5 / 88.9 / 95.8 / 158.6, one DDP bucket of 3000 MiB 91.8 / 93.1 / 99.6 / 161.4 (worse).
+- The nice arms change nothing because no thread changes: Slurm's PropagatePrioProcess=2 starts every guest at nice 19, RLIMIT_NICE is 0, and setpriority to 10 fails with EACCES. SCHED_IDLE needs no privilege, which led to w1055.
+w1055 (node-k13g1, 2026-11-04 03:57, code 426847b, review docs/review_idle_2026-11-04.md), arms in this run order:
+| arm | mean | median | p90 | p99 | steps over 1.6 x median | workers' CPU wait (CPU-equivalents) |
+|---|---|---|---|---|---|---|
+| d640 control | 29.5 | 26.5 | 41.3 | 75.4 | 9.1% | 2.7 |
+| d640 workers under SCHED_IDLE | 29.3 | 27.1 | 37.9 | 70.0 | 6.1% | 8.7 |
+| d640 SCHED_IDLE, broadcast every 200 | 29.4 | 27.4 | 38.5 | 69.8 | 5.9% | 10.3 |
+| d640 control, repeat | 29.4 | 26.2 | 41.9 | 73.2 | 10.0% | not recorded |
+| d1280 control | 88.3 | 88.7 | 95.9 | 160.6 | 2.0% | not recorded |
+| d1280 SCHED_IDLE, broadcast every 200 | 88.4 | 88.9 | 95.7 | 154.8 | 1.3% | not recorded |
+All 32 workers of each rank moved to SCHED_IDLE (policy.txt shows IDL for 3584 worker threads), and no arm has a step over 0.3 s. The switch makes the steps more even and leaves the mean inside the spread of the two controls, so a run takes the same time. Decision: neither switch is adopted, `ladder_run` stays at 0da9b6d, and the queued jobs are not touched.
+
+The periodic slow steps are not a cost (tools/prof/period_profile.py, mean step time by offset from the step with the sync, against steps far from any sync):
+- d1280 control, multiples of 50 that are not multiples of 100: offset 0 is 155.2 ms, offset 1 is 21.2 ms, other steps 88.4 ms: +66.9 ms, then -67.2 ms. Multiples of 100 (the same, plus the logging of log_every_n_steps): 165.7 ms, then 22.1 ms.
+- d640 control, the same steps: offset 0 is 51.3 ms (+21.4 ms), and the next 5 steps are shorter by 4.6, 7.4, 8.4, 2.1 and 4.0 ms: -26.5 ms. Repeat: +22.6 ms, then -8.9, -8.9, -6.4, -6.0, -3.4 ms: -33.6 ms. Multiples of 100: +39.3 ms, then -9.2, -6.4, -7.7, -6.5, -4.3 ms.
+- With the broadcast every 200 steps, the slow step at multiples of 50 goes away (+1.6 ms at d640, -0.6 ms at d1280) and the next steps stop being short. The mean does not change: 29.3 against 29.4 ms, 88.3 against 88.4 ms.
+Reading: the host runs ahead of the GPU by about one step. A host sync waits for the GPU to finish, and the following steps launch into an empty queue, so the wait moves between steps and the sum stays. This reading comes from the pattern above; no test forces it. The first step after a sync takes about 21 ms at d640 and at d1280, against 26 and 88 ms at the median, so at d1280 the host has about four times the speed it needs. The same reading explains why SCHED_IDLE trades its shorter tail for a longer median with the mean unchanged. A slow step alone therefore proves no cost: only the mean over many steps does. The estimate of 0.57 and 1.31 ms per step above came from reading single steps.
+
+GPU work by launching op, from the w1048 trace (tools/prof/trace_phase.py; 16 rank-steps, first step dropped): at d640 compiled forward and backward take 11.6 of 19.3 ms and 829 of 1070 kernels, attention 2.9 ms, all-reduce 2.2 ms. At d1280 AdamW, EMA, gradient scaling and the norm take 14.1 ms; this work follows the parameter count, so flat parameters would not shrink it. At d640 the window catches only part of that work.
+
+Levers left: at d640 up to 4.3 ms (15%) for the data path, measured as production against the cycle arm of w1048 (a different node, and the cycle arm's 64 batches may not match the T distribution). At d1280 the host has no lever. Not tested: the cause of the pin arm's stalls (without them the pin arm would average 27.7 ms, 6% below production), an exact faster crop, and fewer kernels by hand.
+
+## Same seed on all ranks or one seed per rank (2026-11-04, w1053 and w1054, code 1882658, review docs/review_seed_2026-11-03.md)
+The official recipe seeds all ranks alike, so a global batch of 256 has 32 different (t, noise, CFG mask). `GPIC_RANK_SEED=1` gives each rank its own seed. d640 to C0/8 (66816 steps), both arms with GPIC_SHARD_SEED=1730000000, no resume in either arm (w1053's first launch died at NCCL init, before any checkpoint), EMA, 50K samples.
+| arm | checkpoint | FD-DINOv2 | fd_mu | fd_sigma | precision | recall | density | coverage | MMD |
+|---|---|---|---|---|---|---|---|---|---|
+| same | C0/16 | 2099.06 | 791.10 | 1307.96 | .9536 | .0000 | 4.419 | .1145 | 5.128 |
+| rank | C0/16 | 2144.16 | 814.15 | 1330.01 | .9417 | .0000 | 5.095 | .1260 | 5.317 |
+| same | C0/8 | 1503.63 | 561.06 | 942.57 | .9272 | .0007 | 3.052 | .1831 | 3.200 |
+| rank | C0/8 | 1451.32 | 542.71 | 908.61 | .9275 | .0003 | 3.981 | .1951 | 3.024 |
+Per-rank seeds change FD by +2.15% at C0/16 and -3.48% at C0/8. The sign changes, so by the rule set before the run (same sign at both checkpoints and over a few percent) this is no evidence of a gain, and it is no proof of no effect: one pair gives no noise estimate. Density and coverage are higher with per-rank seeds at both checkpoints, a weak hint. A correction to the review's fix note: the arms share the shard order, not the sample order, because the grouping shuffle hashes the pid (gpic_dataset.py:270). The ladder keeps the official seeding.
