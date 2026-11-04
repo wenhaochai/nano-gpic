@@ -297,7 +297,7 @@ R = 16，第 10000 步，调用次数的影响：1 次 0.0044、0.0019、0.0102�
 3. 方案 A 不能从 x_T 取 z0：那样所有提示词的 z0 相同。现在 z0 用 `zlib.crc32(key)` 作种子，每个提示词有自己的 z0。
 4. 这使方案 A 在官方噪声下有点模型没有的随机性。所以“方案 A 对点模型”的干净比较要让两边都用逐提示词的 x_T。
 
-测试（`jobs/eval_noise.sh`，只做评测，约 3.7 H100-h）：w1053 的 C0/8 上跑 official（必须复现 1503.63）、fixed1、fixed2（另一个共同噪声）、prompt_a、prompt_b（逐提示词噪声），C0/16 上跑 prompt_a。读法（运行前写定）：official、fixed1、fixed2 的差异是“噪声身份”的影响。它们的均值与 prompt_a、prompt_b 的均值之差是“共用一个噪声”的代价。`noise_share.json` 给出特征方差里噪声的份额。
+测试（`jobs/eval_noise.sh`，只做评测，两个 4-GPU 作业，约 3.7 H100-h）：w1053 的 C0/8 上跑 official（必须在 0.1% 内复现 1503.63）、fixed1、fixed2（另一个共同噪声）、prompt_a、prompt_b（逐提示词噪声），C0/16 上跑 prompt_a。读法（运行前写定）：official、fixed1、fixed2 的差异是“噪声身份”的影响。它们的均值与 prompt_a、prompt_b 的均值之差是“共用一个噪声”的代价。`noise_share.json` 给出特征方差里噪声的份额。
 
 修订后的判断规则（运行前写定）：
 

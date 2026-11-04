@@ -23,14 +23,9 @@ res["mean_shift_fixed1_vs_fixed2"] = ((f1.mean(0) - f2.mean(0)) ** 2).sum()
 if os.path.exists(f"{out}/prompt_b_{step}/features.npy"):
     fb = feat("prompt_b")
     res["mean_shift_prompt_a_vs_b"] = ((fp.mean(0) - fb.mean(0)) ** 2).sum()
-npz = lambda arm: [os.path.join(r, "output.npz") for r, _, fs in os.walk(f"{out}/{arm}_{step}/pred") if "output.npz" in fs][0]
-try:
-    a, b = np.load(npz("fixed1"))["arr_0"], np.load(npz("fixed2"))["arr_0"]
-    n = min(5000, len(a))
-    x, y = a[:n].astype(np.float32) / 127.5 - 1, b[:n].astype(np.float32) / 127.5 - 1
-    res.update(pixel_noise_var=float(((x - y) ** 2).mean() / 2), pixel_var_over_prompts=float(x.var(0).mean()), pixel_mean_abs_diff_255=float(np.abs(a[:n].astype(np.float32) - b[:n].astype(np.float32)).mean()))
-except (IndexError, OSError) as e:
-    print("no pixel part:", e)
+a, b = np.load(f"{out}/fixed1_{step}/first.npy"), np.load(f"{out}/fixed2_{step}/first.npy")
+x, y = a.astype(np.float32) / 127.5 - 1, b.astype(np.float32) / 127.5 - 1
+res.update(images=len(a), pixel_noise_var=float(((x - y) ** 2).mean() / 2), pixel_var_over_prompts=float(x.var(0).mean()), pixel_mean_abs_diff_255=float(np.abs(a.astype(np.float32) - b.astype(np.float32)).mean()))
 res = {k: float(v) if not isinstance(v, str) else v for k, v in res.items()}
 json.dump(res, open(f"{out}/noise_share.json", "w"), indent=1)
 print(json.dumps(res, indent=1))
