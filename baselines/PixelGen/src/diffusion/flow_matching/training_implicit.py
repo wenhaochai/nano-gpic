@@ -5,6 +5,8 @@ The loss is a generalized energy score over whole images, on the same v-space sc
 with g, g' two samples for one x_t. It is strictly proper, so its minimum is the true posterior, and it needs only one true image per x_t.
 The norm is the root mean square over pixels, which only rescales the score. Everything else is JiTTrainer's: t, noise, the CFG dropout.
 """
+import os
+
 import torch
 
 from src.diffusion.flow_matching.training_JiT import JiTTrainer, time_shift_fn
@@ -15,6 +17,7 @@ class ImplicitJiTTrainer(JiTTrainer):
         super().__init__(*args, **kwargs)
         assert samples >= 2 and 0 < beta < 2, (samples, beta)
         self.samples, self.beta = samples, beta
+        self._print_every, self._calls = int(os.environ.get("GPIC_IMPLICIT_PRINT") or 0), 0   # smoke test only: a host sync on these steps
 
     def _impl_trainstep(self, net, ema_net, solver, x, y, metadata=None):
         B = x.shape[0]
@@ -34,4 +37,8 @@ class ImplicitJiTTrainer(JiTTrainer):
         i, j = torch.triu_indices(self.samples, self.samples, 1, device=x.device)
         between = ((w * (g[:, i] - g[:, j])) ** 2).mean((2, 3, 4)).add(1e-8).pow(half).mean(1)            # [B]
         score = to_data - 0.5 * between
+        if self._print_every:
+            self._calls += 1
+            if self._calls % self._print_every == 0:
+                print(f"[implicit] call {self._calls}: score {score.mean().item():.5f} to_data {to_data.mean().item():.5f} between {between.mean().item():.5f}", flush=True)
         return dict(loss=score.mean(), to_data=to_data.detach().mean(), between=between.detach().mean(), loss_per_sample=score.detach())

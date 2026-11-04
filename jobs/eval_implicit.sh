@@ -2,7 +2,7 @@
 #SBATCH -J gpic-implicit-eval
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=00:45:00
+#SBATCH --time=01:20:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable

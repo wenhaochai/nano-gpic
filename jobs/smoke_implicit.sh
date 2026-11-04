@@ -17,12 +17,22 @@ TS=$(date +%m%d_%H%M)
 OUT=$WC/runs/gpic-speed/implicit_smoke_$TS
 mkdir -p $OUT
 git -C $WT rev-parse HEAD > $OUT/commit.txt
-export LADDER_WT=$WT LADDER_PARTIAL_OK=1 WANDB_MODE=disabled TORCH_LOGS=recompiles LADDER_RUN_ROOT=$OUT IMPLICIT_NAME=smoke IMPLICIT_STEPS=3200
+export LADDER_WT=$WT LADDER_PARTIAL_OK=1 WANDB_MODE=disabled TORCH_LOGS=recompiles LADDER_RUN_ROOT=$OUT IMPLICIT_NAME=smoke IMPLICIT_STEPS=3200 GPIC_IMPLICIT_PRINT=100
 log() { echo "[$(date +%T)] $*" | tee -a $OUT/phases.log; }
 
 log "START train to 800"
 BENCH_OUT=$OUT/bench/first timeout -k 60 600 bash $WT/jobs/train_implicit.sh --trainer.max_steps 800 --trainer.log_every_n_steps 50 > $OUT/first.log 2>&1
 log "END train rc=$?"
+# the checks of review finding 6: a finite score, samples that separate, no recompile after the warm-up
+python3 -I - $OUT/first.log <<'PY' | tee -a $OUT/phases.log
+import math, re, sys
+s = open(sys.argv[1], errors="replace").read()
+rows = re.findall(r"\[implicit\] call (\d+): score (\S+) to_data (\S+) between (\S+)", s)
+last = rows[-1] if rows else None
+ok = bool(last) and all(math.isfinite(float(v)) for v in last[1:]) and float(last[3]) > 1e-3
+after = s.split("[warmup] done")[-1] if "[warmup] done" in s else ""
+print("implicit check:", "PASS" if ok else "FAIL", "last", last, "lines", len(rows), "recompiles after warm-up", after.count("__recompiles"))
+PY
 log "START resume to 1000"
 BENCH_OUT=$OUT/bench/resume timeout -k 60 420 bash $WT/jobs/train_implicit.sh --trainer.max_steps 1000 --trainer.log_every_n_steps 50 > $OUT/resume.log 2>&1
 log "END resume rc=$?"
