@@ -12,11 +12,12 @@ from torch.utils.data import IterableDataset, Dataset
 # Transforms
 # -------------------------
 
-from .augmentation import center_crop_arr, random_crop_arr
+from .augmentation import center_crop_arr, random_crop_arr, random_crop_arr_region
 global train_transform, val_transform
 
+_train_crop = random_crop_arr_region if os.environ.get("GPIC_REGION_CROP") == "1" else random_crop_arr   # jobs/smoke_ladder_crop.sh; unset in production until adopted
 train_transform = T.Compose([
-    T.Lambda(lambda pil_image: random_crop_arr(pil_image, 256)),
+    T.Lambda(lambda pil_image: _train_crop(pil_image, 256)),
     T.ToTensor(),
     T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
 ])
