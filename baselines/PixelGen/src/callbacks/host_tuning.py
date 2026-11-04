@@ -104,6 +104,12 @@ class HostTuning(Callback):
     def on_train_start(self, trainer, pl_module):
         gc.collect()
         gc.freeze()
+        if os.environ.get("GPIC_RANK_SEED") == "1":
+            # Lightning seeds every rank alike (reset_seed), so without this all ranks draw the same t, noise and CFG dropout at each step
+            # and a global batch of 256 has 32 different (t, noise). Applied after the warm-up. jobs/smoke_ladder_seed.sh
+            seed = torch.initial_seed() % 2**31 + 1000003 * (trainer.global_rank + 1)
+            torch.manual_seed(seed)
+            print(f"[seed] rank {trainer.global_rank}: {seed}", flush=True)
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         if self._nice:
