@@ -42,12 +42,14 @@ T_EPS, XI, Z, HW = 0.05, 32, 32, 48
 WIDTH, DEPTH, SPLIT = 256, 4, 2
 NORM_LOW = -0.8, 0.8
 
-KIND = arm.split("_")[0]
+TMIX = 0.1 if arm.endswith("_tmix") else 0.0                # a tenth of the training t uniform on (0, 1), so that low noise gets training
+ARM = arm[:-5] if TMIX else arm
+KIND = ARM.split("_")[0]
 M = 2 if KIND == "impl" else 1
-K = int(arm.split("_k")[1]) if KIND == "part" else 1
-LAM = float(arm.split("_l")[1]) if KIND == "cvae" else 0.0
-ONCE = KIND == "cvae" and arm.startswith("cvae_once")
-m_ = re.match(r"(gauss|nll)_(r(\d+)|d)(d?)$", arm)
+K = int(ARM.split("_k")[1]) if KIND == "part" else 1
+LAM = float(ARM.split("_l")[1]) if KIND == "cvae" else 0.0
+ONCE = KIND == "cvae" and ARM.startswith("cvae_once")
+m_ = re.match(r"(gauss|nll)_(r(\d+)|d)(d?)$", ARM)
 R = int(m_.group(3) or 0) if m_ else 0
 DIAG = bool(m_) and (m_.group(4) == "d" or m_.group(2) == "d")
 COST = {"impl": 1.5, "cvae": 1.04, "flow": 1.17}.get(KIND, 1.0)
@@ -179,6 +181,8 @@ def nll_parts(o):
 def loss_fn(net, x):
     n = len(x)
     t = (torch.randn(n) * NORM_LOW[1] + NORM_LOW[0]).sigmoid()
+    if TMIX:
+        t = torch.where(torch.rand(n) < TMIX, torch.rand(n).clamp_max(0.999), t)
     tv = t.view(-1, 1, 1)
     eps = torch.randn_like(x)
     x_t = tv * x + (1 - tv) * eps
@@ -312,6 +316,27 @@ def kl_now(net, n=2000):
     return (0.5 * (mu ** 2 + ls.exp() - ls - 1).sum(1)).mean().item()
 
 
+@torch.no_grad()
+def val_by_t(net, n=5000):
+    """Velocity-space squared error of the mean by noise level, and the same for the exact posterior mean where it is known: the curve datasets, by a grid on the angle."""
+    res = {}
+    if KIND not in ("point", "gauss"):
+        return res
+    x = sample_data(n)
+    grid_x = curve(torch.linspace(0, 2 * math.pi, 8000)[:, None]).flatten(1) if dataset in ("manifold", "embedded") else None
+    for tv in (0.1, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95):
+        t = torch.full((n,), tv)
+        x_t = tv * x + (1 - tv) * torch.randn_like(x)
+        pred = net.trunk(x_t, t).view(n, D, DT) if KIND == "point" else gauss_mean(net.trunk(x_t, t), x_t, t)
+        row = {"model": (((pred - x) / (1 - tv)) ** 2).mean().item()}
+        if grid_x is not None:
+            s2 = (1 - tv) ** 2 + (tv * 0.01) ** 2
+            w = (-torch.cdist(x_t.flatten(1), tv * grid_x) ** 2 / (2 * s2)).softmax(-1)
+            row["bayes"] = (((w @ grid_x - x.flatten(1)) / (1 - tv)) ** 2).mean().item()
+        res[tv] = row
+    return res
+
+
 if __name__ == "__main__":
     net = Net()
     ema = copy.deepcopy(net)
@@ -330,7 +355,7 @@ if __name__ == "__main__":
                 p.lerp_(q, 1e-3)
         if step in evals:
             real = sample_data(2000)
-            row = {"step": evals[step], "real_steps": step, "dataset": dataset, "arm": arm, "seed": SEED, "seconds": time.time() - t_start, "kl": kl_now(ema), "gen": []}
+            row = {"step": evals[step], "real_steps": step, "dataset": dataset, "arm": arm, "seed": SEED, "seconds": time.time() - t_start, "kl": kl_now(ema), "val": val_by_t(ema), "gen": []}
             for mode in MODES:
                 for calls, kind in ((1, "uniform"), (2, "uniform"), (4, "uniform"), (8, "uniform"), (50, "uniform"), (8, "logit"), (50, "logit")):
                     g = generate(ema, 2000, calls, mode, kind)
