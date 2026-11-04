@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import numpy as np
@@ -236,6 +237,51 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
+class CodeEncoder(nn.Module):
+    """Plan A: x -> u, code_dim numbers. A small ViT on the image's patches, mean pooled. About 1% of a d640 forward with CodePrior."""
+    def __init__(self, patch_dim, num_patches, code_dim, width=128, heads=4, depth=2):
+        super().__init__()
+        self.proj = nn.Linear(patch_dim, width)
+        self.pos = nn.Parameter(torch.randn(1, num_patches, width) * 0.02)
+        self.blocks = nn.ModuleList(
+            nn.TransformerEncoderLayer(width, heads, 4 * width, dropout=0.0, activation="gelu", batch_first=True, norm_first=True) for _ in range(depth))
+        self.norm = nn.LayerNorm(width)
+        self.out = nn.Linear(width, code_dim)
+
+    def forward(self, tokens):
+        h = self.proj(tokens) + self.pos
+        for block in self.blocks:
+            h = block(h)
+        return self.out(self.norm(h).mean(1))
+
+
+class CodePrior(nn.Module):
+    """Plan A: a tiny flow on z, conditioned on the masked mean of the caption's embedding."""
+    def __init__(self, code_dim, y_dim, width=1024, depth=4, y_width=256):
+        super().__init__()
+        self.y_norm = nn.LayerNorm(y_dim)
+        self.y_proj = nn.Linear(y_dim, y_width)
+        self.inp = nn.Linear(code_dim + 12 + y_width, width)
+        self.blocks = nn.ModuleList(nn.Sequential(nn.LayerNorm(width), nn.Linear(width, width), nn.SiLU(), nn.Linear(width, width)) for _ in range(depth))
+        self.out = nn.Linear(width, code_dim)
+
+    def cond(self, y, y_mask=None):
+        y = y.float()
+        if y_mask is None:
+            pooled = y.mean(1)
+        else:
+            m = y_mask[..., None].float()
+            pooled = (y * m).sum(1) / m.sum(1).clamp_min(1)
+        return self.y_proj(self.y_norm(pooled))
+
+    def forward(self, z, tau, c):
+        f = tau[:, None] * (2.0 ** torch.arange(6, device=z.device, dtype=z.dtype) * math.pi)
+        h = self.inp(torch.cat([z, f.sin(), f.cos(), c.to(z.dtype)], 1))
+        for block in self.blocks:
+            h = h + block(h)
+        return self.out(h)
+
+
 class JiT_T2I(nn.Module):
     def __init__(
             self,
@@ -253,11 +299,16 @@ class JiT_T2I(nn.Module):
             load_ema=False,
             xi_dim=0,
             xi_block=0,
+            code_dim=0,
+            code_rate=0.0,
     ):
         """xi_dim > 0 makes the model an implicit sampler of p(x | x_t, y) (docs/distribution_step.md): before block xi_block the batch
-        forks into m copies, and each copy gets its own noise. xi_dim = 0 is the official point model, unchanged."""
+        forks into m copies, and each copy gets its own noise. xi_dim = 0 is the official point model, unchanged.
+        code_dim > 0 is plan A (docs/distribution_step.md 5.2): a code z of the image joins the blocks' conditioning, through a Gaussian channel
+        of code_rate nats, and a tiny flow learns p(z | y). code_dim = 0 is the official point model, unchanged."""
         super().__init__()
         self.xi_dim, self.xi_block = xi_dim, xi_block
+        self.code_dim, self.code_rate = code_dim, code_rate
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.hidden_size = hidden_size
@@ -291,6 +342,10 @@ class JiT_T2I(nn.Module):
         if xi_dim:
             self.xi_global = nn.Linear(xi_dim, hidden_size)   # one noise vector per sample, through the blocks' conditioning: the whole image
             self.xi_token = nn.Linear(xi_dim, hidden_size)    # one noise vector per token: local detail
+        if code_dim:
+            self.code_enc = CodeEncoder(in_channels * patch_size ** 2, self.num_patches, code_dim)
+            self.code_proj = nn.Linear(code_dim, hidden_size)
+            self.code_prior = CodePrior(code_dim, txt_embed_dim)
 
         self.initialize_weights()
         self.precompute_pos = dict()
@@ -347,6 +402,42 @@ class JiT_T2I(nn.Module):
             for layer in (self.xi_global, self.xi_token):
                 nn.init.normal_(layer.weight, std=0.02)
                 nn.init.constant_(layer.bias, 0)
+        if self.code_dim:
+            nn.init.normal_(self.code_proj.weight, std=0.02)   # as the timestep embedding's layers: z starts as a small part of the conditioning
+            nn.init.constant_(self.code_proj.bias, 0)
+            nn.init.constant_(self.code_prior.out.weight, 0)
+            nn.init.constant_(self.code_prior.out.bias, 0)
+
+    def code_encode(self, x):
+        """Plan A: z = a u_hat + sqrt(1 - a^2) eps, u_hat = u scaled to the sphere of radius sqrt(d), a^2 = 1 - exp(-2 R / d). A Gaussian channel with power a^2 and noise 1 - a^2 per
+        dimension: I(x; z) <= R nats by Shannon's bound, whatever the encoder does. So there is no KL term and no weight, and only the flow can sample z well."""
+        tokens = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
+        u = self.code_enc(tokens).float()
+        u = u / u.norm(dim=-1, keepdim=True).clamp_min(1e-6) * self.code_dim ** 0.5
+        a2 = 1 - math.exp(-2 * self.code_rate / self.code_dim)
+        return a2 ** 0.5 * u + (1 - a2) ** 0.5 * torch.randn_like(u)
+
+    def code_prior_loss(self, z, y, y_mask=None):
+        """Flow matching on z given the caption. Call it with z detached: the flow must not change the code."""
+        c = self.code_prior.cond(y, y_mask)
+        tau = torch.rand(z.shape[0], device=z.device, dtype=z.dtype)
+        eta = torch.randn_like(z)
+        z_tau = tau[:, None] * z + (1 - tau[:, None]) * eta
+        return ((self.code_prior(z_tau, tau, c).float() - (z - eta)) ** 2).mean()
+
+    def code_flow(self, z0, y, y_mask=None, steps=64):
+        """z ~ p(z | y) from the start z0 ~ N(0, I)."""
+        c = self.code_prior.cond(y, y_mask)
+        z = z0.float()
+        for j in range(steps):
+            z = z + self.code_prior(z, torch.full((z.shape[0],), j / steps, device=z.device, dtype=z.dtype), c).float() / steps
+        return z
+
+    def code_sample(self, noise, y, y_mask=None, steps=64):
+        """z for a batch of images, from the official per-prompt noise: code_dim pixels spread over the image, so each prompt keeps its z on any rank. They are 1 / 3000 of the
+        noise at d = 64, so the small dependence between z and x_0 does not matter."""
+        flat = noise.flatten(1)
+        return self.code_flow(flat[:, :: flat.shape[1] // self.code_dim][:, :self.code_dim], y, y_mask, steps)
 
     def unpatchify(self, x, H, W):
         """
@@ -361,10 +452,10 @@ class JiT_T2I(nn.Module):
         )
         return x
     
-    def forward(self, x, t, y, return_layer=None, y_mask=None, m=1):
+    def forward(self, x, t, y, return_layer=None, y_mask=None, m=1, z=None):
         """y_mask (ladder option B): [B, T] bool, True = a real caption token, T <= txt_max_length; None = the
         official unmasked path (y padded to txt_max_length). m: samples per input of the implicit sampler; the
-        output is [B * m, C, H, W], each input's samples next to each other."""
+        output is [B * m, C, H, W], each input's samples next to each other. z: plan A's code, [B, code_dim]."""
         B, _, H, W = x.shape
         x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
@@ -375,7 +466,7 @@ class JiT_T2I(nn.Module):
             full_mask = torch.cat([torch.ones(B, 1, 1, x.shape[1], dtype=torch.bool, device=x.device), text_mask], dim=-1)
         t = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
         y = self.y_embedder(y).view(B, -1, self.hidden_size) + ypos.to(y.dtype)
-        condition = nn.functional.silu(t)
+        condition = nn.functional.silu(t if z is None else t + self.code_proj(z.to(t.dtype)).view(B, 1, self.hidden_size))
         for i, block in enumerate(self.text_refine_blocks):
             y = block(y, condition) if text_mask is None else block(y, condition, text_mask)
 

@@ -1,0 +1,5 @@
+# Overlay on lite_ladder_sample.yaml: plan A. The sampler stays the official Euler; predict_step draws one z per image from the flow and keeps it along the path.
+model:
+  denoiser:
+    init_args:
+      code_dim: 64

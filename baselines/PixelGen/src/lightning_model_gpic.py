@@ -255,7 +255,14 @@ class LightningModel(pl.LightningModule):
         # sample images
         net = self.denoiser if self.eval_original_model else self.ema_denoiser
         y_mask = meta.get("y_mask")
-        if y_mask is not None:   # ladder option B: masked text; with CFG != 1 the sampler's batch is [uncond, cond]
+        if getattr(net, "code_dim", 0):   # plan A (docs/distribution_step.md 5.2): one z per image, fixed along the path
+            assert float(self.diffusion_sampler.guidance) == 1.0, "CFG is fixed at 1.0 (owner, 2026-11-01)"
+            z = net.code_sample(xT, condition, y_mask)
+            base = net
+
+            def net(x, t, c, _base=base, _m=y_mask, _z=z):
+                return _base(x, t, c, y_mask=_m, z=_z)
+        elif y_mask is not None:   # ladder option B: masked text; with CFG != 1 the sampler's batch is [uncond, cond]
             null = torch.zeros_like(y_mask)
             null[:, 0] = True
             base = net
