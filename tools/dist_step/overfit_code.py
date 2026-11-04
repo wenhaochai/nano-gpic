@@ -11,11 +11,15 @@ Metrics, at 50 Euler calls with the official grid and t_eps, from the raw weight
   covered   share of training images that are the nearest of a sample with nn_rms below 0.1
   distinct  share of training images that are the nearest of any sample (no threshold)
 The learning rate warms up over 500 steps. Production has 4000 warm-up steps (lite_ladder.yaml); this test has fewer steps in all.
-usage: overfit_code.py <N> <R, 0 for the point model> <out dir> [steps]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
+With code arms the same metrics also come with z from the encoder on a random training image (enc_*): the decoder alone, with a perfect flow.
+  enc_match  share of those samples whose nearest training image is the image that gave z
+  z_fit      mean over samples of z of the squared distance to the nearest code centre a u_hat_i, over d (1 - a^2). About 1 if z lies on a cluster, above 1 if it lies between clusters. flow: z from the flow; enc: z from the encoder
+usage: overfit_code.py <N> <R, 0 for the point model> <out dir> [steps] [seed]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
 """
 import glob
 import io
 import json
+import math
 import os
 import sys
 import tarfile
@@ -33,11 +37,12 @@ from src.models.transformer.JiT_T2I import JiT_T2I
 
 N, RATE, OUT = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3]
 STEPS = int(sys.argv[4]) if len(sys.argv) > 4 else 24000
+SEED = int(sys.argv[5]) if len(sys.argv) > 5 else 0
 EVALS = sorted({s for s in (1000, 2000, 4000, 8000, 16000) if s < STEPS} | {STEPS})
 WC = "/scratch/gpfs/GROUP/USER"
-TAG = f"n{N}_r{RATE:g}"
+TAG = f"n{N}_r{RATE:g}" + (f"_s{SEED}" if SEED else "")
 os.makedirs(OUT, exist_ok=True)
-torch.manual_seed(0)
+torch.manual_seed(SEED)
 dev = "cuda"
 
 
@@ -65,6 +70,41 @@ net = JiT_T2I(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num
 net.compile()
 tr = CodeJiTTrainer(scheduler=LinearScheduler(), loss_weight_fn=constant, lognorm_t=True, timeshift=1.0, P_mean=-0.8, P_std=0.8, t_eps=0.05, null_condition_p=0.0).to(dev)
 opt = torch.optim.AdamW(net.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0, fused=True)
+
+
+@torch.no_grad()
+def code_of(x):
+    """A code of each image and the centre of its cluster, a u_hat: code_encode's two parts."""
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        u = net.code_enc(torch.nn.functional.unfold(x, kernel_size=16, stride=16).transpose(1, 2)).float()
+    u = u / u.norm(dim=-1, keepdim=True).clamp_min(1e-6) * net.code_dim ** 0.5
+    a2 = 1 - math.exp(-2 * net.code_rate / net.code_dim)
+    return a2 ** 0.5 * u, a2
+
+
+@torch.no_grad()
+def z_fit(z, centres, a2):
+    return (torch.cdist(z, centres).min(1)[0] ** 2).mean().item() / (net.code_dim * (1 - a2))
+
+
+@torch.no_grad()
+def sample_enc(n, calls):
+    """Samples with z from the encoder: images, and the index of the image that gave each z."""
+    res, who = [], []
+    ts = torch.cat([torch.linspace(0, 1 - 1 / calls, calls), torch.ones(1)]).to(dev)
+    for i in range(0, n, B):
+        x = torch.randn(B, 3, 256, 256, device=dev)
+        idx = torch.randint(N, (B,), device=dev)
+        centre, a2 = code_of(imgs[idx])
+        z = centre + (1 - a2) ** 0.5 * torch.randn_like(centre)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            for j in range(calls):
+                t = ts[j].repeat(B)
+                pred = net(x, t, y, y_mask=mask, z=z).float()
+                x = x + (ts[j + 1] - ts[j]) * (pred - x) / (1 - t.view(-1, 1, 1, 1)).clamp_min(0.05)
+        res.append(x.float())
+        who.append(idx)
+    return torch.cat(res)[:n], torch.cat(who)[:n]
 
 
 @torch.no_grad()
@@ -113,6 +153,18 @@ for step in range(1, STEPS + 1):
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 zs = net.code_encode(imgs[:B] if N >= B else imgs[torch.randint(N, (B,), device=dev)])
             row["z_var"] = zs.var(0).mean().item()
+            if step in (1000, 8000, 16000, STEPS):
+                g, who = sample_enc(max(64, 8 * N), 50)
+                m = measure(g)
+                row.update({f"enc_{k}": m[k] for k in ("nn_rms", "near", "covered", "distinct", "pixel_std")})
+                d = torch.cat([torch.cdist(g[i:i + 64].flatten(1), imgs.flatten(1)) for i in range(0, len(g), 64)])
+                row["enc_match"] = (d.argmin(1) == who).float().mean().item()
+                centres, a2 = torch.cat([code_of(imgs[i:i + 64])[0] for i in range(0, N, 64)]), 1 - math.exp(-2 * net.code_rate / net.code_dim)
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    flow = torch.cat([net.code_flow(torch.randn(B, net.code_dim, device=dev), y, mask) for _ in range(64)]).float()
+                enc_z = centres[torch.randint(N, (2048,), device=dev)]
+                enc_z = enc_z + (1 - a2) ** 0.5 * torch.randn_like(enc_z)
+                row.update(z_fit_flow=z_fit(flow, centres, a2), z_fit_enc=z_fit(enc_z, centres, a2))
         rows.append(row)
         json.dump(rows, open(f"{OUT}/{TAG}.json", "w"))
         print(TAG, {k: round(v, 4) if isinstance(v, float) else v for k, v in row.items()}, flush=True)
