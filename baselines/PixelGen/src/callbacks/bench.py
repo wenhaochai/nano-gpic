@@ -63,6 +63,7 @@ class BenchTimer(Callback):
         self.mark = None
         self.stages_on = bool(os.environ.get("BENCH_STAGES"))
         self.ticks, self.all_ticks = [], []
+        self.queue_on = os.environ.get("GPIC_PROF_QUEUE") == "1"   # the loader's buffers in each row (jobs/smoke_ladder_pin2.sh)
 
     # ------------------------------------------------------------------ stage markers
     def _stage(self, name):
@@ -113,6 +114,11 @@ class BenchTimer(Callback):
         self.cur = {"step": step,
                     "data_wait_s": (now - self.t_last_end) if self.t_last_end else (now - self.t_train_start),
                     "t_start": now - _T0}
+        if self.queue_on:
+            # After a long data wait: many batches received but not yet due mean one late worker; none mean the workers as a whole fell behind.
+            it = getattr(getattr(trainer.datamodule.train_dataset, "_dataloader", None), "_iterator", None)
+            if it is not None:
+                self.cur.update(q_ready=it._data_queue.qsize(), q_ahead=sum(len(v) == 2 for v in it._task_info.values()), q_out=it._tasks_outstanding)
         self.ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         self.ev[0].record()
         if self.stages_on:

@@ -33,17 +33,21 @@ def bind_to_gpu_socket(index):
     print(f"[numa] device {index} {bus} node {node}: {len(os.sched_getaffinity(0))} CPUs", flush=True)
 
 
-def pin_rank_threads(index, workers):
+def pin_rank_threads(index, workers, split=False):
     """The rank's main thread and its autograd thread alternate, so they share one CPU that no other thread of the node uses: no
     wait for a CPU and nothing else in their caches. Each socket gives up one CPU per GPU on it (index % 4: GPUs 0-3 on one socket,
     4-7 on the other). Every other thread of the rank (pin, NCCL, CUDA, idle autograd threads) and the data workers (workers: their
     pids) stay on the other CPUs of the socket. Call it on the main thread, after the first backward (the autograd thread exists)
-    and after the workers started (later children would inherit one CPU)."""
+    and after the workers started (later children would inherit one CPU).
+    split: main and autograd each get their own CPU, so each socket gives up two CPUs per GPU. w1048 stalled with one shared CPU: a run queue
+    with two pinned threads can be the busiest queue, and a balance pass that can pull neither doubles its interval (kernel: LBF_ALL_PINNED), so
+    the workers may wait for a CPU while others are idle. A queue with one running thread is not a pull candidate. jobs/smoke_ladder_pin2.sh tests this."""
     socket = sorted(os.sched_getaffinity(0))
-    if not 8 <= len(socket) <= 64:          # outside this range bind_to_gpu_socket did not run: two ranks would get one CPU
+    if not 16 <= len(socket) <= 64:         # outside this range bind_to_gpu_socket did not run: two ranks would get one CPU
         raise ValueError(f"{len(socket)} CPUs for this rank")
-    reserved = socket[-4:]                  # the last CPUs: the first CPU of a socket gets more of the system's interrupts
+    reserved = socket[-8:] if split else socket[-4:]   # the last CPUs: the first CPU of a socket gets more of the system's interrupts
     core = reserved[index % 4]
+    autograd_core = reserved[4 + index % 4] if split else core
     others = set(socket) - set(reserved)
     threads = {}
     for tid in os.listdir("/proc/self/task"):
@@ -68,9 +72,9 @@ def pin_rank_threads(index, workers):
             except OSError:                 # a thread that just ended
                 pass
     for t in autograd:
-        os.sched_setaffinity(t, {core})
+        os.sched_setaffinity(t, {autograd_core})
     os.sched_setaffinity(0, {core})         # this thread
-    print(f"[numa] device {index}: main and autograd threads on CPU {core}, {moved} workers and {len(threads) - 1 - len(autograd)} other threads on {len(others)} CPUs", flush=True)
+    print(f"[numa] device {index}: main thread on CPU {core}, autograd thread on CPU {autograd_core}, {moved} workers and {len(threads) - 1 - len(autograd)} other threads on {len(others)} CPUs", flush=True)
 
 
 def idle_workers(index, workers):
@@ -96,7 +100,8 @@ def idle_workers(index, workers):
 class HostTuning(Callback):
     def __init__(self):
         super().__init__()
-        self._pin = os.environ.get("GPIC_PROF_PIN") == "1"   # profiling switch (jobs/smoke_ladder_kernels.sh)
+        self._pin = os.environ.get("GPIC_PROF_PIN") in ("1", "2")   # profiling switch: 1 one shared CPU (jobs/smoke_ladder_kernels.sh), 2 one CPU each (jobs/smoke_ladder_pin2.sh)
+        self._pin_split = os.environ.get("GPIC_PROF_PIN") == "2"
         self._idle = os.environ.get("GPIC_WORKER_IDLE") == "1"   # jobs/smoke_ladder_host3.sh
 
     def setup(self, trainer, pl_module, stage):
@@ -130,6 +135,6 @@ class HostTuning(Callback):
             try:
                 it = getattr(getattr(trainer.datamodule.train_dataset, "_dataloader", None), "_iterator", None)
                 # is_alive: the list keeps workers that ended (GPIC_PROF_CYCLE_BATCHES), and their pid numbers can come back
-                pin_rank_threads(trainer.strategy.root_device.index, [w.pid for w in getattr(it, "_workers", []) if w.is_alive()])
+                pin_rank_threads(trainer.strategy.root_device.index, [w.pid for w in getattr(it, "_workers", []) if w.is_alive()], split=self._pin_split)
             except Exception as e:
                 print(f"[numa] pin skipped: {e!r}", flush=True)
