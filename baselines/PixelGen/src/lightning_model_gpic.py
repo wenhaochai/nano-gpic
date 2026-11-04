@@ -261,6 +261,11 @@ class LightningModel(pl.LightningModule):
         # sample images
         net = self.denoiser if self.eval_original_model else self.ema_denoiser
         y_mask = meta.get("y_mask")
+        if getattr(net, "is_ar", False):   # docs/autoregressive.md: x_T is not used; each image's randomness comes from the draws, and each rank has its own stream
+            assert float(self.diffusion_sampler.guidance) == 1.0, "CFG is fixed at 1.0 (owner, 2026-11-01)"
+            if batch_idx == 0:
+                torch.manual_seed(2000 + self.global_rank)
+            return fp2uint8(self.vae.decode(net.ar_sample(condition, y_mask)))
         if getattr(net, "code_dim", 0):   # plan A (docs/distribution_step.md 5.2): one z per image, fixed along the path
             assert float(self.diffusion_sampler.guidance) == 1.0, "CFG is fixed at 1.0 (owner, 2026-11-01)"
             # z0 has its own seed, from the prompt's key: each prompt keeps its z on any rank, and z0 is independent of xT. The official xT is the same tensor for all prompts (gpic_jsonl_dataset.py), so z0 must not come from it.

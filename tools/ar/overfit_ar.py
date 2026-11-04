@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Overfit test of the autoregressive model on the real backbone (d640, 9 + 2 blocks), on one GPU, with no data workers and no Lightning; the model and the trainer are the real ones. Unconditional (the null caption), N real images. Same images and metrics as tools/dist_step/overfit_code.py, so the point model's numbers of w1095 are the reference.
+
+  nn_rms    root mean square per pixel from each sample to its nearest training image, in [-1, 1] units
+  near      share of samples with nn_rms below 0.1
+  covered   share of training images that are the nearest of a sample with nn_rms below 0.1
+  distinct  share of training images that are the nearest of any sample
+  tf_rms    the same distance when each patch is drawn given the true patches before it (teacher forcing). tf_rms far below nn_rms means that errors grow along the chain.
+Samples: 128 at the checks, 8 N (at least 64) at the last step. Raw weights.
+usage: overfit_ar.py <N> <out dir> [steps] [seed]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
+"""
+import glob
+import io
+import json
+import os
+import sys
+import tarfile
+import time
+
+import numpy as np
+import torch
+from PIL import Image
+
+from src.data.dataset.augmentation import center_crop_arr
+from src.diffusion.flow_matching.training_ar import ARTrainer
+from src.models.transformer.AR_JiT import ARJiT
+
+N, OUT = int(sys.argv[1]), sys.argv[2]
+STEPS = int(sys.argv[3]) if len(sys.argv) > 3 else 24000
+SEED = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+CHECKS = sorted({s for s in (1000, 4000, 8000, 16000) if s < STEPS} | {STEPS})
+WC = "/scratch/gpfs/GROUP/USER"
+TAG = f"n{N}" + (f"_s{SEED}" if SEED else "")
+os.makedirs(OUT, exist_ok=True)
+torch.manual_seed(SEED)
+dev = "cuda"
+
+
+def load_images(n):
+    out = []
+    with tarfile.open(f"{WC}/data/gpic/train/gpic_train_00000.tar") as tar:
+        for m in tar:
+            if m.name.endswith(".jpg"):
+                arr = center_crop_arr(Image.open(io.BytesIO(tar.extractfile(m).read())).convert("RGB"), 256)
+                out.append(torch.from_numpy(np.asarray(arr).copy()).permute(2, 0, 1).float() / 127.5 - 1)
+                if len(out) == n:
+                    break
+    return torch.stack(out).to(dev)
+
+
+imgs = load_images(N)
+null = torch.load(glob.glob(f"{WC}/data/gpic/train_emb_qwen3_1.7b/null.pt")[0], map_location=dev, weights_only=True).float()
+B, T = 32, 8
+y = torch.zeros(B, T, 2048, device=dev, dtype=torch.bfloat16)
+y[:, 0] = null[0, 0].bfloat16()
+mask = torch.zeros(B, T, dtype=torch.bool, device=dev)
+mask[:, 0] = True
+net = ARJiT(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num_blocks=9, num_text_blocks=2, patch_size=16, txt_embed_dim=2048, txt_max_length=320, bottleneck_dim=256, head_width=1024, head_depth=3, head_steps=32).to(dev)
+net.compile()
+tr = ARTrainer(P_mean=-0.8, P_std=1.6, t_eps=0.05, null_condition_p=0.0).to(dev)
+opt = torch.optim.AdamW(net.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0, fused=True)
+
+
+def measure(g):
+    d = torch.cat([torch.cdist(g[i:i + 64].flatten(1), imgs.flatten(1)) for i in range(0, len(g), 64)]) / (3 * 256 * 256) ** 0.5
+    nn, idx = d.min(1)
+    return dict(nn_rms=nn.mean().item(), nn_rms_p90=nn.quantile(0.9).item(), near=(nn < 0.1).float().mean().item(), covered=idx[nn < 0.1].unique().numel() / N, distinct=idx.unique().numel() / N, pixel_std=g.std(0).mean().item())
+
+
+@torch.no_grad()
+def sample(n):
+    res = []
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        for _ in range(0, n, B):
+            res.append(net.ar_sample(y, mask).float())
+    return torch.cat(res)[:n]
+
+
+@torch.no_grad()
+def teacher_forced():
+    """Each patch drawn given the true patches before it: the chain with no chance for errors to grow."""
+    x = imgs[torch.randint(N, (B,), device=dev)]
+    tokens = torch.nn.functional.unfold(x, kernel_size=16, stride=16).transpose(1, 2)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        z = net(tokens, y, y_mask=mask).float()
+        drawn = net.draw_patch(z.reshape(-1, z.shape[-1])).view(tokens.shape)
+    return ((drawn - tokens) ** 2).mean(dim=(1, 2)).sqrt().mean().item()
+
+
+rows = []
+t0 = time.time()
+ema_fm = None
+for step in range(1, STEPS + 1):
+    for group in opt.param_groups:
+        group["lr"] = 1e-4 * min(1.0, step / 500)
+    x = imgs[torch.randint(N, (B,), device=dev)]
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        res = tr._impl_trainstep(net, None, None, x, y, {"y_mask": mask})
+    res["loss"].backward()
+    torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0, foreach=True)
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    if step % 50 == 0:
+        fm = res["fm_loss"].item()
+        ema_fm = fm if ema_fm is None else 0.9 * ema_fm + 0.1 * fm
+    if step in CHECKS:
+        train_s = time.time() - t0
+        g = sample(max(64, 8 * N) if step == STEPS else 128)
+        row = dict(step=step, seconds=train_s, sample_s=time.time() - t0 - train_s, fm=ema_fm, tf_rms=teacher_forced(), **measure(g))
+        rows.append(row)
+        json.dump(rows, open(f"{OUT}/{TAG}.json", "w"))
+        print(TAG, {k: round(v, 4) if isinstance(v, float) else v for k, v in row.items()}, flush=True)
+g = sample(32)[:16]
+grid = ((g.clamp(-1, 1) + 1) * 127.5).byte().permute(0, 2, 3, 1).cpu().numpy()
+Image.fromarray(np.concatenate([np.concatenate(list(grid[i:i + 8]), 1) for i in (0, 8)], 0)).save(f"{OUT}/{TAG}.png")
+print(TAG, "done", round(time.time() - t0), "s", flush=True)
