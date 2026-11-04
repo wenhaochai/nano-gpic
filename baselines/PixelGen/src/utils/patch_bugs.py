@@ -27,8 +27,12 @@ from lightning.pytorch.loops.training_epoch_loop import _TrainingEpochLoop as _T
 if hasattr(_TEL, "_broadcast_sigterm_tensor"):
     _broadcast_sigterm_every_step = _TEL._broadcast_sigterm_tensor
 
-    def _broadcast_sigterm_every_50(self):
-        if self.trainer.global_step % 50 == 0:
+    _SIGTERM_EVERY = max(1, int(os.environ.get("GPIC_SIGTERM_EVERY") or 50))   # steps; one check costs about 30 ms at d640, 55 ms at d1280 (w1048)
+    if os.environ.get("GPIC_SIGTERM_EVERY"):
+        print(f"[sigterm] broadcast every {_SIGTERM_EVERY} steps", flush=True)
+
+    def _broadcast_sigterm_sometimes(self):
+        if self.trainer.global_step % _SIGTERM_EVERY == 0:
             _broadcast_sigterm_every_step(self)
 
-    _TEL._broadcast_sigterm_tensor = _broadcast_sigterm_every_50
+    _TEL._broadcast_sigterm_tensor = _broadcast_sigterm_sometimes
