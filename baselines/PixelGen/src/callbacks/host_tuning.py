@@ -73,10 +73,25 @@ def pin_rank_threads(index, workers):
     print(f"[numa] device {index}: main and autograd threads on CPU {core}, {moved} workers and {len(threads) - 1 - len(autograd)} other threads on {len(others)} CPUs", flush=True)
 
 
+def nice_workers(index, workers, value):
+    """Data workers at a higher nice value, on all their CPUs: a rank's main and autograd threads then rarely wait for a CPU behind them
+    (w1048: 8.5% and 7.7% of the wall clock), and the workers lose no CPU. Raising the nice value of an own process needs no privilege."""
+    done = 0
+    for pid in workers:
+        try:
+            for tid in os.listdir(f"/proc/{pid}/task"):
+                os.setpriority(os.PRIO_PROCESS, int(tid), value)
+            done += 1
+        except OSError:                     # a worker that ended, or a thread that just ended
+            pass
+    print(f"[nice] device {index}: {done} of {len(workers)} workers at nice {value}", flush=True)
+
+
 class HostTuning(Callback):
     def __init__(self):
         super().__init__()
         self._pin = os.environ.get("GPIC_PROF_PIN") == "1"   # profiling switch (jobs/smoke_ladder_kernels.sh)
+        self._nice = int(os.environ.get("GPIC_WORKER_NICE", 0))   # jobs/smoke_ladder_host2.sh
 
     def setup(self, trainer, pl_module, stage):
         # before the dataloaders start, so the data workers follow the rank; a few percent of speed never stops a run
@@ -91,6 +106,13 @@ class HostTuning(Callback):
         gc.freeze()
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        if self._nice:
+            value, self._nice = self._nice, 0
+            try:
+                it = getattr(getattr(trainer.datamodule.train_dataset, "_dataloader", None), "_iterator", None)
+                nice_workers(trainer.strategy.root_device.index, [w.pid for w in getattr(it, "_workers", []) if w.is_alive()], value)
+            except Exception as e:
+                print(f"[nice] skipped: {e!r}", flush=True)
         if self._pin:
             self._pin = False
             try:
