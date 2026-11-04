@@ -63,6 +63,7 @@ class BenchTimer(Callback):
         self.mark = None
         self.stages_on = bool(os.environ.get("BENCH_STAGES"))
         self.ticks, self.all_ticks = [], []
+        self.queue_on = os.environ.get("GPIC_PROF_QUEUE") == "1"   # the loader's buffers in each row (jobs/smoke_ladder_pin2.sh)
 
     # ------------------------------------------------------------------ stage markers
     def _stage(self, name):
@@ -113,6 +114,20 @@ class BenchTimer(Callback):
         self.cur = {"step": step,
                     "data_wait_s": (now - self.t_last_end) if self.t_last_end else (now - self.t_train_start),
                     "t_start": now - _T0}
+        if self.queue_on:
+            # After a long data wait, q_ahead > 0: one late worker. q_ahead = 0 and q_raw > 0 with q_ready = 0: a late pin thread. All 0: the workers as a whole fell behind.
+            # A jump in delay_main_ns or delay_pin_ns: that thread waited for a CPU. q_rcvd - 1 modulo the workers per rank is the worker that delivered this batch.
+            try:
+                it = getattr(getattr(trainer.datamodule.train_dataset, "_dataloader", None), "_iterator", None)
+                if it is not None:
+                    self.cur.update(q_ready=it._data_queue.qsize(), q_raw=it._worker_result_queue.qsize(), q_ahead=sum(len(v) == 2 for v in it._task_info.values()), q_rcvd=it._rcvd_idx)
+                    with open("/proc/thread-self/schedstat") as f:
+                        self.cur["delay_main_ns"] = int(f.read().split()[1])
+                    with open(f"/proc/self/task/{it._pin_memory_thread.native_id}/schedstat") as f:
+                        self.cur["delay_pin_ns"] = int(f.read().split()[1])
+            except Exception as e:   # a profiling switch never stops a run
+                print(f"[queue] stopped: {e!r}", flush=True)
+                self.queue_on = False
         self.ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         self.ev[0].record()
         if self.stages_on:

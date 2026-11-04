@@ -38,7 +38,7 @@ if [ -n "${BENCH_OUT:-}" ]; then BENCH_CB=',{"class_path":"src.callbacks.bench.B
 CB='[{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"ms-{step:06d}","monitor":null,"save_last":false,"save_top_k":-1,"every_n_train_steps":'$MS'}},{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"resume-{step:06d}","monitor":null,"save_last":true,"save_top_k":0,"every_n_train_steps":'$LAST'}},{"class_path":"src.callbacks.compile_warmup.CompileWarmup"},{"class_path":"src.callbacks.host_tuning.HostTuning"}'$BENCH_CB']'
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
-export GPIC_SHARD_SEED=$(date +%s)   # shard order shuffled per launch and per epoch, shared by all ranks
+export GPIC_SHARD_SEED=${GPIC_SHARD_SEED:-$(date +%s)}   # shard order shuffled per launch and per epoch, shared by all ranks; a test may fix it
 export TORCHINDUCTOR_CPP_WRAPPER=1   # kernels launched from C++: d640 39.3 -> 32.6 ms; the same math up to bf16 rounding (tools/test_cpp_launcher.py)
 # the main thread spent 14.5% of its CPU time in glibc malloc; the threshold keeps tcmalloc's large-alloc report out of the log
 [ -f /usr/lib64/libtcmalloc.so.4 ] && export LD_PRELOAD=/usr/lib64/libtcmalloc.so.4${LD_PRELOAD:+:$LD_PRELOAD} TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD=100000000000
