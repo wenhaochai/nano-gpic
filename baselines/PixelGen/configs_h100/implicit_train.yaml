@@ -1,0 +1,20 @@
+# Overlay on lite_ladder.yaml: the implicit sampler (docs/distribution_step.md). main.py fit --config lite_ladder.yaml --config this.
+model:
+  denoiser:
+    init_args:
+      xi_dim: 64
+      xi_block: 6        # d640 has 9 main blocks: 6 once per x_t, 3 and the head per sample
+  diffusion_trainer:
+    class_path: src.diffusion.flow_matching.training_implicit.ImplicitJiTTrainer
+    init_args:
+      scheduler:
+        class_path: src.diffusion.flow_matching.scheduling.LinearScheduler
+      loss_weight_fn: src.diffusion.flow_matching.training_JiT.constant
+      lognorm_t: true
+      timeshift: 1.0
+      P_mean: -0.8
+      P_std: 0.8
+      t_eps: 0.05
+      null_condition_p: 0.1
+      samples: 2
+      beta: 1.0

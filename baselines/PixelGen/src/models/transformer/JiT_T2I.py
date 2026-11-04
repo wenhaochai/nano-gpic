@@ -251,8 +251,13 @@ class JiT_T2I(nn.Module):
             bottleneck_dim=256,
             weight_path=None,
             load_ema=False,
+            xi_dim=0,
+            xi_block=0,
     ):
+        """xi_dim > 0 makes the model an implicit sampler of p(x | x_t, y) (docs/distribution_step.md): before block xi_block the batch
+        forks into m copies, and each copy gets its own noise. xi_dim = 0 is the official point model, unchanged."""
         super().__init__()
+        self.xi_dim, self.xi_block = xi_dim, xi_block
         self.in_channels = in_channels
         self.out_channels = in_channels
         self.hidden_size = hidden_size
@@ -283,6 +288,9 @@ class JiT_T2I(nn.Module):
             TextRefineBlock(self.hidden_size, self.num_groups) for _ in range(self.num_text_blocks)
         ])
         self.final_layer = FinalLayer(self.hidden_size, in_channels*patch_size**2)
+        if xi_dim:
+            self.xi_global = nn.Linear(xi_dim, hidden_size)   # one noise vector per sample, through the blocks' conditioning: the whole image
+            self.xi_token = nn.Linear(xi_dim, hidden_size)    # one noise vector per token: local detail
 
         self.initialize_weights()
         self.precompute_pos = dict()
@@ -335,6 +343,10 @@ class JiT_T2I(nn.Module):
         # Zero-out output layers
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+        if self.xi_dim:   # small, not zero: with zero the samples start equal, and the energy score's repulsion has no direction
+            for layer in (self.xi_global, self.xi_token):
+                nn.init.normal_(layer.weight, std=0.02)
+                nn.init.constant_(layer.bias, 0)
 
     def unpatchify(self, x, H, W):
         """
@@ -349,9 +361,10 @@ class JiT_T2I(nn.Module):
         )
         return x
     
-    def forward(self, x, t, y, return_layer=None, y_mask=None):
+    def forward(self, x, t, y, return_layer=None, y_mask=None, m=1):
         """y_mask (ladder option B): [B, T] bool, True = a real caption token, T <= txt_max_length; None = the
-        official unmasked path (y padded to txt_max_length)."""
+        official unmasked path (y padded to txt_max_length). m: samples per input of the implicit sampler; the
+        output is [B * m, C, H, W], each input's samples next to each other."""
         B, _, H, W = x.shape
         x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
@@ -369,6 +382,11 @@ class JiT_T2I(nn.Module):
         x = self.x_embedder(x)
         x += self.pos_embed
         for i, block in enumerate(self.blocks):
+            if self.xi_dim and i == self.xi_block:   # the blocks before this one run once per input
+                x, y, condition = x.repeat_interleave(m, 0), y.repeat_interleave(m, 0), condition.repeat_interleave(m, 0)
+                full_mask = None if full_mask is None else full_mask.repeat_interleave(m, 0)
+                x = x + self.xi_token(torch.randn(x.shape[0], x.shape[1], self.xi_dim, device=x.device, dtype=x.dtype))
+                condition = condition + self.xi_global(torch.randn(x.shape[0], 1, self.xi_dim, device=x.device, dtype=x.dtype))
             if return_layer is not None and i==return_layer:
                 feat = x
             x = block(x, y, condition, xpos) if full_mask is None else block(x, y, condition, xpos, full_mask)
