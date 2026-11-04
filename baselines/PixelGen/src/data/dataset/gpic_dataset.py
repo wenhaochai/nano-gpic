@@ -21,7 +21,7 @@ train_transform = T.Compose([
     T.ToTensor(),
     T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
 ])
-print("Defined train_transform function (from dataset.augmentation import random_crop_arr) :", train_transform)
+print(f"Defined train_transform function (from dataset.augmentation import {_train_crop.__name__}) :", train_transform)
 
 val_transform = T.Compose([
         T.Lambda(lambda pil_image: center_crop_arr(pil_image, 256)),
@@ -304,7 +304,7 @@ class GPICWebDataset(IterableDataset):
             self._repeats += 1
             if self._last_sample is None or self._repeats > 8:
                 raise
-            warnings.warn(f"{s.get('__key__')}: {exn!r}: repeating the sample before it")
+            print(f"[data] {s.get('__key__')}: {exn!r}: repeating the sample before it", flush=True)   # a print: patch_bugs.py filters every UserWarning
             return self._last_sample
         self._last_sample, self._repeats = out, 0
         return out
