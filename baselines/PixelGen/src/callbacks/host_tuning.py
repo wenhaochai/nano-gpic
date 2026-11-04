@@ -39,9 +39,8 @@ def pin_rank_threads(index, workers, split=False):
     4-7 on the other). Every other thread of the rank (pin, NCCL, CUDA, idle autograd threads) and the data workers (workers: their
     pids) stay on the other CPUs of the socket. Call it on the main thread, after the first backward (the autograd thread exists)
     and after the workers started (later children would inherit one CPU).
-    split: main and autograd each get their own CPU, so each socket gives up two CPUs per GPU. w1048 stalled with one shared CPU: a run queue
-    with two pinned threads can be the busiest queue, and a balance pass that can pull neither doubles its interval (kernel: LBF_ALL_PINNED), so
-    the workers may wait for a CPU while others are idle. A queue with one running thread is not a pull candidate. jobs/smoke_ladder_pin2.sh tests this."""
+    split: main and autograd each get their own CPU, so each socket gives up two CPUs per GPU. w1048 stalled with one shared CPU, with workers waiting for a CPU at the same CPU use.
+    A balance back-off from a run queue with two pinned threads is one candidate cause; upstream code gives it no strong support (docs/review_pin2_2026-11-04.md F3). jobs/smoke_ladder_pin2.sh tests it."""
     socket = sorted(os.sched_getaffinity(0))
     if not 16 <= len(socket) <= 64:         # outside this range bind_to_gpu_socket did not run: two ranks would get one CPU
         raise ValueError(f"{len(socket)} CPUs for this rank")
@@ -74,7 +73,8 @@ def pin_rank_threads(index, workers, split=False):
     for t in autograd:
         os.sched_setaffinity(t, {autograd_core})
     os.sched_setaffinity(0, {core})         # this thread
-    print(f"[numa] device {index}: main thread on CPU {core}, autograd thread on CPU {autograd_core}, {moved} workers and {len(threads) - 1 - len(autograd)} other threads on {len(others)} CPUs", flush=True)
+    where = f"main thread on CPU {core}, autograd thread on CPU {autograd_core}" if split else f"main and autograd threads on CPU {core}"
+    print(f"[numa] device {index}: {where}, {moved} workers and {len(threads) - 1 - len(autograd)} other threads on {len(others)} CPUs", flush=True)
 
 
 def idle_workers(index, workers):
