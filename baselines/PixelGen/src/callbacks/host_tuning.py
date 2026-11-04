@@ -91,7 +91,7 @@ class HostTuning(Callback):
     def __init__(self):
         super().__init__()
         self._pin = os.environ.get("GPIC_PROF_PIN") == "1"   # profiling switch (jobs/smoke_ladder_kernels.sh)
-        self._nice = int(os.environ.get("GPIC_WORKER_NICE", 0))   # jobs/smoke_ladder_host2.sh
+        self._nice = int(os.environ.get("GPIC_WORKER_NICE") or 0)   # jobs/smoke_ladder_host2.sh
 
     def setup(self, trainer, pl_module, stage):
         # before the dataloaders start, so the data workers follow the rank; a few percent of speed never stops a run

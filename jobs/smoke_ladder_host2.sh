@@ -2,18 +2,19 @@
 #SBATCH -J gpic-ladder-host2
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=00:40:00
+#SBATCH --time=00:45:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
 #FETCHABLE
 # The levers left after w1048 (docs/text_cache.md, "What is left of the step"), on 8 H100s, on one node. Measures only. No W&B.
-# d640: data workers at a higher nice value; fewer data workers; the SIGTERM broadcast every 200 steps. d1280: one DDP bucket of 3000 MiB
-# instead of three (the graphs change, so that arm compiles cold); the broadcast every 200 steps. Same math, except that the number of
-# workers changes the order of the data.
+# d640: data workers at a higher nice value; fewer data workers. d1280: one DDP bucket of 3000 MiB instead of three (the graphs change,
+# so that arm compiles cold). Same math, except that the number of workers changes the order of the data. The SIGTERM broadcast has no
+# arm: its cost per broadcast step comes from the per-step times of the controls (review finding 3). A second d640 control at the end
+# gives the spread between launches. Expected: about 30 min.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-WT=$WC/project/gpic-wt/ladder_kern
+WT=$WC/project/gpic-wt/ladder_host2
 [ -d "$WT" ] || { echo "no worktree $WT"; exit 2; }
 TS=$(date +%m%d_%H%M)
 OUT=$WC/runs/gpic-speed/ladder_host2_$TS
@@ -46,6 +47,8 @@ wait_arm() {   # wait_arm <tag>: 20 s after the warm-up, CPU use and wait of ran
 wait_arm d640_control &
 d640 d640_control 420 2400
 wait
+d1280 d1280_control 420 800
+d1280 d1280_b3000 720 800 --trainer.strategy.init_args.bucket_cap_mb 3000
 wait_arm d640_nice10 &
 GPIC_WORKER_NICE=10 d640 d640_nice10 420 2400
 wait
@@ -58,9 +61,6 @@ wait
 wait_arm d640_w16_nice10 &
 GPIC_WORKER_NICE=10 d640 d640_w16_nice10 420 2400 --data.train_num_workers 16
 wait
-GPIC_SIGTERM_EVERY=200 d640 d640_bcast200 420 2400
-d1280 d1280_control 420 800
-d1280 d1280_b3000 720 800 --trainer.strategy.init_args.bucket_cap_mb 3000
-GPIC_SIGTERM_EVERY=200 d1280 d1280_bcast200 420 800
+d640 d640_control2 420 2400
 
 log "DONE $OUT"
