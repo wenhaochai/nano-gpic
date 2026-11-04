@@ -19,11 +19,14 @@ WT=$WC/project/gpic-wt/ladder_seed
 ROOT=$WC/runs/gpic-speed/ladder_seed_$ARM
 mkdir -p $ROOT
 export LADDER_WT=$WT LADDER_RUN_ROOT=$ROOT
-bash $WT/jobs/train_ladder.sh d640 640 9 2 66816 --trainer.logger.init_args.name seed_$ARM --trainer.logger.init_args.id seed-$ARM > $ROOT/train.log 2>&1
+export GPIC_SHARD_SEED=1730000000   # both arms read the same data in the same order, so only the t, noise and CFG streams differ (review finding 2)
+bash $WT/jobs/train_ladder.sh d640 640 9 2 66816 --trainer.logger.init_args.name seed_$ARM --trainer.logger.init_args.id seed-$ARM >> $ROOT/train.log 2>&1
 rc=$?
 echo "train rc=$rc"
 [ $rc -eq 0 ] || exit $rc
+fail=0
 for STEP in 33408 66816; do
-  bash $WT/jobs/eval_ladder.sh d640 640 9 2 $STEP > $ROOT/eval_$STEP.log 2>&1
-  echo "eval $STEP rc=$?"
+  bash $WT/jobs/eval_ladder.sh d640 640 9 2 $STEP > $ROOT/eval_$STEP.log 2>&1 || fail=1
+  echo "eval $STEP fail=$fail"
 done
+exit $fail
