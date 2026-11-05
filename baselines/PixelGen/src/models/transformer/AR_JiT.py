@@ -149,6 +149,39 @@ class ARJiT(JiT_T2I):
         return out
 
     @torch.no_grad()
+    def sample_eta(self, y, y_mask=None, eta=0.0):
+        """The mask-state jump process with stochasticity eta (Campbell et al., arXiv 2402.04997, appendix F.1.1: R^DB takes a revealed token back to the mask state at rate eta per unit t, where t is the revealed share). MAR's schedule sets how many tokens stay masked after each step. At each step, each known token first goes back to the mask state with probability eta * (increase of the revealed share in this step); then, in each image, tokens chosen at random among all masked ones are drawn given the known ones until the schedule's count is met. The number of backbone calls stays ar_steps. eta = 0 is MAR's sampler in law. Returns the images and the number of head draws per image."""
+        B, N = y.shape[0], self.num_patches
+        tokens = torch.zeros(B, N, self.patch_dim, device=y.device)
+        context = torch.zeros(B, N, self.patch_dim, device=y.device)
+        unknown = torch.ones(B, N, dtype=torch.bool, device=y.device)
+        draws = 0
+        revealed = lambda step: 1 - math.cos(math.pi / 2 * step / self.ar_steps)
+        for step in range(self.ar_steps):
+            if eta:
+                back = torch.rand(B, N, device=y.device) < eta * (revealed(step + 1) - revealed(step))
+                unknown = unknown | back
+            left = unknown.sum(1)
+            if step == self.ar_steps - 1:
+                count = left
+            else:
+                target = math.floor(N * math.cos(math.pi / 2 * (step + 1) / self.ar_steps))
+                count = left - (left - 1).clamp_max(target).clamp_min(1)   # at least one token is drawn, and at least one stays masked, as in _sample_random
+            if not count.any():
+                continue
+            keys = torch.rand(B, N, device=y.device).masked_fill(~unknown, 2.0)
+            pick = keys.argsort(1).argsort(1) < count[:, None]   # the count smallest keys, all of them on masked tokens
+            z = self(context, y, y_mask=y_mask, known=~unknown)
+            where = pick.nonzero(as_tuple=True)
+            drawn = self.draw_patch(z[where].float())
+            tokens[where] = drawn
+            context[where] = self._read(drawn)
+            unknown = unknown & ~pick
+            draws += where[0].numel()
+        side = int(N ** 0.5) * self.patch_size
+        return self.unpatchify(tokens, side, side), draws / B
+
+    @torch.no_grad()
     def _sample_random(self, y, y_mask=None, prefix=None, return_order=False):
         """MAR's sampler: a new random order per image, and a cosine schedule of the unknown share from 1 to 0 over ar_steps steps. At each step the next tokens in the order are drawn given the known ones, each from its distribution. All images of a batch draw the same number of tokens per step."""
         B, N = y.shape[0], self.num_patches

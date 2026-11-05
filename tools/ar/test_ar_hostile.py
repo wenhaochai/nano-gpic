@@ -268,6 +268,32 @@ res["loss"].backward()
 assert not [n for n, p in c2.named_parameters() if p.requires_grad and p.grad is None]
 print("14. random order: no leak, loss on masked tokens, each token drawn once, compiled path")
 
+# 17. sample_eta: at eta = 0 the schedule of known counts equals _sample_random's, every token gets drawn once and the head draws N per image. At eta > 0 the counts after each step still follow the schedule, tokens go back and are drawn again, nothing stays masked at the end, and the backbone calls stay ar_steps.
+re = wake(ARJiT(**kw, order="random", ar_steps=64))
+log_known, log_pick = [], []
+keep_forward = ARJiT.forward
+def spy_eta(self, tokens, y, y_mask=None, q=None, tau=None, known=None):
+    log_known.append(known.clone())
+    return keep_forward(self, tokens, y, y_mask=y_mask, q=q, tau=tau, known=known)
+ARJiT.forward = spy_eta
+log_known.clear()
+re._sample_random(y, mask)
+base_counts = [k.sum(1).tolist() for k in log_known]
+log_known.clear()
+img0, draws0 = re.sample_eta(y, mask, eta=0.0)
+assert [k.sum(1).tolist() for k in log_known] == base_counts, "eta = 0 changed the schedule"
+assert draws0 == N and img0.shape == (2, 3, 64, 64)
+log_known.clear()
+torch.manual_seed(5)
+img5, draws5 = re.sample_eta(y, mask, eta=20.0)
+counts5 = [k.sum(1) for k in log_known]
+assert len(log_known) <= 64 and draws5 > 2 * N, draws5
+went_back = any(((a & ~b).sum() > 0) for a, b in zip(log_known[:-1], log_known[1:]))
+assert went_back, "no token went back to the mask state at eta = 20"
+assert img5.shape == (2, 3, 64, 64) and torch.isfinite(img5).all()
+ARJiT.forward = keep_forward
+print("17. sample_eta: eta = 0 keeps the schedule and draws each token once; eta = 20 takes tokens back,", round(draws5 / N, 1), "x the draws")
+
 # 16. The order the sampler returns is the draw order: the last entries are drawn first. redraw changes only the picked tokens, and depends on the others.
 rd = wake(ARJiT(**kw, order="random", ar_steps=64))
 seen3 = []
