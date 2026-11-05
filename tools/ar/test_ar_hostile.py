@@ -276,7 +276,7 @@ d_loop = hf.draw_patch(zz)
 os.environ["GPIC_AR_HEAD_FLOW"] = "1"
 torch.manual_seed(11)
 d_flow = hf.draw_patch(zz)
-hf.head_steps = 4     # the flow follows a change of steps (overfit_ar.py's check at 128)
+hf.head_steps += 2     # the flow follows a change of steps (overfit_ar.py's check at 128)
 torch.manual_seed(11)
 d_flow4 = hf.draw_patch(zz)
 del os.environ["GPIC_AR_HEAD_FLOW"]
