@@ -231,7 +231,7 @@ class LightningModel(pl.LightningModule):
         # perf C2: the per-caption-type losses need host syncs (index tensors from Python lists) and four sync_dist
         # all-reduces; compute them only on steps whose on_step logs are written (Lightning's own condition), so the
         # logged values are unchanged and every other step runs without them
-        log_now = self.logger is not None and self.trainer._logger_connector.should_update_logs
+        log_now = self._log_now
         if log_now and caption_types is not None and loss_per_sample is not None:
             CAPTION_TYPES = ["tag", "short", "medium", "long"]
             for ct in CAPTION_TYPES:
