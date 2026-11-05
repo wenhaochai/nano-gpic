@@ -328,15 +328,20 @@ class JiT_T2I(nn.Module):
             code_dim=0,
             code_rate=0.0,
             head_width=0,
+            gm_k=0,
     ):
         """xi_dim > 0 makes the model an implicit sampler of p(x | x_t, y) (docs/distribution_step.md): before block xi_block the batch
         forks into m copies, and each copy gets its own noise. xi_dim = 0 is the official point model, unchanged.
         code_dim > 0 is plan A (docs/distribution_step.md 5.2): a code z of the image joins the blocks' conditioning, through a Gaussian channel
         of code_rate nats, and a tiny flow learns p(z | y). code_dim = 0 is the official point model, unchanged.
         head_width > 0 is test E (docs/energy_head.md): the backbone runs once per input and EnergyHead, in place of FinalLayer, draws m samples, each with its own noise.
-        head_width = 0 is the official point model, unchanged."""
+        head_width = 0 is the official point model, unchanged.
+        gm_k > 0 is GMFlow (docs/gmflow.md): per pixel, a mixture of gm_k Gaussians over the clean RGB value, with K x-means, K logits and one std per sample (s_x = (1 - t) s_u).
+        gm_k = 0 is the official point model, unchanged."""
         super().__init__()
         assert not (head_width and xi_dim), "the energy head and the implicit fork are two different models"
+        assert not (gm_k and (head_width or xi_dim or code_dim)), "the GMFlow head is a model of its own"
+        self.gm_k = gm_k
         self.head_width = head_width
         self.xi_dim, self.xi_block = xi_dim, xi_block
         self.code_dim, self.code_rate = code_dim, code_rate
@@ -371,6 +376,10 @@ class JiT_T2I(nn.Module):
         ])
         if head_width:
             self.final_layer = EnergyHead(self.hidden_size, head_width, in_channels*patch_size**2)
+        elif gm_k:   # per pixel: K means of in_channels values and K logits (GMFlow, lib/models/architecture/gmflow.py:261, 296)
+            self.final_layer = FinalLayer(self.hidden_size, gm_k * (in_channels + 1) * patch_size**2)
+            # log s_u per sample from the detached time and caption embeddings (GMFlow gmflow.py:179-190, 403)
+            self.gm_logstd = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 1024), nn.SiLU(), nn.Linear(1024, 1))
         else:
             self.final_layer = FinalLayer(self.hidden_size, in_channels*patch_size**2)
         if xi_dim:
@@ -431,7 +440,11 @@ class JiT_T2I(nn.Module):
         
         # Zero-out output layers
         out = self.final_layer.out.linear if self.head_width else self.final_layer.linear
-        nn.init.constant_(out.weight, 0)
+        if self.gm_k:   # Xavier weight (from _basic_init) and zero bias, as GMFlow's released model: with zero weights the K means start equal and never separate
+            nn.init.constant_(self.gm_logstd[-1].weight, 0)   # s_u = 1 at init (GMFlow gmflow.py:199)
+            nn.init.constant_(self.gm_logstd[-1].bias, 0)
+        else:
+            nn.init.constant_(out.weight, 0)
         nn.init.constant_(out.bias, 0)
         if self.head_width:   # the head's blocks start as the identity, as the backbone's; the noise layers small, not zero, as xi_global below
             for block in self.final_layer.blocks:
@@ -488,10 +501,19 @@ class JiT_T2I(nn.Module):
         )
         return x
     
-    def forward(self, x, t, y, return_layer=None, y_mask=None, m=1, z=None):
+    def gm_unpatchify(self, x, H, W):
+        """x: (B, T, p^2 K (C + 1)) -> means (B, K, C, H, W) and raw logits (B, K, 1, H, W). fold reads each token as [channel, row, column], the order unfold writes."""
+        B, K, C = x.shape[0], self.gm_k, self.out_channels
+        x = self.unpatchify(x, H, W)
+        means, logits = x.split([K * C, K], dim=1)
+        return means.reshape(B, K, C, H, W), logits.reshape(B, K, 1, H, W)
+
+    def forward(self, x, t, y, return_layer=None, y_mask=None, m=1, z=None, gm_mode="mean"):
         """y_mask (ladder option B): [B, T] bool, True = a real caption token, T <= txt_max_length; None = the
         official unmasked path (y padded to txt_max_length). m: samples per input of the implicit sampler; the
-        output is [B * m, C, H, W], each input's samples next to each other. z: plan A's code, [B, code_dim]."""
+        output is [B * m, C, H, W], each input's samples next to each other. z: plan A's code, [B, code_dim].
+        gm_mode (gm_k > 0 only): "mean" returns the mixture mean sum_k A_k mu_k as the x prediction, so the point model's samplers run on it unchanged;
+        "full" returns dict(means (B, K, C, H, W), logweights (B, K, 1, H, W), log-softmax over K, fp32, logstd (B, 1, 1, 1, 1) = log s_u, fp32)."""
         B, _, H, W = x.shape
         x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
@@ -501,7 +523,12 @@ class JiT_T2I(nn.Module):
             text_mask = y_mask[:, None, None, :]
             full_mask = torch.cat([torch.ones(B, 1, 1, x.shape[1], dtype=torch.bool, device=x.device), text_mask], dim=-1)
         t = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
-        y = self.y_embedder(y).view(B, -1, self.hidden_size) + ypos.to(y.dtype)
+        y_dtype = y.dtype   # the input's dtype, as before this option existed
+        y = self.y_embedder(y).view(B, -1, self.hidden_size)
+        if self.gm_k and gm_mode == "full":   # the std's input: time plus the mean caption embedding over the real tokens, detached
+            pooled = y.mean(1) if y_mask is None else (y * y_mask[..., None].to(y.dtype)).sum(1) / y_mask.sum(1, keepdim=True).clamp_min(1).to(y.dtype)
+            gm_cond = (t.view(B, self.hidden_size) + pooled).detach()
+        y = y + ypos.to(y_dtype)
         condition = nn.functional.silu(t if z is None else t + self.code_proj(z.to(t.dtype)).view(B, 1, self.hidden_size))
         for i, block in enumerate(self.text_refine_blocks):
             y = block(y, condition) if text_mask is None else block(y, condition, text_mask)
@@ -519,6 +546,13 @@ class JiT_T2I(nn.Module):
             x = block(x, y, condition, xpos) if full_mask is None else block(x, y, condition, xpos, full_mask)
             
         x = self.final_layer(x, condition, m) if self.head_width else self.final_layer(x)
+        if self.gm_k:
+            assert return_layer is None and gm_mode in ("mean", "full"), gm_mode
+            means, logits = self.gm_unpatchify(x, H, W)
+            logweights = logits.float().log_softmax(dim=1)
+            if gm_mode == "mean":
+                return (logweights.exp() * means.float()).sum(1)
+            return dict(means=means, logweights=logweights, logstd=self.gm_logstd(gm_cond).float().view(B, 1, 1, 1, 1))
         output = self.unpatchify(x, H, W)
         if return_layer is not None:
             return output, feat

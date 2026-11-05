@@ -132,6 +132,8 @@ class LightningModel(pl.LightningModule):
         check = getattr(self.denoiser, "code_dim", 0) and trainer._calls % trainer._check_every == 0   # plan A: the flow's parameters get only the prior's gradient, the others only the main loss's
         prior = torch.stack([p.grad.norm() for p in self.denoiser.code_prior.parameters() if p.grad is not None]).norm().item() if check else None
         total = torch.nn.utils.clip_grad_norm_(params, gradient_clip_val, foreach=True)
+        if getattr(self.denoiser, "gm_k", 0) and getattr(self, "_log_now", False):   # GMFlow: the pre-clip norm, on the steps whose logs are written (no extra host sync)
+            self.log("train/grad_norm_preclip", total, on_step=True, sync_dist=False)
         if check:
             print(f"[code] call {trainer._calls}: grad norm before the clip {total.item():.4f}, of which the flow {prior:.4f}, clip at {gradient_clip_val}", flush=True)
 
@@ -213,6 +215,9 @@ class LightningModel(pl.LightningModule):
         with torch.no_grad():
             x = self.vae.encode(x)
             condition, uncondition = self.conditioner(y, metadata)
+        self._log_now = self.logger is not None and self.trainer._logger_connector.should_update_logs
+        if hasattr(self.diffusion_trainer, "diag_now"):   # GMFlow: its diagnostics only on the steps whose logs are written
+            self.diffusion_trainer.diag_now = self._log_now
         loss = self.diffusion_trainer(self.denoiser, self.ema_denoiser, self.diffusion_sampler, x, condition, uncondition, metadata)
 
         # --- GPIC: log per-caption-type training loss ---
@@ -280,8 +285,8 @@ class LightningModel(pl.LightningModule):
             null[:, 0] = True
             base = net
 
-            def net(x, t, c, _base=base, _m=y_mask, _n=null):
-                return _base(x, t, c, y_mask=_m if x.shape[0] == _m.shape[0] else torch.cat([_n, _m], dim=0))
+            def net(x, t, c, _base=base, _m=y_mask, _n=null, **kw):   # kw: gm_mode of the GMFlow samplers
+                return _base(x, t, c, y_mask=_m if x.shape[0] == _m.shape[0] else torch.cat([_n, _m], dim=0), **kw)
         samples = self.diffusion_sampler(net, xT, condition, uncondition)
 
         samples = self.vae.decode(samples)
