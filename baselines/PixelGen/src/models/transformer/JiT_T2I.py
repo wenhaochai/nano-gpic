@@ -237,6 +237,32 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
+
+class EnergyHead(nn.Module):
+    """Test E (docs/energy_head.md): replaces FinalLayer. The backbone's tokens h are projected once per input; then each of the m samples gets its own noise, a global vector
+    through the conditioning and a vector per token, and two small residual MLP blocks per token give a whole-image sample of p(x | x_t, y)."""
+    def __init__(self, hidden_size, width, out_channels, xi_dim=64, depth=2):
+        super().__init__()
+        self.xi_dim = xi_dim
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.inp = nn.Linear(hidden_size, width)
+        self.cond = nn.Linear(hidden_size, width)
+        self.xi_global = nn.Linear(xi_dim, width)
+        self.xi_token = nn.Linear(xi_dim, width)
+        self.blocks = nn.ModuleList(ResBlock(width) for _ in range(depth))
+        self.out = FinalLayer(width, out_channels)
+
+    def forward(self, h, c, m=1):
+        B, N, _ = h.shape
+        h = self.inp(self.norm(h)).repeat_interleave(m, 0)
+        c = self.cond(c).repeat_interleave(m, 0)
+        h = h + self.xi_token(torch.randn(B * m, N, self.xi_dim, device=h.device, dtype=h.dtype))
+        c = c + self.xi_global(torch.randn(B * m, 1, self.xi_dim, device=h.device, dtype=h.dtype))
+        for block in self.blocks:
+            h = block(h, c)
+        return self.out(h)
+
+
 class CodeEncoder(nn.Module):
     """Plan A: x -> u, code_dim numbers. A small ViT on the image's patches, mean pooled. About 1% of a d640 forward with CodePrior."""
     def __init__(self, patch_dim, num_patches, code_dim, width=128, heads=4, depth=2):
@@ -301,12 +327,17 @@ class JiT_T2I(nn.Module):
             xi_block=0,
             code_dim=0,
             code_rate=0.0,
+            head_width=0,
     ):
         """xi_dim > 0 makes the model an implicit sampler of p(x | x_t, y) (docs/distribution_step.md): before block xi_block the batch
         forks into m copies, and each copy gets its own noise. xi_dim = 0 is the official point model, unchanged.
         code_dim > 0 is plan A (docs/distribution_step.md 5.2): a code z of the image joins the blocks' conditioning, through a Gaussian channel
-        of code_rate nats, and a tiny flow learns p(z | y). code_dim = 0 is the official point model, unchanged."""
+        of code_rate nats, and a tiny flow learns p(z | y). code_dim = 0 is the official point model, unchanged.
+        head_width > 0 is test E (docs/energy_head.md): the backbone runs once per input and EnergyHead, in place of FinalLayer, draws m samples, each with its own noise.
+        head_width = 0 is the official point model, unchanged."""
         super().__init__()
+        assert not (head_width and xi_dim), "the energy head and the implicit fork are two different models"
+        self.head_width = head_width
         self.xi_dim, self.xi_block = xi_dim, xi_block
         self.code_dim, self.code_rate = code_dim, code_rate
         self.in_channels = in_channels
@@ -338,7 +369,10 @@ class JiT_T2I(nn.Module):
         self.text_refine_blocks = nn.ModuleList([
             TextRefineBlock(self.hidden_size, self.num_groups) for _ in range(self.num_text_blocks)
         ])
-        self.final_layer = FinalLayer(self.hidden_size, in_channels*patch_size**2)
+        if head_width:
+            self.final_layer = EnergyHead(self.hidden_size, head_width, in_channels*patch_size**2)
+        else:
+            self.final_layer = FinalLayer(self.hidden_size, in_channels*patch_size**2)
         if xi_dim:
             self.xi_global = nn.Linear(xi_dim, hidden_size)   # one noise vector per sample, through the blocks' conditioning: the whole image
             self.xi_token = nn.Linear(xi_dim, hidden_size)    # one noise vector per token: local detail
@@ -396,8 +430,16 @@ class JiT_T2I(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
         
         # Zero-out output layers
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        out = self.final_layer.out.linear if self.head_width else self.final_layer.linear
+        nn.init.constant_(out.weight, 0)
+        nn.init.constant_(out.bias, 0)
+        if self.head_width:   # the head's blocks start as the identity, as the backbone's; the noise layers small, not zero, as xi_global below
+            for block in self.final_layer.blocks:
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            for layer in (self.final_layer.xi_global, self.final_layer.xi_token):
+                nn.init.normal_(layer.weight, std=0.02)
+                nn.init.constant_(layer.bias, 0)
         if self.xi_dim:   # small, not zero: with zero the samples start equal, and the energy score's repulsion has no direction
             for layer in (self.xi_global, self.xi_token):
                 nn.init.normal_(layer.weight, std=0.02)
@@ -476,7 +518,7 @@ class JiT_T2I(nn.Module):
                 feat = x
             x = block(x, y, condition, xpos) if full_mask is None else block(x, y, condition, xpos, full_mask)
             
-        x = self.final_layer(x)
+        x = self.final_layer(x, condition, m) if self.head_width else self.final_layer(x)
         output = self.unpatchify(x, H, W)
         if return_layer is not None:
             return output, feat
