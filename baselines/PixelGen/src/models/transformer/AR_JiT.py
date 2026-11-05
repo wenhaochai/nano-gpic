@@ -140,7 +140,16 @@ class ARJiT(JiT_T2I):
         return self.unpatchify(tokens, side, side)
 
     @torch.no_grad()
-    def _sample_random(self, y, y_mask=None, prefix=None):
+    def redraw(self, tokens, pick, y, y_mask=None):
+        """Draws the picked tokens again given all the others, in one step. tokens [B, N, P], pick [B, N] with the same count in each row. The training saw at most 30% known, so this asks the model about more known tokens than it trained on."""
+        out = tokens.clone()
+        z = self(self._read(tokens), y, y_mask=y_mask, known=~pick)
+        where = pick.nonzero(as_tuple=True)
+        out[where] = self.draw_patch(z[where].float())
+        return out
+
+    @torch.no_grad()
+    def _sample_random(self, y, y_mask=None, prefix=None, return_order=False):
         """MAR's sampler: a new random order per image, and a cosine schedule of the unknown share from 1 to 0 over ar_steps steps. At each step the next tokens in the order are drawn given the known ones, each from its distribution. All images of a batch draw the same number of tokens per step."""
         B, N = y.shape[0], self.num_patches
         k = 0 if prefix is None else prefix.shape[1]
@@ -171,4 +180,5 @@ class ARJiT(JiT_T2I):
             context[where] = self._read(drawn)
             unknown = after
         side = int(N ** 0.5) * self.patch_size
-        return self.unpatchify(tokens, side, side)
+        image = self.unpatchify(tokens, side, side)
+        return (image, order) if return_order else image   # the token at order[:, -1] is drawn first, at order[:, -2] next

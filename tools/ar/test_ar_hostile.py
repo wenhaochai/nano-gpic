@@ -268,6 +268,43 @@ res["loss"].backward()
 assert not [n for n, p in c2.named_parameters() if p.requires_grad and p.grad is None]
 print("14. random order: no leak, loss on masked tokens, each token drawn once, compiled path")
 
+# 16. The order the sampler returns is the draw order: the last entries are drawn first. redraw changes only the picked tokens, and depends on the others.
+rd = wake(ARJiT(**kw, order="random", ar_steps=64))
+seen3 = []
+orig_draw2 = ARJiT.draw_patch
+real_forward = ARJiT.forward
+def spy_known(self, tokens, y, y_mask=None, q=None, tau=None, known=None):
+    seen3.append(known.clone())
+    return real_forward(self, tokens, y, y_mask=y_mask, q=q, tau=tau, known=known)
+ARJiT.forward = spy_known
+img, order = rd.ar_sample(y, mask), None
+seen3.clear()
+img, order = rd._sample_random(y, mask, return_order=True)
+ARJiT.forward = real_forward
+assert img.shape == (2, 3, 64, 64) and order.shape == (2, N)
+for step, kn in enumerate(seen3):   # at step s, s tokens are known (one per step here: more steps than tokens), and they are the last s in the order
+    for b in range(2):
+        want = set(order[b, N - int(kn[b].sum()):].tolist())
+        assert want == set(kn[b].nonzero().flatten().tolist()), (step, b)
+assert int(seen3[0].sum()) == 0 and int(seen3[-1][0].sum()) == N - 1
+toks = torch.rand(2, N, P) * 2 - 1
+pick = torch.zeros(2, N, dtype=torch.bool)
+pick[0, [1, 7, 9]] = True
+pick[1, [0, 2, 3]] = True
+out = rd.redraw(toks, pick, y, mask)
+assert (out[~pick] == toks[~pick]).all() and (out[pick] != toks[pick]).any()
+torch.manual_seed(1)
+o1 = rd.redraw(toks, pick, y, mask)
+other = toks.clone()
+other[~pick] = -other[~pick]
+torch.manual_seed(1)
+o2 = rd.redraw(other, pick, y, mask)
+assert (o1[pick] != o2[pick]).any()
+torch.manual_seed(1)
+o3 = rd.redraw(toks + 0.5 * pick[..., None].float(), pick, y, mask)   # the old values of the picked tokens must not matter
+assert (o3[pick] == o1[pick]).all()
+print("16. the draw order and redraw: only picked tokens change, the old picked values do not matter")
+
 # 15. temperature: 1 changes nothing on one seed; below 1 the draws are closer together on a fresh head that has learned nothing but a mean.
 tt = wake(ARJiT(**kw, temperature=1.0))
 torch.manual_seed(3)
