@@ -1,0 +1,20 @@
+# Overlay on lite_ladder.yaml: the GMFlow head (docs/gmflow.md), K = 8, transition loss lambda 0.5, no caption dropout. main.py fit --config lite_ladder.yaml --config this.
+# A copy of energy_train.yaml with only the head and the trainer changed. jobs/run_gmflow.sh sets gm_k per run (8 or 1).
+model:
+  denoiser:
+    init_args:
+      gm_k: 8    # per pixel: K x-means, K logits; one log s_u per sample from a small MLP
+  diffusion_trainer:
+    class_path: src.diffusion.flow_matching.training_gmflow.GMFlowTrainer
+    init_args:
+      scheduler:
+        class_path: src.diffusion.flow_matching.scheduling.LinearScheduler
+      loss_weight_fn: src.diffusion.flow_matching.training_JiT.constant
+      lognorm_t: true
+      timeshift: 1.0
+      P_mean: -0.8
+      P_std: 0.8
+      t_eps: 0.05   # unused by the loss (digest section 12, note 3)
+      null_condition_p: 0.0   # owner 2026-11-04: no CFG, so no caption dropout
+      lam: 0.5
+      weight_scale: 2.0

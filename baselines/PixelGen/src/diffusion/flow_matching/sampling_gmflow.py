@@ -34,13 +34,9 @@ class _GMSampler(EulerSamplerJiT):
         return self.timesteps.to(noise.device, torch.float32)
 
     def _call(self, net, x, t_cur, condition):
-        """A mixture (gm_k > 0) or, for a point model, its x prediction as an fp32 tensor. A point model is called without gm_mode."""
-        t = t_cur.repeat(x.shape[0])
-        if getattr(self, "_point", None) is None:
-            out = net(x, t, condition, gm_mode="full")
-            self._point = not isinstance(out, dict)
-            return out.float() if self._point else as_mixture(out)
-        return net(x, t, condition).float() if self._point else as_mixture(net(x, t, condition, gm_mode="full"))
+        """A mixture (gm_k > 0) or, for a point model, its x prediction as an fp32 tensor. JiT_T2I with gm_k = 0 ignores gm_mode, so every call has one signature."""
+        out = net(x, t_cur.repeat(x.shape[0]), condition, gm_mode="full")
+        return as_mixture(out) if isinstance(out, dict) else out.float()
 
 
 class GMSDESampler(_GMSampler):

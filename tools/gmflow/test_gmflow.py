@@ -248,6 +248,9 @@ def T5():
     print(f"  control, Euler on the mean, 4 calls: on a data point {near:.4f}, share of P[0] {f0:.4f}")
     assert near < 0.99, near
     # the point-model path: K = 1, s = 0 is DDPM with the small variance; the last step returns the network's x
+    point = JiT_T2I(**small)   # the real gm_k = 0 model accepts gm_mode and returns a tensor
+    with torch.no_grad():
+        assert torch.is_tensor(point(torch.randn(1, 3, 64, 64), torch.rand(1), torch.randn(1, 32, 32), gm_mode="full"))
     torch.manual_seed(5)
     xs, _ = sampler(GMSDESampler, 4, rank_seed=False)._impl_sampling(lambda x, t, c, gm_mode=None: exact_net(x, t, c), noise[:4], None, None)
     torch.manual_seed(5)

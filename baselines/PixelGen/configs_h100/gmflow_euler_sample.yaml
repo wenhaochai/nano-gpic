@@ -1,0 +1,5 @@
+# Overlay on lite_ladder_sample.yaml: the official Euler sampler, unchanged, on the GMFlow model's mixture mean ("Euler on the mean", docs/gmflow.md). The model's default output mode is the mean.
+# gm_k comes from the command line (jobs/eval_gmflow.sh); with gm_k 0 this is the point model's official Euler.
+model:
+  diffusion_sampler:
+    class_path: src.diffusion.flow_matching.sampling.EulerSamplerJiT
