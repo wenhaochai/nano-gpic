@@ -440,7 +440,10 @@ class JiT_T2I(nn.Module):
         
         # Zero-out output layers
         out = self.final_layer.out.linear if self.head_width else self.final_layer.linear
-        if self.gm_k:   # Xavier weight (from _basic_init) and zero bias, as GMFlow's released model: with zero weights the K means start equal and never separate
+        if self.gm_k:   # zero bias and a uniform weight, as GMFlow's released model (with zero weights the K means start equal and never separate). The bound is
+            # Xavier's for K = 8 at every K, so the K = 1 control starts at the same output scale as K = 8 (review F5: K = 1's own Xavier gave std 0.88 against 0.38)
+            b = math.sqrt(6.0 / (self.hidden_size + 8 * (self.in_channels + 1) * self.patch_size ** 2))
+            nn.init.uniform_(out.weight, -b, b)
             nn.init.constant_(self.gm_logstd[-1].weight, 0)   # s_u = 1 at init (GMFlow gmflow.py:199)
             nn.init.constant_(self.gm_logstd[-1].bias, 0)
         else:

@@ -18,7 +18,7 @@ set -eo pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 K=$1 STEP=$(printf %06d $2) SAMPLER=$3 CALLS=$4
 [ $# -eq 4 ] || { echo "usage: eval_gmflow.sh <K> <step> <sampler> <calls>"; exit 2; }
-WT=$WC/project/gpic-wt/gmflow
+WT=${GMFLOW_WT:-$WC/project/gpic-wt/gmflow}   # run_gmflow.sh and eval_point_sampler.sh name the frozen worktree
 case $K in
   8|1) DEF_ROOT=$WC/runs/gpic-speed/gmflow_k${K}_d640 ;;
   0) DEF_ROOT=$WC/runs/gpic-speed/point_nodrop_d640 ;;
