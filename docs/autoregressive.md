@@ -18,6 +18,19 @@ p(x | y) = Π p(patch_i | patch_1 … patch_{i−1}, y)，从左到右、从上�
 5. head 的 τ：logit-normal(−0.8, 1.6)，不是官方的 0.8。`tools/ar/head_modes.py`（8 个模式，768 维，宽 512，1 个训练种子）里抽样离模式更近：rms 0.005 对 0.012。模式份额的总变差是 0.027 对 0.040，采样噪声约 0.016，所以份额没有分辨出来。这个选择只在 toy 上比较过。
 6. 第一版没有 KV cache：每个 patch 都跑一次完整主干，生成一张图约 9.1 TFLOP，是 50 步 Euler（1.74 TFLOP）的 5.2 倍。head 训练时仍然每个位置抽一个 τ。
 
+## 需求和实现的对照（严格审计，2026-11-04）
+
+| 编号 | 负责人的要求 | 实现 | 测试 |
+|---:|---|---|---|
+| 1 | 每一步输出下一个 token 的分布 | `TokenFlowHead`，`draw_patch` | `test_ar.py` 第 5 项（两个模式的份额），`head_modes.py` |
+| 2 | 根据分布随机采样，不做确定性回归采样 | `ar_sample`：每个 patch 从新噪声出发 | `test_ar_hostile.py` 第 8 项 |
+| 3 | 不必是离散分布 | head 建模 768 个实数 | `test_ar.py` 第 5、6 项 |
+| 4 | 自回归，和 LLM 一样 | 因果 mask，输入右移一位，从左到右 | `test_ar_hostile.py` 第 1、2、3 项（用梯度验证） |
+| 5 | 和基线相同的算力 | 133.00 GFLOP 每张图，52320 步 | `test_ar.py` 第 7 项，`test_ar_hostile.py` 第 11 项（手算） |
+| 6 | 主榜协议：CFG 1.0，EMA，50K 测试 caption，FD-DINOv2 | `jobs/eval_ar.sh` | 独立评审第 8 项 |
+
+**和 LLM 的一个差别。** LLM 的输出层直接给出每个 token 的概率。flow head 只能抽样，要读出某个 patch 的概率密度需要对 ODE 积分。head 训练时的损失也是对速度的 L2，这是 flow matching 学习分布的方式，不是对 patch 取均值。
+
 ## 风险
 
 1. 每个 token 的分布：MAR 用 VAE latent（16 维），我没有搜到在 768 维像素 patch 上这样做的先例。
