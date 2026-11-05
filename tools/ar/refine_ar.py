@@ -78,7 +78,9 @@ def score(tokens):
     g = net.unpatchify(tokens, 256, 256)
     d = torch.cat([torch.cdist(g[i:i + 64].flatten(1), imgs.flatten(1)) for i in range(0, len(g), 64)]) / (3 * 256 * 256) ** 0.5
     nn, idx = d.min(1)
-    res = dict(nn_rms=nn.mean().item(), near=(nn < 0.1).float().mean().item(), covered=idx[nn < 0.1].unique().numel() / N, distinct=idx.unique().numel() / N)
+    counts = torch.bincount(idx, minlength=N).float()
+    q = counts[counts > 0] / counts.sum()
+    res = dict(nn_rms=nn.mean().item(), near=(nn < 0.1).float().mean().item(), covered=idx[nn < 0.1].unique().numel() / N, distinct=idx.unique().numel() / N, effective_images=(-(q * q.log()).sum()).exp().item())
     best, who, stray_flags = [], [], []
     for i in range(0, len(tokens), 32):
         per = ((tokens[i:i + 32, None] - true[None]) ** 2).mean(-1).sqrt()   # [s, N, 256]

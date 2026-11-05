@@ -2,7 +2,7 @@
 #SBATCH -J gpic-ar-smoke
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=01:10:00
+#SBATCH --time=01:45:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
@@ -10,13 +10,15 @@
 # Smoke test of the autoregressive model through the production path on 8 H100s: a short training of d640, a resume from its last checkpoint, and the full evaluation (the FD of a checkpoint this young means nothing; the time of the evaluation does). No W&B.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-WT=$WC/project/gpic-wt/ar_run
+WT=$WC/project/gpic-wt/ar_real
 [ -d "$WT/baselines/PixelGen" ] || { echo "no worktree $WT"; exit 2; }
+grep -q "redraw_first" $WT/baselines/PixelGen/src/models/transformer/AR_JiT.py && grep -q "order: random" $WT/baselines/PixelGen/configs_h100/ar_train.yaml || { echo "$WT holds old code"; exit 2; }
 TS=$(date +%m%d_%H%M)
 OUT=$WC/runs/gpic-speed/ar_smoke_$TS
 mkdir -p $OUT
 git -C $WT rev-parse HEAD > $OUT/commit.txt
 export LADDER_WT=$WT LADDER_PARTIAL_OK=1 WANDB_MODE=disabled TORCH_LOGS=recompiles LADDER_RUN_ROOT=$OUT
+export GPIC_REGION_CROP=0 GPIC_SHARD_SEED=1730000000   # as jobs/run_ar.sh, so the step time reads for the real run
 log() { echo "[$(date +%T)] $*" | tee -a $OUT/phases.log; }
 log "START train to 800"
 BENCH_OUT=$OUT/bench/first timeout -k 60 700 bash $WT/jobs/train_ladder.sh d640 640 9 2 3200 --config configs_h100/ar_train.yaml --trainer.max_steps 800 --trainer.log_every_n_steps 50 > $OUT/first.log 2>&1
@@ -33,10 +35,13 @@ PY
 log "START resume to 1000"
 BENCH_OUT=$OUT/bench/resume timeout -k 60 420 bash $WT/jobs/train_ladder.sh d640 640 9 2 3200 --config configs_h100/ar_train.yaml --trainer.max_steps 1000 --trainer.log_every_n_steps 50 > $OUT/resume.log 2>&1
 rc=$?; log "END resume rc=$rc"; [ $rc -eq 0 ] || fail=1
-log "START eval"
-timeout -k 60 2400 bash $WT/jobs/eval_ar.sh d640 640 9 2 800 > $OUT/eval.log 2>&1
-rc=$?; log "END eval rc=$rc"; [ $rc -eq 0 ] || fail=1
-ls $OUT/exp_ladder_d640/eval_000800_ar/metrics.json || fail=1
-cat $OUT/exp_ladder_d640/eval_000800_ar/phase_times.json 2>/dev/null | tee -a $OUT/phases.log
+for V in base first64; do
+  log "START eval $V"
+  timeout -k 60 1500 bash $WT/jobs/eval_ar.sh d640 640 9 2 800 $V > $OUT/eval_$V.log 2>&1
+  rc=$?; log "END eval $V rc=$rc"; [ $rc -eq 0 ] || fail=1
+  ls $OUT/exp_ladder_d640/eval_000800_ar_$V/metrics.json || fail=1
+  cat $OUT/exp_ladder_d640/eval_000800_ar_$V/phase_times.json 2>/dev/null | tee -a $OUT/phases.log
+done
+ls -R $OUT/bench 2>/dev/null | head -12 | tee -a $OUT/phases.log
 log "DONE $OUT fail=$fail"
 exit $fail

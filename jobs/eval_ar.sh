@@ -19,7 +19,7 @@ case $VARIANT in
   eta*) SAMPLER="--model.denoiser.init_args.eta ${VARIANT#eta}" ;;
   *) echo "unknown variant $VARIANT"; exit 2 ;;
 esac
-WT=${LADDER_WT:-$WC/project/gpic-wt/ar_run}
+WT=${LADDER_WT:-$WC/project/gpic-wt/ar_real}
 RUN=${LADDER_RUN_ROOT:-$WC/runs/gpic-speed}/exp_ladder_$NAME
 CKPT=$(ls -t $RUN/ms-*$STEP*.ckpt 2>/dev/null | head -1); [ -n "$CKPT" ] || { echo "no ms checkpoint for step $STEP in $RUN"; exit 2; }
 cd $WT/baselines/PixelGen
@@ -32,6 +32,8 @@ n = lambda part: len({m.group(1) for k in sd for m in [re.match(rf"ema_denoiser\
 got = (sd["ema_denoiser.y_pos_embedding"].shape[-1], n("blocks"), n("text_refine_blocks"))
 assert got == (d, nb, nt), f"checkpoint has d, nb, nt = {got}, arguments {(d, nb, nt)}"
 assert "ema_denoiser.head.out.weight" in sd, "this checkpoint is not the autoregressive model"
+assert "ema_denoiser.mask_token" in sd, "this checkpoint is not the random order"
+assert len({k.split(".")[3] for k in sd if k.startswith("ema_denoiser.head.blocks.")}) == 3, "the sampling config has a head of 3 blocks"
 PY
 OUT=$RUN/eval_${STEP}_ar_$VARIANT; mkdir -p $OUT; echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD)" | tee $OUT/ckpt.txt
 t0=$(date +%s)

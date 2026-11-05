@@ -2,15 +2,15 @@
 #SBATCH -J gpic-point-nodrop
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=02:00:00
+#SBATCH --time=01:20:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
 #FETCHABLE
-# The control of test C: the point model at d640 to C0/8 (66816 steps), with no caption dropout (owner 2026-11-04), then FD at C0/16 and C0/8 with each prompt's own noise. Same shard order and the same official crop as w1053, which differs only by the dropout, so this also measures the dropout. docs/autoregressive.md, section 测试 C. Code: the frozen worktree gpic-wt/ar_run.
+# The control of test C: the point model at d640 to C0/8 (66816 steps), with no caption dropout (owner 2026-11-04), then FD at C0/16 and C0/8 with each prompt's own noise. Same shard order and the same official crop as w1053, which differs only by the dropout, so this also measures the dropout. docs/autoregressive.md, section 测试 C. Code: the frozen worktree gpic-wt/ar_real.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-WT=$WC/project/gpic-wt/ar_run
+WT=$WC/project/gpic-wt/ar_real
 [ -d "$WT/baselines/PixelGen" ] || { echo "no worktree $WT"; exit 2; }
 grep -q "null_condition_p: 0.0" $WT/baselines/PixelGen/configs_h100/lite_ladder.yaml || { echo "$WT still has caption dropout"; exit 2; }
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }

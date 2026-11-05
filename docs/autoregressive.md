@@ -369,8 +369,8 @@ MAR 的默认训练命令是 3 层 × 1024，MAR-B、L、H 的预训练模型是
 读法（运行前写定）：
 
 1. 门槛：long_s0 和 long_s1 的 first64 covered 都不低于 0.7594，算过门槛。原样的 covered 一起报告。
-2. 抽图偏向是不是训练不够：long_s0、long_s1 的有效图数比 w1135 的 base（均值约 115、112）都高 20% 以上，distinct 都高 0.05 以上，才算是。
-3. long_head6 和 long_few 只和 long_s0 比（同一种子）。k = 0 的 manifold 或 k = 2、4 的 follow 比 long_s0 高 0.1 以上，才算这个改动有效。distinct 和有效图数的读法同第 2 条。这是单种子，只用来决定下一步。
+2. 抽图偏向是不是训练不够：long_s0、long_s1 的有效图数（`<臂>_refine.json` 的 base.effective_images）比 w1135 的 base（均值约 115、112，算法相同）都高 20% 以上，distinct 都高 0.05 以上，才算是。
+3. long_head6 和 long_few 只和 long_s0 比（同一种子）。k = 2、4 的 follow 比 long_s0 高 0.1 以上，或 k = 0 的 manifold 高 0.2 以上，才算这个改动有效。两份权重之间 manifold 就差 0.15，follow 只差不到 0.02（w1136）。distinct 和有效图数的读法同第 2 条。这是单种子，只用来决定下一步。
 4. 这些臂的结果都不算真实数据上的结论。
 
 ## 测试 C：真实训练（`jobs/run_ar.sh`、`jobs/run_point_nodrop.sh`）
@@ -378,7 +378,7 @@ MAR 的默认训练命令是 3 层 × 1024，MAR-B、L、H 的预训练模型是
 d640，同样的训练 FLOPs，没有 caption dropout（负责人 2026-11-04），每个提示一个噪声，EMA，50K 张。
 
 1. 自回归：MAR 顺序，head 3 × 1024，到 C0/8（52320 步）。评测 C0/16 和 C0/8，原样和 first64 两种采样。η 的最好值由测试 A 决定，之后在同一权重上加测。
-2. 对照：点模型，同样的数据顺序和裁剪，没有 caption dropout，到 C0/8（66816 步），每个提示一个噪声。这也测出 dropout 本身的影响：对比 w1053 的 1529.61、1083.94。
+2. 对照：点模型，同样的 shard 顺序和裁剪，没有 caption dropout，到 C0/8（66816 步），每个提示一个噪声。
 
 读法（运行前写定）：
 
@@ -386,3 +386,6 @@ d640，同样的训练 FLOPs，没有 caption dropout（负责人 2026-11-04）�
 2. 差距小于 5% 或方向不一致：不算胜出，报告。一个配方的种子噪声只有 w1053、w1054 一对（2.1%、3.5%，还是两种种子方案），所以 5% 只是一个粗略的线。
 3. EMA 的已知偏差：同样算力下自回归的步数少，C0/16 时 EMA 还留着 7.3% 的初始权重，点模型是 3.5%。这对自回归不利。
 4. recall 和 coverage 一起报告，因为基线缺的是覆盖。
+5. dropout 本身：对照和 w1053（1529.61、1083.94，有 dropout）比。去掉 dropout 后随机数流从第 1 步起就不同，样本顺序也不固定，所以这个差里还有一个种子的噪声。两个算力点同向而且都超过 5%，才说 dropout 有影响。否则只报告。
+
+代码在冻结的 worktree `gpic-wt/ar_real`。自回归的正式训练要先过 `jobs/smoke_ar.sh`（第一次走 Lightning、DDP、resume 和 predict），步时由它测出，再定 `--time`。

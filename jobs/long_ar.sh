@@ -2,12 +2,12 @@
 #SBATCH -J gpic-ar-long
 #SBATCH --gres=gpu:4
 #SBATCH -c 48
-#SBATCH --time=01:40:00
+#SBATCH --time=01:15:00
 #SBATCH --mem=200G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
 #FETCHABLE
-# Test B: the MAR-order model on 256 training images to 48000 steps, 4 arms, each followed by the redraw and following tests on its weights. Reading, set before the run, in docs/autoregressive.md, section 测试 B. The threshold does not change. Expected: about 1 h. Code: the frozen worktree gpic-wt/ar_long.
+# Test B: the MAR-order model on 256 training images to 48000 steps, 4 arms, each followed by the redraw and following tests on its weights. Reading, set before the run, in docs/autoregressive.md, section 测试 B. The threshold does not change. Expected: about 45 min. Code: the frozen worktree gpic-wt/ar_long.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 WT=${LADDER_WT:-$WC/project/gpic-wt/ar_long}
@@ -25,7 +25,7 @@ IFS=, read -r -a DEV <<<"${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 arm() {   # gpu tag seed head_depth [overfit options]
   local g=$1 tag=$2 seed=$3 depth=$4; shift 4
   export CUDA_VISIBLE_DEVICES=${DEV[$g]} OMP_NUM_THREADS=4
-  timeout -k 60 5000 python $WT/tools/ar/overfit_ar.py 256 $OUT 48000 $seed --order random --head-depth $depth --name $tag "$@" > $OUT/$tag.log 2>&1 || { echo "failed: train $tag"; return 1; }
+  timeout -k 60 3400 python $WT/tools/ar/overfit_ar.py 256 $OUT 48000 $seed --order random --head-depth $depth --name $tag "$@" > $OUT/$tag.log 2>&1 || { echo "failed: train $tag"; return 1; }
   timeout -k 60 600 python $WT/tools/ar/refine_ar.py $OUT/$tag.pt 256 $OUT/${tag}_refine.json 11 $depth > $OUT/${tag}_refine.log 2>&1 || { echo "failed: refine $tag"; return 1; }
   timeout -k 60 600 python $WT/tools/ar/follow_ar.py $OUT/$tag.pt 256 $OUT/${tag}_follow.json 11 $depth > $OUT/${tag}_follow.log 2>&1 || { echo "failed: follow $tag"; return 1; }
 }

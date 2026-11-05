@@ -296,7 +296,7 @@ for _ in range(120):
 ARJiT.forward = keep_fw
 assert all(a == b for a, b in seen_known), "one known count per batch"
 share_few = sum(a <= 1 for a, _ in seen_known) / len(seen_known)
-assert 0.45 < share_few < 0.85, share_few   # on 16 tokens the MAR rule alone gives about 0.26 at 1 known or fewer, so 0.5 + 0.5 x 0.26 = 0.63
+assert 0.6 < share_few < 0.92, share_few   # on 16 tokens the MAR rule alone gives 0.50 at 1 known or fewer, so 0.5 + 0.5 x 0.50 = 0.75
 print("18. ar_sample variants; few_known: share of batches at 1 known or fewer", round(share_few, 2))
 
 # 17. sample_eta: at eta = 0 the schedule of known counts equals _sample_random's, every token gets drawn once and the head draws N per image. At eta > 0 the counts after each step still follow the schedule, tokens go back and are drawn again, nothing stays masked at the end, and the backbone calls stay ar_steps.
