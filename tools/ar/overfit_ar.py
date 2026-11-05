@@ -7,7 +7,7 @@
   distinct  share of training images that are the nearest of any sample
   late      the same distances on the last quarter of the patches (rows 192 to 255), where the image is already decided: nn_late to the nearest training image of the whole sample, tf_late when each patch is drawn given the true patches before it (teacher forcing). tf_late far below nn_late means that errors grow along the chain. The reverse does not hold on early patches: a good model may draw another image's patch there, so only the late rows are read this way.
 Samples: 128 at the checks, 8 N (at least 64) at the last step. Raw weights.
-Rescue, at the last step: the first k true patches of a training image are given, and the chain draws the rest. late_source is the rms on the last quarter of the rows to that image, late_nearest to the nearest training image of the whole result, and late_ok the share of samples with late_nearest below 0.1 (the distance has two modes, so this share is steadier than a mean of 64). head_steps_128 repeats k = 0 with four times the head's steps. The reading is in docs/autoregressive.md.
+Rescue, at the last step: the first k true patches of a training image are given, and the chain draws the rest. late_source is the rms on the last quarter of the rows to that image, late_nearest to the nearest training image of the whole result, and late_ok the share of samples with late_nearest below 0.1 (the distance has two modes, so this share is steadier than a mean of 128). head_steps_128 repeats k = 0 with four times the head's steps. The reading is in docs/autoregressive.md.
 row_rms, at the last step: the rms of each of the 16 patch rows to the nearest training image of the whole sample, and row_ok the share under 0.1. High from row 0: blending starts at the first draws. Low and then rising: the chain drifts.
 The final weights are saved as <name>.pt, for later tests of the sampler.
 usage: overfit_ar.py <N> <out dir> [steps] [seed] [--context-noise S] [--head-width W] [--head-depth D] [--name TAG]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
@@ -113,7 +113,7 @@ def teacher_forced():
 
 
 @torch.no_grad()
-def rescue(k, batches=2):
+def rescue(k, batches=4):
     """The chain from k true patches: rms on the last quarter of the rows to the source image, to the nearest training image of the whole result, and the share of the latter under 0.1."""
     src, nearest = [], []
     for _ in range(batches):
@@ -169,7 +169,7 @@ diag = dict(first_patches())
 for k in (0, 1, 4, 16, 64, 128, 192):
     diag[f"late_source_k{k}"], diag[f"late_nearest_k{k}"], diag[f"late_ok_k{k}"] = rescue(k)
 net.head_steps = 128
-diag["late_source_k0_head_steps_128"], diag["late_nearest_k0_head_steps_128"], diag["late_ok_k0_head_steps_128"] = rescue(0, batches=1)
+diag["late_source_k0_head_steps_128"], diag["late_nearest_k0_head_steps_128"], diag["late_ok_k0_head_steps_128"] = rescue(0, batches=2)
 net.head_steps = 32
 json.dump(diag, open(f"{OUT}/{TAG}_rescue.json", "w"), indent=1)
 print(TAG, "rescue", {k: round(v, 4) for k, v in diag.items()}, flush=True)
