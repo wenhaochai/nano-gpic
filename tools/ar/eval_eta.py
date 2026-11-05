@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The mask-state jump process with stochasticity eta on saved weights of tools/ar/overfit_ar.py, no training: AR_JiT.sample_eta. Metrics as in tools/ar/refine_ar.py, plus effective images, exp(entropy) of the samples per training image.
-usage: eval_eta.py <weights .pt> <N> <out .json> <eta> <sampling seed> [--head-depth D] [--head-width W] [--samples S]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
+usage: eval_eta.py <weights .pt> <N> <out .json> <eta> <sampling seed> [--head-depth D] [--head-width W] [--samples S] [--ar-steps K]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
 """
 import argparse
 import io
@@ -24,6 +24,7 @@ ap.add_argument("seed", type=int)
 ap.add_argument("--head-depth", type=int, default=3)
 ap.add_argument("--head-width", type=int, default=1024)
 ap.add_argument("--samples", type=int, default=None)
+ap.add_argument("--ar-steps", type=int, default=64)
 A = ap.parse_args()
 N = A.N
 SAMPLES = A.samples or 8 * N
@@ -49,7 +50,7 @@ mask = torch.zeros(B, T, dtype=torch.bool, device=dev)
 mask[:, 0] = True
 sd = torch.load(A.weights, map_location="cpu", weights_only=True)
 assert any("mask_token" in k for k in sd), "this script is for the random order"
-net = ARJiT(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num_blocks=9, num_text_blocks=2, patch_size=16, txt_embed_dim=2048, txt_max_length=320, bottleneck_dim=256, head_width=A.head_width, head_depth=A.head_depth, head_steps=32, order="random", ar_steps=64)
+net = ARJiT(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num_blocks=9, num_text_blocks=2, patch_size=16, txt_embed_dim=2048, txt_max_length=320, bottleneck_dim=256, head_width=A.head_width, head_depth=A.head_depth, head_steps=32, order="random", ar_steps=A.ar_steps)
 net.load_state_dict(sd, strict=True)
 net = net.to(dev).eval().requires_grad_(False)
 net.compile()
@@ -82,7 +83,7 @@ def effective(labels):
     return (-(q * q.log()).sum()).exp().item()
 
 
-res = dict(eta=A.eta, seed=A.seed, samples=len(gen), sample_s=sample_s, head_draws_per_image=float(np.mean(draws)), nn_rms=nn.mean().item(), near=near.float().mean().item(), covered=idx[near].unique().numel() / N, distinct=idx.unique().numel() / N, effective_images=effective(idx), never_drawn=1 - idx.unique().numel() / N, best_share=best.mean().item(), near_robust=ok.float().mean().item(), covered_robust=who[ok].unique().numel() / N, stray=(1 - best[ok]).mean().item() if ok.any() else None)
+res = dict(eta=A.eta, ar_steps=A.ar_steps, seed=A.seed, samples=len(gen), sample_s=sample_s, head_draws_per_image=float(np.mean(draws)), nn_rms=nn.mean().item(), near=near.float().mean().item(), covered=idx[near].unique().numel() / N, distinct=idx.unique().numel() / N, effective_images=effective(idx), never_drawn=1 - idx.unique().numel() / N, best_share=best.mean().item(), near_robust=ok.float().mean().item(), covered_robust=who[ok].unique().numel() / N, stray=(1 - best[ok]).mean().item() if ok.any() else None)
 json.dump(res, open(A.out, "w"), indent=1)
 torch.save(dict(nn=nn.cpu(), idx=idx.cpu(), best=best.cpu(), who=who.cpu()), A.out.replace(".json", "_per_sample.pt"))
 print({k: round(v, 4) if isinstance(v, float) else v for k, v in res.items()}, flush=True)
