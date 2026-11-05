@@ -134,6 +134,8 @@ class LightningModel(pl.LightningModule):
         total = torch.nn.utils.clip_grad_norm_(params, gradient_clip_val, foreach=True)
         if getattr(self.denoiser, "gm_k", 0) and getattr(self, "_log_now", False):   # GMFlow: the pre-clip norm, on the steps whose logs are written (no extra host sync)
             self.log("train/grad_norm_preclip", total, on_step=True, sync_dist=False)
+        if getattr(self.denoiser, "gm_k", 0) and trainer._print_every and trainer._calls % trainer._print_every == 0:   # smoke test only (GPIC_GM_PRINT): a host sync
+            print(f"[gmflow] call {trainer._calls}: grad norm before the clip {total.item():.4f}", flush=True)
         if check:
             print(f"[code] call {trainer._calls}: grad norm before the clip {total.item():.4f}, of which the flow {prior:.4f}, clip at {gradient_clip_val}", flush=True)
 

@@ -34,6 +34,9 @@ try:
     step = f"{statistics.median(st) / 1000:.4f} s/step (median of {len(st)} steps after the first 20)"
 except Exception as e:
     step = f"no step times ({e!r})"
+g = [float(v) for v in re.findall(r"\[gmflow\] call \d+: grad norm before the clip (\S+)", s)]
+ok = ok and bool(g) and all(math.isfinite(v) for v in g)
+print("pre-clip grad norm: first", g[:3], "last", g[-3:], "share above the clip 1.0:", sum(v > 1 for v in g) / max(len(g), 1))
 print("gmflow check:", "PASS" if ok else "FAIL", "| first", rows[0] if rows else None, "| last", rows[-1] if rows else None, "| lines", len(rows),
       "| recompiles after warm-up", after.count("__recompiles"), "|", step)
 sys.exit(0 if ok else 1)
