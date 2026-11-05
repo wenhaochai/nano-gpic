@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Sampler settings on saved weights of tools/ar/overfit_ar.py, with no training (w1133 saved them). The first metrics are the overfit test's own. The robust ones explain them: in w1133 the MAR-order samples look like one training image with a few stray patches, which raise an rms over the whole image.
-  robust_rms   for each sample, the smallest over training images of the median patch rms to that image
-  near_robust  share of samples with robust_rms below 0.1; covered_robust likewise, as covered
-  stray        over samples with robust_rms below 0.1: the share of patches further than 0.2 from that image
+  best_share   for each sample, the largest share of its 256 patches within rms 0.2 of one training image. Different images' patches at one position lie much further apart (median rms 0.66, 10th percentile 0.34), and a collage of two images gets a low share, which a median would hide (review 2026-11-04)
+  near_robust  share of samples with best_share >= 0.9 (at most 25 stray patches); covered_robust likewise, as covered
+  stray        over those samples: 1 - best_share
 usage: eval_saved_ar.py <weights .pt> <N> <out .json> <ar_steps> <temperature> [samples]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
 """
 import io
@@ -59,15 +59,14 @@ d = torch.cat([torch.cdist(gen[i:i + 64].flatten(1), imgs.flatten(1)) for i in r
 nn, idx = d.min(1)
 res = dict(ar_steps=STEPS, temperature=TEMP, samples=len(gen), sample_s=sample_s, nn_rms=nn.mean().item(), near=(nn < 0.1).float().mean().item(), covered=idx[nn < 0.1].unique().numel() / N, distinct=idx.unique().numel() / N)
 patches = torch.nn.functional.unfold(gen, kernel_size=16, stride=16).transpose(1, 2)   # [S, 256, 768]
-best, who, stray = [], [], []
+best, who = [], []
 for i in range(0, len(patches), 32):
     per = ((patches[i:i + 32, None] - true[None]) ** 2).mean(-1).sqrt()   # [s, N, 256]
-    med, at = per.median(dim=-1)[0].min(dim=1)
-    best.append(med)
+    share, at = (per < 0.2).float().mean(-1).max(dim=1)
+    best.append(share)
     who.append(at)
-    stray.append((per[torch.arange(len(at)), at] > 0.2).float().mean(-1))
-best, who, stray = torch.cat(best), torch.cat(who), torch.cat(stray)
-ok = best < 0.1
-res.update(robust_rms=best.mean().item(), near_robust=ok.float().mean().item(), covered_robust=who[ok].unique().numel() / N, stray=stray[ok].mean().item() if ok.any() else None, stray_p90=stray[ok].quantile(0.9).item() if ok.any() else None)
+best, who = torch.cat(best), torch.cat(who)
+ok = best >= 0.9
+res.update(best_share=best.mean().item(), near_robust=ok.float().mean().item(), covered_robust=who[ok].unique().numel() / N, stray=(1 - best[ok]).mean().item() if ok.any() else None, share_quantiles=[round(v, 3) for v in best.quantile(torch.tensor([0.1, 0.25, 0.5, 0.75, 0.9], device=dev)).tolist()])
 json.dump(res, open(OUT, "w"), indent=1)
 print({k: round(v, 4) if isinstance(v, float) else v for k, v in res.items()}, flush=True)

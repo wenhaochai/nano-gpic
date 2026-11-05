@@ -53,7 +53,7 @@ class ARJiT(JiT_T2I):
         """context_noise: Gaussian noise of this std on the patches that the backbone reads, in training and at sampling, so that a drawn patch with small errors is like the inputs it trained on (the conditioning augmentation of Cascaded Diffusion). Targets stay clean. 0 is the first design."""
         super().__init__(**kwargs)
         self.patch_dim = self.in_channels * self.patch_size ** 2
-        self.head_steps, self.t_eps, self.context_noise, self.temperature = head_steps, t_eps, context_noise, temperature   # temperature: the scale of the head's start noise, an approximation of MAR's temperature
+        self.head_steps, self.t_eps, self.context_noise, self.temperature = head_steps, t_eps, context_noise, temperature   # temperature: the scale of the head's start noise on its ODE. Not MAR's temperature, which scales the noise of each reverse step
         self.z_norm = self.final_layer.norm_final
         del self.final_layer   # the output is the head's; an unused parameter would stop DDP
         assert order in ("raster", "random"), order
