@@ -8,13 +8,14 @@
 #SBATCH --comment=fetchable
 #FETCHABLE
 # GPIC evaluation of one autoregressive checkpoint: jobs/eval_ladder.sh's protocol (50K test captions, EMA net, CFG 1.0, FD-DINOv2 / PRDC / MMD), with configs_h100/ar_sample.yaml. x_T is not used: each image's randomness comes from the draws. So the baseline is the point model with each prompt's own noise.
-# usage: eval_ar.sh <size> <d> <nb> <nt> <step> [base|first<K>|eta<E>]   The last is the sampler: as drawn, the first K tokens drawn again at the end, or the jump process with stochasticity E. All three give each prompt its own noise.
+# usage: eval_ar.sh <size> <d> <nb> <nt> <step> [base|flow|first<K>|eta<E>]   The last is the sampler: as drawn, the first K tokens drawn again at the end, or the jump process with stochasticity E. All three give each prompt its own noise.
 # Env (smoke tests only): LADDER_WT, LADDER_RUN_ROOT.
 set -eo pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 NAME=$1 D=$2 NB=$3 NT=$4 STEP=$(printf %06d $5) VARIANT=${6:-base}
 case $VARIANT in
   base) SAMPLER= ;;
+  flow) SAMPLER=; export GPIC_AR_HEAD_FLOW=1 ;;   # as base, with the head's flow in one compiled graph
   first*) SAMPLER="--model.denoiser.init_args.redraw_first ${VARIANT#first}" ;;
   eta*) SAMPLER="--model.denoiser.init_args.eta ${VARIANT#eta}" ;;
   *) echo "unknown variant $VARIANT"; exit 2 ;;
