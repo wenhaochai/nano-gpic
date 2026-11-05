@@ -2,7 +2,7 @@
 #SBATCH -J gpic-energy-overfit
 #SBATCH --gres=gpu:4
 #SBATCH -c 48
-#SBATCH --time=00:20:00
+#SBATCH --time=00:18:00
 #SBATCH --mem=200G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
@@ -10,7 +10,7 @@
 # Test E (docs/energy_head.md): the energy head against the point model, overfit on N = 256 real images with the null caption, 24000 steps, one arm per GPU:
 # point seed 0 (control; its effective_images was never measured); energy head seed 0 and seed 1; the implicit model in the repo (xi_block = 6, M = 2) seed 0.
 # Reading rule, set before the run: docs/energy_head.md, section 读法. The threshold is covered >= 0.7594 on 2 seeds.
-# Expected: about 12 min (estimate from w1113's timings, not measured: no GPU was free for a timing run). The implicit arm trains 32% more FLOPs per step, so the other GPUs idle about 2 min at the end.
+# Expected: about 14 min for the slowest arm (implicit), an estimate from w1113's H100 timings and an A40 timing of each arm's train step (point 74.9 ms, energy 82.5, implicit 97.5): no H100 was free to time it. The implicit arm trains 32% more FLOPs per step, so the other GPUs idle about 3 min at the end.
 # Code: the worktree gpic-wt/energy_head.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
@@ -30,7 +30,7 @@ ARMS=("point 0" "energy 0" "energy 1" "implicit 0")
 g=0
 for arm in "${ARMS[@]}"; do
   set -- $arm
-  CUDA_VISIBLE_DEVICES=${DEV[$g]} OMP_NUM_THREADS=4 timeout -k 60 1500 python $WT/tools/energy/overfit_energy.py $1 256 $OUT 24000 $2 > $OUT/n256_$1_s$2.log 2>&1 &
+  CUDA_VISIBLE_DEVICES=${DEV[$g]} OMP_NUM_THREADS=4 timeout -k 60 1000 python $WT/tools/energy/overfit_energy.py $1 256 $OUT 24000 $2 > $OUT/n256_$1_s$2.log 2>&1 &
   g=$((g + 1))
 done
 fail=0
