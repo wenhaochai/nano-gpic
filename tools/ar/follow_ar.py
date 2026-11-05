@@ -9,6 +9,7 @@ At k = 0 also which training image each draw lies nearest to:
   effective_per_position  exp(entropy) of the image counts at each position, mean over positions
   effective_all           the same over all positions together
   baseline_*              the same statistics for true patches of uniformly chosen images, plus noise of the same median rms as any_rms
+  *_hit                   the same, only for draws within 0.2 of a training patch, against a baseline with as many draws. An error of another shape than the baseline's white noise can favour central patches, and these counts do not read that as a preference (review 2026-11-04)
 <out>_counts0.pt holds the counts; <out>_samples.png holds 16 samples, each row as drawn followed by a row with the first 64 tokens drawn again.
 usage: follow_ar.py <weights .pt> <N> <out .json> <sampling seed>    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
 """
@@ -38,19 +39,21 @@ def effective(counts):
     return (-(q * q.clamp_min(1e-30).log()).sum(-1)).exp()
 
 
-def add_counts(counts, who):
+def add_counts(counts, who, keep=None):
     T = who.shape[1]
-    pos = torch.arange(T, device=who.device).repeat(len(who))
-    counts.index_put_((pos, who.flatten()), torch.ones(who.numel(), device=who.device), accumulate=True)
+    pos, images = torch.arange(T, device=who.device).repeat(len(who)), who.flatten()
+    if keep is not None:
+        pos, images = pos[keep.flatten()], images[keep.flatten()]
+    counts.index_put_((pos, images), torch.ones(images.numel(), device=who.device), accumulate=True)
 
 
 def measure(draw, true, ks, repeats, batch, limit=0.2):
-    """draw(tokens [B, T, P], pick [B, T] bool) returns the tokens with the picked ones drawn again. Each image is the given image repeats times at each k. Returns {k: stats} and the counts [T, N] at k = 0."""
+    """draw(tokens [B, T, P], pick [B, T] bool) returns the tokens with the picked ones drawn again. Each image is the given image repeats times at each k. Returns {k: stats} and two counts [T, N] at k = 0: all draws, and only the draws within limit of a training patch."""
     N, T = true.shape[:2]
     assert N % batch == 0
     dev = true.device
     close = close_matrix(true, limit)
-    res, counts = {}, torch.zeros(T, N, device=dev)
+    res, counts, hits = {}, torch.zeros(T, N, device=dev), torch.zeros(T, N, device=dev)
     for k in ks:
         hit_own = hit_any = total = 0
         ideal, own_vals, any_vals = [], [], []
@@ -76,8 +79,9 @@ def measure(draw, true, ks, repeats, batch, limit=0.2):
                     ideal.append(close[a][agree][:, p].float().mean().item())
                 if k == 0:
                     add_counts(counts, who)
+                    add_counts(hits, who, nearest < limit)
         res[k] = dict(follow=hit_own / total, ideal=float(np.mean(ideal)), manifold=hit_any / total, own_rms=torch.cat(own_vals).median().item(), any_rms=torch.cat(any_vals).median().item(), draws=total)
-    return res, counts
+    return res, counts, hits
 
 
 def baseline(true, sigma, draws_per_position, batch):
@@ -131,13 +135,16 @@ def main():
             return net.redraw(tokens, pick, y, mask)
 
     t0 = time.time()
-    res, counts = measure(draw, true, (0, 1, 2, 4, 8, 16, 32, 64, 128), repeats=4, batch=B)
+    res, counts, hits = measure(draw, true, (0, 1, 2, 4, 8, 16, 32, 64, 128), repeats=4, batch=B)
     out = dict(seed=SEED, seconds=time.time() - t0, k={str(k): v for k, v in res.items()})
     per_position = int(counts[0].sum().item())
     base = baseline(true, res[0]["any_rms"], per_position, B)
     out["draw0"] = dict(draws_per_position=per_position, effective_per_position=effective(counts).mean().item(), effective_all=effective(counts.sum(0)).item(), baseline_per_position=effective(base).mean().item(), baseline_all=effective(base.sum(0)).item())
+    hits_per_position = int(hits.sum(1).float().mean().item())
+    base_hit = baseline(true, res[0]["any_rms"], hits_per_position, B)
+    out["draw0"].update(hits_per_position=hits_per_position, effective_per_position_hit=effective(hits).mean().item(), effective_all_hit=effective(hits.sum(0)).item(), baseline_per_position_hit=effective(base_hit).mean().item(), baseline_all_hit=effective(base_hit.sum(0)).item())
     json.dump(out, open(OUT, "w"), indent=1)
-    torch.save(dict(per_position=counts.cpu(), baseline=base.cpu()), OUT.replace(".json", "_counts0.pt"))
+    torch.save(dict(per_position=counts.cpu(), baseline=base.cpu(), hits=hits.cpu(), baseline_hit=base_hit.cpu()), OUT.replace(".json", "_counts0.pt"))
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         g, order = net._sample_random(y, mask, return_order=True)
         tokens = unfold(g.float())

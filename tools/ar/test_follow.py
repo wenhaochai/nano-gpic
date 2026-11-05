@@ -37,7 +37,8 @@ def blur(tokens, pick):
     return torch.where(pick[..., None], true.mean(0).expand_as(tokens), tokens)
 
 
-res, counts = measure(oracle, true, KS, repeats=6, batch=B)
+res, counts, hits = measure(oracle, true, KS, repeats=6, batch=B)
+assert (hits == counts).all() and counts.sum() == 6 * N * T   # real patches all count
 for k, r in res.items():
     se = (r["follow"] * (1 - r["follow"]) / (6 * N)) ** 0.5   # one image per case, so the case is the unit
     assert abs(r["follow"] - r["ideal"]) < 4 * max(se, 0.01), (k, r)
@@ -46,22 +47,22 @@ assert 0.2 < res[0]["ideal"] < 0.3, res[0]   # a uniform image: 1/2 of the famil
 assert res[32]["ideal"] > 0.99 and res[1]["ideal"] < res[8]["ideal"]
 print("oracle follows the chain rule:", {k: round(r["follow"], 3) for k, r in res.items()}, "ideal", {k: round(r["ideal"], 3) for k, r in res.items()})
 chance = res[0]["ideal"]
-res_i, counts_i = measure(ignores, true, KS, repeats=6, batch=B)
+res_i, counts_i, _ = measure(ignores, true, KS, repeats=6, batch=B)
 for k, r in res_i.items():
     assert abs(r["follow"] - chance) < 0.04 and r["manifold"] == 1, (k, r)
 assert res_i[32]["ideal"] > 0.99
 print("a draw that ignores the known tokens stays at chance:", {k: round(r["follow"], 3) for k, r in res_i.items()})
-res_b, _ = measure(blur, true, (0, 8), repeats=2, batch=B)
+res_b, counts_b, hits_b = measure(blur, true, (0, 8), repeats=2, batch=B)
 assert res_b[0]["manifold"] < 0.02 and res_b[0]["follow"] < 0.02
+assert counts_b.sum() == 2 * N * T and hits_b.sum() <= 0.02 * 2 * N * T   # a blur counts in all draws and not in the hits
 print("a blur is not a real patch:", round(res_b[0]["manifold"], 3))
-res_c, _ = measure(lambda t, p: t, true, (0, 8), repeats=2, batch=B)
+res_c, _, _ = measure(lambda t, p: t, true, (0, 8), repeats=2, batch=B)
 assert res_c[8]["follow"] == 1 and res_c[8]["own_rms"] == 0
 print("the image itself: follow 1")
 base = baseline(true, 0.03, int(counts_i[0].sum().item()), B)
 ratio = effective(counts_i).mean().item() / effective(base).mean().item()
 assert 0.9 < ratio < 1.1, ratio
-single, _ = None, None
-_, counts_one = measure(lambda t, p: torch.where(p[..., None], true[:1].expand_as(t), t), true, (0,), repeats=1, batch=B)
+_, counts_one, _ = measure(lambda t, p: torch.where(p[..., None], true[:1].expand_as(t), t), true, (0,), repeats=1, batch=B)
 assert (effective(counts_one) - 1).abs().max() < 1e-4 and abs(effective(counts_one.sum(0)).item() - 1) < 1e-4
 print("effective images: uniform against its baseline", round(ratio, 3), "one image", 1)
 try:
