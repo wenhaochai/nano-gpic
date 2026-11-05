@@ -151,7 +151,7 @@ model:
       P_mean: -0.8
       P_std: 0.8
       t_eps: 0.05
-      null_condition_p: 0.1
+      null_condition_p: 0.0   # owner 2026-11-04: no CFG, so no caption dropout
   diffusion_sampler:
     class_path: src.diffusion.flow_matching.sampling.EulerSamplerJiT
     init_args:
