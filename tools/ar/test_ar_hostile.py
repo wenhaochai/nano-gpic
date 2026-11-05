@@ -124,6 +124,11 @@ print("7. checkpoint round trip, EMA copy, copy after sampling")
 # 8. Sampling: rows differ with one caption (each draw is random), the first patch depends on the caption, and a drawn patch lies in [-1, 1]. tokens[:, i:] must not matter.
 same = y[:1].repeat(2, 1, 1)
 sm = mask[:1].repeat(2, 1)
+before = torch.get_rng_state()
+torch.manual_seed(5)
+one = net._read(torch.ones(2, 3))
+assert (one == 1).all() and (torch.manual_seed(5), torch.randn(1))[1] == (torch.manual_seed(5), torch.randn(1))[1]
+torch.set_rng_state(before)
 torch.manual_seed(1)
 imgs = net.ar_sample(same, sm)
 assert imgs.shape == (2, 3, 64, 64) and (imgs[0] != imgs[1]).any() and imgs.abs().max() <= 1
@@ -204,6 +209,64 @@ torch.manual_seed(4)
 a2 = net.ar_sample(y, mask, prefix=pre)
 assert (a2 != a0).any()
 print("13. prefix: returned unchanged, and it changes the rest")
+
+# 14. Random order: no leak from unknown tokens, known tokens do reach every output, the loss counts masked tokens only, every parameter trains, and the sampler draws each token exactly once.
+rnd = wake(ARJiT(**kw, order="random", ar_steps=6))
+known = torch.zeros(2, N, dtype=torch.bool)
+known[0, [1, 5]] = True
+known[1, [2, 9]] = True
+t = tokens.clone().requires_grad_(True)
+z = rnd(t, y, y_mask=mask, known=known)
+g = torch.autograd.grad(z.sum(), t)[0].abs().amax(dim=2)
+assert (g[~known] == 0).all() and (g[known] > 0).all(), g
+assert (rnd(tokens, y, y_mask=mask, known=torch.ones(2, N, dtype=torch.bool)) != rnd(tokens, y, y_mask=mask, known=known)).any()
+tr_r = ARTrainer(null_condition_p=0.0, min_mask=0.7)
+torch.manual_seed(11)
+rnd.zero_grad()
+for _ in range(8):   # a step with every token masked gives the patch embedding a zero gradient, as MAR does; it stays in the graph, so DDP is fine
+    res = tr_r._impl_trainstep(rnd, None, None, x, y, {"y_mask": mask})
+    res["loss"].backward()
+    assert all(p.grad is not None for p in rnd.parameters() if p.requires_grad)
+none = [n for n, p in rnd.named_parameters() if p.requires_grad and p.grad.abs().sum() == 0]
+assert not none and res["loss_per_sample"].shape == (2,), none
+assert not hasattr(rnd, "causal") and not hasattr(rnd, "bos") and not hasattr(net, "mask_token")
+rates = []
+class Rec(ARJiT):
+    def forward(self, tokens, y, y_mask=None, q=None, tau=None, known=None):
+        rates.append(1 - known.float().mean().item())
+        assert (known.sum(1) == known[0].sum()).all()
+        return super().forward(tokens, y, y_mask=y_mask, q=q, tau=tau, known=known)
+rec = Rec(**kw, order="random", ar_steps=6)
+for _ in range(40):
+    tr_r._impl_trainstep(rec, None, None, x, y, {"y_mask": mask})
+assert min(rates) >= 0.7 and max(rates) <= 1.0 and sum(rates) / len(rates) > 0.8, (min(rates), max(rates))
+drawn_at = []
+orig_draw = ARJiT.draw_patch
+def spy_draw(self, z):
+    drawn_at.append(z.shape[0])
+    return orig_draw(self, z)
+ARJiT.draw_patch = spy_draw
+img = rnd.ar_sample(y, mask)
+assert img.shape == (2, 3, 64, 64) and sum(drawn_at) == 2 * N and all(c % 2 == 0 for c in drawn_at), drawn_at
+assert len(drawn_at) <= 6
+drawn_at.clear()
+big_steps = wake(ARJiT(**kw, order="random", ar_steps=64))
+big_steps.ar_sample(y, mask)
+assert sum(drawn_at) == 2 * N and len(drawn_at) == N, (sum(drawn_at), len(drawn_at))   # more steps than tokens: one token per step
+drawn_at.clear()
+pre = torch.rand(2, 5, P) * 2 - 1
+img = rnd.ar_sample(y, mask, prefix=pre)
+back = torch.nn.functional.unfold(img, kernel_size=16, stride=16).transpose(1, 2)
+assert (back[:, :5] - pre).abs().max() < 1e-5 and sum(drawn_at) == 2 * (N - 5), drawn_at
+ARJiT.draw_patch = orig_draw
+c2 = wake(ARJiT(**kw, order="random", ar_steps=6))
+e2 = copy.deepcopy(c2)
+c2.compile()
+assert (c2(tokens, y, y_mask=mask, known=known) - e2(tokens, y, y_mask=mask, known=known)).abs().max() < 1e-3
+res = tr_r(c2, None, None, x, y.clone(), null.clone(), {"y_mask": mask.clone()})
+res["loss"].backward()
+assert not [n for n, p in c2.named_parameters() if p.requires_grad and p.grad is None]
+print("14. random order: no leak, loss on masked tokens, each token drawn once, compiled path")
 
 # 11. Hand count of the head's FLOPs at d640, 2 per multiply-add, against FlopCounterMode's 9.87 G.
 w, D = 1024, 640

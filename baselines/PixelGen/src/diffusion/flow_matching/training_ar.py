@@ -2,15 +2,17 @@
 
 The head's recipe is the official one, per patch: x-prediction, L2 in v space with t_eps, except for a wider tau: logit-normal(-0.8, 1.6). In tools/ar/head_modes.py (8 modes in 768 dimensions, one training seed) a draw lies closer to its mode: rms 0.005 against 0.012 at the official std of 0.8. The modes' shares do not separate the two: total variation 0.027 against 0.040, with a sampling noise of about 0.016. CFG dropout comes from BaseTrainer.
 """
+import math
+
 import torch
 
 from src.diffusion.base.training import BaseTrainer
 
 
 class ARTrainer(BaseTrainer):
-    def __init__(self, P_mean=-0.8, P_std=1.6, t_eps=0.05, **kwargs):
+    def __init__(self, P_mean=-0.8, P_std=1.6, t_eps=0.05, min_mask=0.7, **kwargs):
         super().__init__(**kwargs)
-        self.P_mean, self.P_std, self.t_eps = P_mean, P_std, t_eps
+        self.P_mean, self.P_std, self.t_eps, self.min_mask = P_mean, P_std, t_eps, min_mask
 
     def _impl_trainstep(self, net, ema_net, solver, x, y, metadata=None):
         patches = torch.nn.functional.unfold(x, kernel_size=net.patch_size, stride=net.patch_size).transpose(1, 2)
@@ -20,8 +22,26 @@ class ARTrainer(BaseTrainer):
         q = tau[..., None] * patches + (1 - tau[..., None]) * eta
         y_mask = metadata.get("y_mask") if isinstance(metadata, dict) else None
         context = patches + net.context_noise * torch.randn_like(patches) if net.context_noise else patches   # what the backbone reads; the target stays clean
-        hat = net(context, y, y_mask=y_mask, q=q, tau=tau).float()
+        kw = {}
+        counted = None
+        if net.order == "random":   # as MAR: one masked share per batch from a left-half Gaussian at 1 with std 0.25, cut at min_mask; a new order per image; the loss on the masked tokens only
+            rate = 1 - 0.25 * torch.randn(1).abs().item()
+            while rate < self.min_mask:
+                rate = 1 - 0.25 * torch.randn(1).abs().item()
+            masked = math.ceil(N * rate)
+            order = torch.rand(B, N, device=x.device).argsort(dim=1)
+            known = torch.ones(B, N, dtype=torch.bool, device=x.device)
+            known.scatter_(1, order[:, :masked], False)
+            kw["known"] = known
+            counted = (~known).float()
+        hat = net(context, y, y_mask=y_mask, q=q, tau=tau, **kw).float()
         # v_hat - v = ((hat - q) - (patches - q)) / (1 - tau), with the official clamp
         per_value = ((hat - patches) / (1 - tau[..., None]).clamp_min(self.t_eps)) ** 2
-        fm = per_value.mean()
-        return dict(fm_loss=fm, loss=fm, loss_per_sample=per_value.mean(dim=(1, 2)))
+        if counted is None:
+            fm = per_value.mean()
+            per_sample = per_value.mean(dim=(1, 2))
+        else:
+            per_token = per_value.mean(dim=-1)
+            fm = (per_token * counted).sum() / counted.sum()
+            per_sample = (per_token * counted).sum(dim=1) / counted.sum(dim=1)
+        return dict(fm_loss=fm, loss=fm, loss_per_sample=per_sample)

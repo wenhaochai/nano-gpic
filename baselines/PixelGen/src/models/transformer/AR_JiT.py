@@ -1,8 +1,10 @@
 """An image model that works as an LLM does (docs/autoregressive.md): at each step it gives the distribution of the next patch given the caption and the patches before it, and the sampler draws from it.
 
-p(x | y) = prod_i p(patch_i | patch_1 ... patch_{i-1}, y), in raster order. The backbone is JiT_T2I's, with a causal mask: z_i sees the caption and the patches before i. There is no noise level, and the backbone's timestep embedding sees a constant.
+p(x | y) = prod_i p(patch_i | patch_1 ... patch_{i-1}, y). Two orders. order = "raster": left to right, with a causal mask, as an LLM: z_i sees the caption and the patches before i. order = "random": a new random order per image and bidirectional attention, as MAR (Li et al. 2024; its table 1 has FID 19.23 for raster and causal against 3.43 for random and bidirectional without CFG): the known patches and a mask token at the unknown positions all attend to each other. Unlike MAR, one stack runs over all positions, with no split into an encoder and a decoder.
+The backbone is JiT_T2I's. There is no noise level, and the backbone's timestep embedding sees a constant.
 The distribution of one patch is continuous: a small flow on the 768 values of the patch, given z_i (TokenFlowHead), with the official recipe's x-prediction and v-space L2.
 """
+import math
 import os
 
 import torch
@@ -47,19 +49,24 @@ class TokenFlowHead(nn.Module):
 class ARJiT(JiT_T2I):
     is_ar = True
 
-    def __init__(self, head_width=1024, head_depth=3, head_steps=32, t_eps=0.05, context_noise=0.0, **kwargs):
+    def __init__(self, head_width=1024, head_depth=3, head_steps=32, t_eps=0.05, context_noise=0.0, order="raster", ar_steps=64, **kwargs):
         """context_noise: Gaussian noise of this std on the patches that the backbone reads, in training and at sampling, so that a drawn patch with small errors is like the inputs it trained on (the conditioning augmentation of Cascaded Diffusion). Targets stay clean. 0 is the first design."""
         super().__init__(**kwargs)
         self.patch_dim = self.in_channels * self.patch_size ** 2
         self.head_steps, self.t_eps, self.context_noise = head_steps, t_eps, context_noise
         self.z_norm = self.final_layer.norm_final
         del self.final_layer   # the output is the head's; an unused parameter would stop DDP
-        self.bos = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
+        assert order in ("raster", "random"), order
+        self.order, self.ar_steps = order, ar_steps
+        if order == "raster":
+            self.bos = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
+            self.register_buffer("causal", torch.tril(torch.ones(self.num_patches, self.num_patches, dtype=torch.bool)), persistent=False)
+        else:
+            self.mask_token = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
         self.head = TokenFlowHead(self.patch_dim, self.hidden_size, head_width, head_depth)
-        self.register_buffer("causal", torch.tril(torch.ones(self.num_patches, self.num_patches, dtype=torch.bool)), persistent=False)
 
-    def forward(self, tokens, y, y_mask=None, q=None, tau=None):
-        """tokens [B, N, P]: the patches in raster order. The output at i sees tokens before i only, whatever tokens[:, i:] holds.
+    def forward(self, tokens, y, y_mask=None, q=None, tau=None, known=None):
+        """tokens [B, N, P]: the patches in raster order. Raster order: the output at i sees tokens before i only, whatever tokens[:, i:] holds. Random order: known [B, N] says which tokens the model sees, and the others do not reach any output.
         Without q: z [B, N, D]. With q [B, N, P] and tau [B, N]: the head's x_hat [B, N, P], inside this graph (training)."""
         B, N, P = tokens.shape
         side = int(N ** 0.5)
@@ -71,13 +78,18 @@ class ARJiT(JiT_T2I):
         text_mask = None if y_mask is None else y_mask[:, None, None, :]
         for block in self.text_refine_blocks:
             y = block(y, condition) if text_mask is None else block(y, condition, text_mask)
-        x = self.x_embedder(tokens[:, :-1])
-        x = torch.cat([self.bos.expand(B, 1, self.hidden_size).to(x.dtype), x], dim=1) + self.pos_embed.to(x.dtype)   # bf16 under autocast, as the official in-place add keeps it (review 2026-11-04)
-        causal = self.causal[None, None].expand(B, 1, N, N)   # SDPA boolean mask, True = attend
-        words = torch.ones(B, 1, N, y.shape[1], dtype=torch.bool, device=x.device) if y_mask is None else y_mask[:, None, None, :].expand(B, 1, N, y.shape[1])
-        mask = torch.cat([causal, words], dim=-1)
+        if self.order == "raster":
+            x = self.x_embedder(tokens[:, :-1])
+            x = torch.cat([self.bos.expand(B, 1, self.hidden_size).to(x.dtype), x], dim=1) + self.pos_embed.to(x.dtype)   # bf16 under autocast, as the official in-place add keeps it (review 2026-11-04)
+            causal = self.causal[None, None].expand(B, 1, N, N)   # SDPA boolean mask, True = attend
+            words = torch.ones(B, 1, N, y.shape[1], dtype=torch.bool, device=x.device) if y_mask is None else y_mask[:, None, None, :].expand(B, 1, N, y.shape[1])
+            mask = torch.cat([causal, words], dim=-1)
+        else:
+            x = self.x_embedder(tokens)
+            x = torch.where(known[..., None], x, self.mask_token.to(x.dtype)) + self.pos_embed.to(x.dtype)
+            mask = None if y_mask is None else torch.cat([torch.ones(B, 1, 1, N, dtype=torch.bool, device=x.device), y_mask[:, None, None, :]], dim=-1)   # the official mask: all patches attend to all
         for block in self.blocks:
-            x = block(x, y, condition, xpos, mask)
+            x = block(x, y, condition, xpos) if mask is None else block(x, y, condition, xpos, mask)
         z = self.z_norm(x)
         if q is None:
             return z
@@ -90,6 +102,10 @@ class ARJiT(JiT_T2I):
             object.__setattr__(self, "_compiled_head", fast)
         return self._compiled_head
 
+    def _read(self, patches):
+        """What the backbone reads of a patch. With context_noise = 0 it takes no random numbers."""
+        return patches + self.context_noise * torch.randn_like(patches) if self.context_noise else patches
+
     @torch.no_grad()
     def draw_patch(self, z):
         """One draw from the distribution of one patch given z [B, D]: the head's flow from noise, on a uniform grid, with the last step on x_hat."""
@@ -99,12 +115,14 @@ class ARJiT(JiT_T2I):
         for j in range(self.head_steps):
             hat = head(q, grid[j].repeat(B), z).float()
             q = hat if j == self.head_steps - 1 else q + (grid[j + 1] - grid[j]) * (hat - q) / (1 - grid[j]).clamp_min(self.t_eps)
-        return q.clamp(-1, 1)   # a drawn patch goes back in as input, and real inputs lie in [-1, 1]
+        return q.clamp(-1, 1)   # as real patches
 
     @torch.no_grad()
     def ar_sample(self, y, y_mask=None, prefix=None):
         """Images [B, C, H, W] for captions y: one patch per step, each drawn from its distribution given the patches before it. The whole sequence goes through the backbone at each step: the mask hides what is not drawn yet, and the shape stays fixed for the compiled graph.
         prefix [B, k, P] (diagnostics): the first k patches are given, and the rest are drawn. They are returned unchanged."""
+        if self.order == "random":
+            return self._sample_random(y, y_mask, prefix)
         B, N = y.shape[0], self.num_patches
         tokens = torch.zeros(B, N, self.patch_dim, device=y.device)   # what comes out
         context = torch.zeros(B, N, self.patch_dim, device=y.device)  # what the backbone reads
@@ -112,11 +130,45 @@ class ARJiT(JiT_T2I):
         if prefix is not None:
             k = prefix.shape[1]
             tokens[:, :k] = prefix
-            context[:, :k] = prefix + self.context_noise * torch.randn_like(prefix)
+            context[:, :k] = self._read(prefix)
         for i in range(k, N):
             z = self(context, y, y_mask=y_mask)[:, i].float()
             drawn = self.draw_patch(z)
             tokens[:, i] = drawn
-            context[:, i] = drawn + self.context_noise * torch.randn_like(drawn)
+            context[:, i] = self._read(drawn)
+        side = int(N ** 0.5) * self.patch_size
+        return self.unpatchify(tokens, side, side)
+
+    @torch.no_grad()
+    def _sample_random(self, y, y_mask=None, prefix=None):
+        """MAR's sampler: a new random order per image, and a cosine schedule of the unknown share from 1 to 0 over ar_steps steps. At each step the next tokens in the order are drawn given the known ones, each from its distribution. All images of a batch draw the same number of tokens per step."""
+        B, N = y.shape[0], self.num_patches
+        k = 0 if prefix is None else prefix.shape[1]
+        tokens = torch.zeros(B, N, self.patch_dim, device=y.device)
+        context = torch.zeros(B, N, self.patch_dim, device=y.device)
+        unknown = torch.ones(B, N, dtype=torch.bool, device=y.device)
+        keys = torch.rand(B, N, device=y.device)
+        if k:
+            tokens[:, :k] = prefix
+            context[:, :k] = self._read(prefix)
+            unknown[:, :k] = False
+            keys[:, :k] += 2   # given patches come last in the order, so they never count as next
+        order = keys.argsort(dim=1)
+        for step in range(self.ar_steps):
+            left = int(unknown[0].sum())
+            if left == 0:
+                break
+            next_left = 0 if step == self.ar_steps - 1 else max(1, min(left - 1, math.floor(N * math.cos(math.pi / 2 * (step + 1) / self.ar_steps))))
+            if next_left >= left:   # more steps than tokens: nothing to draw at this step
+                continue
+            after = torch.zeros_like(unknown)
+            after.scatter_(1, order[:, :next_left], True)
+            pick = unknown & ~after
+            z = self(context, y, y_mask=y_mask, known=~unknown)
+            where = pick.nonzero(as_tuple=True)
+            drawn = self.draw_patch(z[where].float())
+            tokens[where] = drawn
+            context[where] = self._read(drawn)
+            unknown = after
         side = int(N ** 0.5) * self.patch_size
         return self.unpatchify(tokens, side, side)
