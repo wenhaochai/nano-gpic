@@ -15,6 +15,7 @@ source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 D=$1 NB=$2 NT=$3 STEP=$(printf %06d $4); shift 4
 WT=${LADDER_WT:-$WC/project/gpic-wt/energy_real}
 CONFIG=${EVAL_CONFIG:-energy_sample}
+SUF=${EVAL_SUF:-}
 RUN=${LADDER_RUN_ROOT:-$WC/runs/gpic-speed/energy_d640}/exp_ladder_d640
 CKPT=$(ls -t $RUN/ms-*$STEP*.ckpt 2>/dev/null | head -1); [ -n "$CKPT" ] || { echo "no ms checkpoint for step $STEP in $RUN"; exit 2; }
 cd $WT/baselines/PixelGen
@@ -28,10 +29,10 @@ n = lambda part: len({m.group(1) for k in sd for m in [re.match(rf"ema_denoiser\
 got = (sd["ema_denoiser.y_pos_embedding"].shape[-1], n("blocks"), n("text_refine_blocks"))
 assert got == (d, nb, nt), f"checkpoint has d, nb, nt = {got}, arguments {(d, nb, nt)}"
 energy = any(k.startswith("ema_denoiser.final_layer.xi_global") for k in sd)
-assert energy == (sys.argv[5] == "energy_sample"), f"checkpoint is energy head: {energy}, config {sys.argv[5]}"
+assert energy == sys.argv[5].startswith("energy"), f"checkpoint is energy head: {energy}, config {sys.argv[5]}"
 PY
 for CALLS in "$@"; do
-  OUT=$RUN/eval_${STEP}_calls${CALLS}_prompt; mkdir -p $OUT; echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) calls=$CALLS" | tee $OUT/ckpt.txt
+  OUT=$RUN/eval_${STEP}_calls${CALLS}_prompt$SUF; mkdir -p $OUT; echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) calls=$CALLS" | tee $OUT/ckpt.txt
   t0=$(date +%s)
   WANDB_MODE=disabled python main.py predict --config configs_h100/lite_ladder_sample.yaml --config configs_h100/$CONFIG.yaml --trainer.devices 8 \
     --trainer.default_root_dir "$OUT/pred" --ckpt_path "$CKPT" --model.diffusion_sampler.init_args.num_steps $CALLS \
