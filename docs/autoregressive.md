@@ -79,6 +79,8 @@ p(x | y) = Π p(patch_i | patch_1 … patch_{i−1}, y)，从左到右、从上�
 
 负责人问“自回归是怎么做的，MAR？”时，我读了 MAR 论文的表 1（ImageNet 256，MAR-L，Diffusion Loss，不用 CFG 的 FID）：从左到右 + 因果 19.23，随机顺序 + 因果 13.07，随机顺序 + 双向 3.43，MAR 默认 3.50。我们的第一版正好是 Diffusion Loss 几行里最差的组合。我之前只读了摘要，这是我的错。所以诊断加上 MAR 的顺序和注意力。
 
+负责人 2026-11-04 再次强调：我们不用 CFG，默认只有 cond 这个 branch。所以下面只看不用 CFG 的数字。MAR 1.55、GRN 1.81、FractalMAR 6.15 都用了 CFG，不能和我们比较。
+
 我这次读了全文的表，设计落在这些格子里（MAR 论文，MAR-L，400 epoch，不用 CFG 的 FID）：
 
 - 顺序和注意力（表 1）：base 是“从左到右 + 因果”，19.23。random 是“随机 + 双向，每步多个 token”，3.50。
