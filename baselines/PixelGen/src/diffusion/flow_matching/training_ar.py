@@ -19,7 +19,8 @@ class ARTrainer(BaseTrainer):
         eta = torch.randn_like(patches)
         q = tau[..., None] * patches + (1 - tau[..., None]) * eta
         y_mask = metadata.get("y_mask") if isinstance(metadata, dict) else None
-        hat = net(patches, y, y_mask=y_mask, q=q, tau=tau).float()
+        context = patches + net.context_noise * torch.randn_like(patches) if net.context_noise else patches   # what the backbone reads; the target stays clean
+        hat = net(context, y, y_mask=y_mask, q=q, tau=tau).float()
         # v_hat - v = ((hat - q) - (patches - q)) / (1 - tau), with the official clamp
         per_value = ((hat - patches) / (1 - tau[..., None]).clamp_min(self.t_eps)) ** 2
         fm = per_value.mean()

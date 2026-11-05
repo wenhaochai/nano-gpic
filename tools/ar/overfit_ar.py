@@ -7,8 +7,10 @@
   distinct  share of training images that are the nearest of any sample
   late      the same distances on the last quarter of the patches (rows 192 to 255), where the image is already decided: nn_late to the nearest training image of the whole sample, tf_late when each patch is drawn given the true patches before it (teacher forcing). tf_late far below nn_late means that errors grow along the chain. The reverse does not hold on early patches: a good model may draw another image's patch there, so only the late rows are read this way.
 Samples: 128 at the checks, 8 N (at least 64) at the last step. Raw weights.
-usage: overfit_ar.py <N> <out dir> [steps] [seed]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
+Rescue, at the last step: the first k true patches of a training image are given, and the chain draws the rest. late_source is the rms on the last quarter of the rows to that image, and late_nearest to the nearest training image of the whole result. If one true patch brings late_nearest down, the first draws are at fault; if many true patches do not, errors grow along the chain. head_steps_128 repeats k = 0 with four times the head's steps.
+usage: overfit_ar.py <N> <out dir> [steps] [seed] [--context-noise S] [--head-width W] [--head-depth D] [--name TAG]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
 """
+import argparse
 import glob
 import io
 import json
@@ -25,12 +27,20 @@ from src.data.dataset.augmentation import center_crop_arr
 from src.diffusion.flow_matching.training_ar import ARTrainer
 from src.models.transformer.AR_JiT import ARJiT
 
-N, OUT = int(sys.argv[1]), sys.argv[2]
-STEPS = int(sys.argv[3]) if len(sys.argv) > 3 else 24000
-SEED = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+ap = argparse.ArgumentParser()
+ap.add_argument("N", type=int)
+ap.add_argument("out")
+ap.add_argument("steps", type=int, nargs="?", default=24000)
+ap.add_argument("seed", type=int, nargs="?", default=0)
+ap.add_argument("--context-noise", type=float, default=0.0)
+ap.add_argument("--head-width", type=int, default=1024)
+ap.add_argument("--head-depth", type=int, default=3)
+ap.add_argument("--name", default=None)
+ARGS = ap.parse_args()
+N, OUT, STEPS, SEED = ARGS.N, ARGS.out, ARGS.steps, ARGS.seed
 CHECKS = sorted({s for s in (1000, 4000, 8000, 16000) if s < STEPS} | {STEPS})
 WC = "/scratch/gpfs/GROUP/USER"
-TAG = f"n{N}" + (f"_s{SEED}" if SEED else "")
+TAG = ARGS.name or f"n{N}" + (f"_s{SEED}" if SEED else "")
 os.makedirs(OUT, exist_ok=True)
 torch.manual_seed(SEED)
 dev = "cuda"
@@ -49,13 +59,14 @@ def load_images(n):
 
 
 imgs = load_images(N)
+assert (torch.nn.functional.unfold(imgs[:1], kernel_size=16, stride=16)[0, :, 0] == imgs[0, :, :16, :16].flatten()).all(), "first_patches relies on this order"
 null = torch.load(glob.glob(f"{WC}/data/gpic/train_emb_qwen3_1.7b/null.pt")[0], map_location=dev, weights_only=True).float()
 B, T = 32, 8
 y = torch.zeros(B, T, 2048, device=dev, dtype=torch.bfloat16)
 y[:, 0] = null[0, 0].bfloat16()
 mask = torch.zeros(B, T, dtype=torch.bool, device=dev)
 mask[:, 0] = True
-net = ARJiT(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num_blocks=9, num_text_blocks=2, patch_size=16, txt_embed_dim=2048, txt_max_length=320, bottleneck_dim=256, head_width=1024, head_depth=3, head_steps=32).to(dev)
+net = ARJiT(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num_blocks=9, num_text_blocks=2, patch_size=16, txt_embed_dim=2048, txt_max_length=320, bottleneck_dim=256, head_width=ARGS.head_width, head_depth=ARGS.head_depth, head_steps=32, context_noise=ARGS.context_noise).to(dev)
 net.compile()
 tr = ARTrainer(P_mean=-0.8, P_std=1.6, t_eps=0.05, null_condition_p=0.0).to(dev)
 opt = torch.optim.AdamW(net.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0, fused=True)
@@ -83,9 +94,38 @@ def teacher_forced():
     x = imgs[torch.randint(N, (B,), device=dev)]
     tokens = torch.nn.functional.unfold(x, kernel_size=16, stride=16).transpose(1, 2)
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        z = net(tokens, y, y_mask=mask).float()
+        context = tokens + net.context_noise * torch.randn_like(tokens)
+        z = net(context, y, y_mask=mask).float()
         drawn = net.draw_patch(z.reshape(-1, z.shape[-1])).view(tokens.shape)
     return ((drawn[:, 192:] - tokens[:, 192:]) ** 2).mean(dim=(1, 2)).sqrt().mean().item()
+
+
+@torch.no_grad()
+def rescue(k, batches=2):
+    """The chain from k true patches: rms on the last quarter of the rows to the source image, and to the nearest training image of the whole result."""
+    src, nearest = [], []
+    for _ in range(batches):
+        x = imgs[torch.randint(N, (B,), device=dev)]
+        tokens = torch.nn.functional.unfold(x, kernel_size=16, stride=16).transpose(1, 2)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            g = net.ar_sample(y, mask, prefix=tokens[:, :k]).float()
+        src.append(((g[:, :, 192:] - x[:, :, 192:]) ** 2).mean(dim=(1, 2, 3)).sqrt())
+        idx = torch.cdist(g.flatten(1), imgs.flatten(1)).argmin(1)
+        nearest.append(((g[:, :, 192:] - imgs[idx][:, :, 192:]) ** 2).mean(dim=(1, 2, 3)).sqrt())
+    return torch.cat(src).mean().item(), torch.cat(nearest).mean().item()
+
+
+@torch.no_grad()
+def first_patches():
+    """Each training image's first patch against draws of the first patch: is the first draw on a true first patch?"""
+    true = imgs[:, :, :16, :16].flatten(1)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        z = net(torch.zeros(B, net.num_patches, net.patch_dim, device=dev), y, y_mask=mask)[:, 0].float()
+        draws = torch.cat([net.draw_patch(z) for _ in range(16)])
+    d = torch.cdist(draws, true).min(1)[0] / 768 ** 0.5
+    between = torch.cdist(true, true)
+    between.fill_diagonal_(float("inf"))
+    return dict(first_draw_rms=d.mean().item(), first_draw_near=(d < 0.1).float().mean().item(), first_true_gap=(between.min(1)[0] / 768 ** 0.5).median().item())
 
 
 rows = []
@@ -111,6 +151,14 @@ for step in range(1, STEPS + 1):
         rows.append(row)
         json.dump(rows, open(f"{OUT}/{TAG}.json", "w"))
         print(TAG, {k: round(v, 4) if isinstance(v, float) else v for k, v in row.items()}, flush=True)
+diag = dict(first_patches())
+for k in (0, 1, 4, 16, 64, 128, 192):
+    diag[f"late_source_k{k}"], diag[f"late_nearest_k{k}"] = rescue(k)
+net.head_steps = 128
+diag["late_source_k0_head_steps_128"], diag["late_nearest_k0_head_steps_128"] = rescue(0, batches=1)
+net.head_steps = 32
+json.dump(diag, open(f"{OUT}/{TAG}_rescue.json", "w"), indent=1)
+print(TAG, "rescue", {k: round(v, 4) for k, v in diag.items()}, flush=True)
 g = sample(32)[:16]
 grid = ((g.clamp(-1, 1) + 1) * 127.5).byte().permute(0, 2, 3, 1).cpu().numpy()
 Image.fromarray(np.concatenate([np.concatenate(list(grid[i:i + 8]), 1) for i in (0, 8)], 0)).save(f"{OUT}/{TAG}.png")

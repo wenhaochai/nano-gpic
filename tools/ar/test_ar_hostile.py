@@ -160,6 +160,51 @@ none = [n for n, p in c.named_parameters() if p.requires_grad and p.grad is None
 assert not none, none
 print("10. compiled forward on both paths, and every parameter has a gradient through it")
 
+# 12. context_noise. At 0 the trainer gives the first design's loss on the same RNG stream. Above 0 the backbone reads noisy patches, the target stays clean, causality holds, and sampling returns clean drawn patches.
+plain, noisy = wake(ARJiT(**kw)), None
+tr0 = ARTrainer(null_condition_p=0.0)
+torch.manual_seed(9)
+l0 = tr0._impl_trainstep(plain, None, None, x, y, {"y_mask": mask})["loss"].item()
+torch.manual_seed(9)
+l1 = tr0._impl_trainstep(plain, None, None, x, y, {"y_mask": mask})["loss"].item()
+assert l0 == l1
+noisy = wake(ARJiT(**kw, context_noise=0.3))
+seen2 = {}
+orig = ARJiT.forward
+def spy_forward(self, tokens, y, y_mask=None, q=None, tau=None):
+    seen2["tokens"] = tokens.clone()
+    return orig(self, tokens, y, y_mask=y_mask, q=q, tau=tau)
+ARJiT.forward = spy_forward
+tr0._impl_trainstep(noisy, None, None, x, y, {"y_mask": mask})
+clean = torch.nn.functional.unfold(x, kernel_size=16, stride=16).transpose(1, 2)
+gap = (seen2["tokens"] - clean)
+assert abs(gap.std().item() - 0.3) < 0.02, gap.std().item()
+tr0._impl_trainstep(plain, None, None, x, y, {"y_mask": mask})
+assert (seen2["tokens"] == clean).all(), "context_noise = 0 must read the clean patches"
+torch.manual_seed(3)
+img = noisy.ar_sample(y, mask)
+read = seen2["tokens"]   # the last forward's context: all but the last patch are filled
+out = torch.nn.functional.unfold(img, kernel_size=16, stride=16).transpose(1, 2)
+assert img.abs().max() <= 1, "returned patches are the clean draws"
+assert abs((read[:, :15] - out[:, :15]).std().item() - 0.3) < 0.03
+ARJiT.forward = orig
+print("12. context_noise: the backbone reads noise, the target and the output stay clean")
+
+# 13. prefix: the first k patches come back unchanged, the draw depends on them, and k = 0 and None agree on one seed.
+pre = torch.rand(2, 5, P) * 2 - 1
+img = net.ar_sample(y, mask, prefix=pre)
+back = torch.nn.functional.unfold(img, kernel_size=16, stride=16).transpose(1, 2)
+assert (back[:, :5] - pre).abs().max() < 1e-5
+torch.manual_seed(4)
+a0 = net.ar_sample(y, mask)
+torch.manual_seed(4)
+a1 = net.ar_sample(y, mask, prefix=torch.zeros(2, 0, P))
+assert (a0 == a1).all()
+torch.manual_seed(4)
+a2 = net.ar_sample(y, mask, prefix=pre)
+assert (a2 != a0).any()
+print("13. prefix: returned unchanged, and it changes the rest")
+
 # 11. Hand count of the head's FLOPs at d640, 2 per multiply-add, against FlopCounterMode's 9.87 G.
 w, D = 1024, 640
 per = 768 * w + D * w + 256 * w + w * w + 3 * (2 * w * w + 3 * w * w) + w * 768

@@ -47,10 +47,11 @@ class TokenFlowHead(nn.Module):
 class ARJiT(JiT_T2I):
     is_ar = True
 
-    def __init__(self, head_width=1024, head_depth=3, head_steps=32, t_eps=0.05, **kwargs):
+    def __init__(self, head_width=1024, head_depth=3, head_steps=32, t_eps=0.05, context_noise=0.0, **kwargs):
+        """context_noise: Gaussian noise of this std on the patches that the backbone reads, in training and at sampling, so that a drawn patch with small errors is like the inputs it trained on (the conditioning augmentation of Cascaded Diffusion). Targets stay clean. 0 is the first design."""
         super().__init__(**kwargs)
         self.patch_dim = self.in_channels * self.patch_size ** 2
-        self.head_steps, self.t_eps = head_steps, t_eps
+        self.head_steps, self.t_eps, self.context_noise = head_steps, t_eps, context_noise
         self.z_norm = self.final_layer.norm_final
         del self.final_layer   # the output is the head's; an unused parameter would stop DDP
         self.bos = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
@@ -101,12 +102,21 @@ class ARJiT(JiT_T2I):
         return q.clamp(-1, 1)   # a drawn patch goes back in as input, and real inputs lie in [-1, 1]
 
     @torch.no_grad()
-    def ar_sample(self, y, y_mask=None):
-        """Images [B, C, H, W] for captions y: one patch per step, each drawn from its distribution given the patches before it. The whole sequence goes through the backbone at each step: the mask hides what is not drawn yet, and the shape stays fixed for the compiled graph."""
+    def ar_sample(self, y, y_mask=None, prefix=None):
+        """Images [B, C, H, W] for captions y: one patch per step, each drawn from its distribution given the patches before it. The whole sequence goes through the backbone at each step: the mask hides what is not drawn yet, and the shape stays fixed for the compiled graph.
+        prefix [B, k, P] (diagnostics): the first k patches are given, and the rest are drawn. They are returned unchanged."""
         B, N = y.shape[0], self.num_patches
-        tokens = torch.zeros(B, N, self.patch_dim, device=y.device)
-        for i in range(N):
-            z = self(tokens, y, y_mask=y_mask)[:, i].float()
-            tokens[:, i] = self.draw_patch(z)
+        tokens = torch.zeros(B, N, self.patch_dim, device=y.device)   # what comes out
+        context = torch.zeros(B, N, self.patch_dim, device=y.device)  # what the backbone reads
+        k = 0
+        if prefix is not None:
+            k = prefix.shape[1]
+            tokens[:, :k] = prefix
+            context[:, :k] = prefix + self.context_noise * torch.randn_like(prefix)
+        for i in range(k, N):
+            z = self(context, y, y_mask=y_mask)[:, i].float()
+            drawn = self.draw_patch(z)
+            tokens[:, i] = drawn
+            context[:, i] = drawn + self.context_noise * torch.randn_like(drawn)
         side = int(N ** 0.5) * self.patch_size
         return self.unpatchify(tokens, side, side)
