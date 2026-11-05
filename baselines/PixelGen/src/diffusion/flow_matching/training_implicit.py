@@ -13,10 +13,11 @@ from src.diffusion.flow_matching.training_JiT import JiTTrainer, time_shift_fn
 
 
 class ImplicitJiTTrainer(JiTTrainer):
-    def __init__(self, *args, samples=2, beta=1.0, **kwargs):
+    def __init__(self, *args, samples=2, beta=1.0, lam=1.0, low_t_p=0.0, low_t_max=0.05, **kwargs):
         super().__init__(*args, **kwargs)
         assert samples >= 2 and 0 < beta < 2, (samples, beta)
-        self.samples, self.beta = samples, beta
+        self.samples, self.beta, self.lam = samples, beta, lam   # lam = 1 is strictly proper; De Bortoli et al. (arXiv 2502.02483) find lam < 1 better at many steps
+        self.low_t_p, self.low_t_max = low_t_p, low_t_max   # share of images with t uniform below low_t_max, where a small set has a posterior over many images
         self._print_every, self._calls = int(os.environ.get("GPIC_IMPLICIT_PRINT") or 0), 0   # smoke test only: a host sync on these steps
 
     def _impl_trainstep(self, net, ema_net, solver, x, y, metadata=None):
@@ -26,6 +27,8 @@ class ImplicitJiTTrainer(JiTTrainer):
         else:
             base_t = torch.rand(B, device=x.device, dtype=torch.float32)
         t = time_shift_fn(base_t, self.timeshift)
+        if self.low_t_p:
+            t = torch.where(torch.rand(B, device=x.device) < self.low_t_p, torch.rand(B, device=x.device) * self.low_t_max, t)
         noise = torch.randn_like(x)
         x_t = self.scheduler.alpha(t) * x + noise * self.scheduler.sigma(t)
         y_mask = metadata.get("y_mask") if isinstance(metadata, dict) else None
@@ -36,7 +39,7 @@ class ImplicitJiTTrainer(JiTTrainer):
         to_data = ((w * (g - x[:, None])) ** 2).mean((2, 3, 4)).add(1e-8).pow(half).mean(1)               # [B]
         i, j = torch.triu_indices(self.samples, self.samples, 1, device=x.device)
         between = ((w * (g[:, i] - g[:, j])) ** 2).mean((2, 3, 4)).add(1e-8).pow(half).mean(1)            # [B]
-        score = to_data - 0.5 * between
+        score = to_data - 0.5 * self.lam * between
         if self._print_every:
             self._calls += 1
             if self._calls % self._print_every == 0:

@@ -8,8 +8,8 @@
 #SBATCH --comment=fetchable
 #FETCHABLE
 # Test E (docs/energy_head.md): the energy head against the point model, overfit on N = 256 real images with the null caption, 24000 steps, one arm per GPU:
-# point seed 0 (control; its effective_images was never measured); energy head seed 0 and seed 1; the implicit model in the repo (xi_block = 6, M = 2) seed 0.
-# Reading rule, set before the run: docs/energy_head.md, section 读法. The threshold is covered >= 0.7594 on 2 seeds.
+# point (control; its effective_images was never measured); energy head at lambda 1; at lambda 0.5; at lambda 1 with 10% of the images at t below 0.05. All seed 0: a second seed only for an arm that looks better than the point model.
+# Reading rule, set before the run: docs/energy_head.md, section 读法. The threshold is covered >= 0.7594.
 # Expected: about 14 min for the slowest arm (implicit), an estimate from w1113's H100 timings and an A40 timing of each arm's train step (point 74.9 ms, energy 82.5, implicit 97.5): no H100 was free to time it. The implicit arm trains 32% more FLOPs per step, so the other GPUs idle about 3 min at the end.
 # Code: the worktree gpic-wt/energy_head.
 set -o pipefail
@@ -26,15 +26,15 @@ cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD WANDB_MODE=disabled TORCHINDUCTOR_COMPILE_THREADS=8
 IFS=, read -r -a DEV <<<"${CUDA_VISIBLE_DEVICES:-0,1,2,3}"   # a guest on part of a node sees its own GPUs here
 (( ${#DEV[@]} >= 4 )) || { echo "${#DEV[@]} GPUs"; exit 2; }
-ARMS=("point 0" "energy 0" "energy 1" "implicit 0")
+ARMS=("point 0 1 0" "energy 0 1 0" "energy 0 0.5 0" "energy 0 1 0.1")
 g=0
 for arm in "${ARMS[@]}"; do
   set -- $arm
-  CUDA_VISIBLE_DEVICES=${DEV[$g]} OMP_NUM_THREADS=4 timeout -k 60 1000 python $WT/tools/energy/overfit_energy.py $1 256 $OUT 24000 $2 > $OUT/n256_$1_s$2.log 2>&1 &
+  CUDA_VISIBLE_DEVICES=${DEV[$g]} OMP_NUM_THREADS=4 timeout -k 60 950 python $WT/tools/energy/overfit_energy.py $1 256 $OUT 24000 $2 $3 $4 > $OUT/n256_$1_s$2_l$3_t$4.log 2>&1 &
   g=$((g + 1))
 done
 fail=0
 for p in $(jobs -p); do wait $p || fail=1; done
-for arm in "${ARMS[@]}"; do set -- $arm; tail -qn 2 $OUT/n256_$1_s$2.log | cut -c1-500; done
+for arm in "${ARMS[@]}"; do set -- $arm; tail -qn 3 $OUT/n256_$1_s$2_l$3_t$4.log | cut -c1-500; done
 echo "energy overfit done fail=$fail $OUT"
 exit $fail

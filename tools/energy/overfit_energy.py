@@ -38,9 +38,11 @@ ARM, N, OUT = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 assert ARM in ("point", "energy", "implicit"), ARM
 STEPS = int(sys.argv[4]) if len(sys.argv) > 4 else 24000
 SEED = int(sys.argv[5]) if len(sys.argv) > 5 else 0
+LAM = float(sys.argv[6]) if len(sys.argv) > 6 else 1.0
+LOW_T = float(sys.argv[7]) if len(sys.argv) > 7 else 0.0
 EVALS = sorted({s for s in (1000, 2000, 4000, 8000, 16000) if s < STEPS} | {STEPS})
 WC = "/scratch/gpfs/GROUP/USER"
-TAG = f"n{N}_{ARM}_s{SEED}"
+TAG = f"n{N}_{ARM}_s{SEED}" + (f"_lam{LAM}" if LAM != 1 else "") + (f"_low{LOW_T}" if LOW_T else "")
 os.makedirs(OUT, exist_ok=True)
 torch.manual_seed(SEED)
 dev = "cuda"
@@ -69,7 +71,7 @@ kw = {"point": {}, "energy": dict(head_width=352), "implicit": dict(xi_dim=64, x
 net = JiT_T2I(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num_blocks=9, num_text_blocks=2, patch_size=16, txt_embed_dim=2048, txt_max_length=320, bottleneck_dim=256, **kw).to(dev)
 net.compile()
 tkw = dict(scheduler=LinearScheduler(), loss_weight_fn=constant, lognorm_t=True, timeshift=1.0, P_mean=-0.8, P_std=0.8, t_eps=0.05, null_condition_p=0.0)
-tr = (JiTTrainer(**tkw) if ARM == "point" else ImplicitJiTTrainer(**tkw, samples=2, beta=1.0)).to(dev)
+tr = (JiTTrainer(**tkw) if ARM == "point" else ImplicitJiTTrainer(**tkw, samples=2, beta=1.0, lam=LAM, low_t_p=LOW_T)).to(dev)
 opt = torch.optim.AdamW(net.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0, fused=True)
 
 
@@ -103,6 +105,28 @@ def measure(g):
                 distinct=idx.unique().numel() / N, effective_images=entropy.exp().item(), pixel_std=g.std(0).mean().item())
 
 
+@torch.no_grad()
+def posterior_probe(times=(0.0, 0.005, 0.01, 0.02, 0.05), inputs=16, draws=64):
+    """At fixed t, for x_t from training images: the effective number of images of the exact posterior over this set, and of the model's x_hat over repeated calls on one x_t (nearest image, no threshold). A deterministic model gives 1. On 256 images the exact posterior is one image from t = 0.02 on (review 2026-11-04), so the choice of image happens below it."""
+    out = {}
+    for t_ in times:
+        exact, model, near = [], [], []
+        for _ in range(inputs):
+            x_t = t_ * imgs[torch.randint(N, (1,), device=dev)] + (1 - t_) * torch.randn(1, 3, 256, 256, device=dev)
+            logp = -((x_t - t_ * imgs) ** 2).flatten(1).sum(1) / (2 * (1 - t_) ** 2)
+            p = (logp - logp.max()).exp()
+            p = p / p.sum()
+            exact.append((-(p[p > 0] * p[p > 0].log()).sum()).exp().item())
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                g = torch.cat([net(x_t.expand(B, -1, -1, -1), torch.full((B,), t_, device=dev), y, y_mask=mask).float() for _ in range(0, draws, B)])[:draws]
+            nn, idx = nearest(g)
+            q = torch.bincount(idx, minlength=N).float() / len(idx)
+            model.append((-(q[q > 0] * q[q > 0].log()).sum()).exp().item())
+            near.append((nn < 0.1).float().mean().item())
+        out[str(t_)] = dict(exact=float(np.mean(exact)), model=float(np.mean(model)), near=float(np.mean(near)))
+    return out
+
+
 rows = []
 t0 = time.time()
 ema = {}
@@ -132,6 +156,9 @@ for step in range(1, STEPS + 1):
         rows.append(row)
         json.dump(rows, open(f"{OUT}/{TAG}.json", "w"))
         print(TAG, {k: round(v, 4) if isinstance(v, float) else v for k, v in row.items()}, flush=True)
+probe = posterior_probe()
+json.dump(probe, open(f"{OUT}/{TAG}_probe.json", "w"), indent=1)
+print(TAG, "probe", {k: {a: round(b, 3) for a, b in v.items()} for k, v in probe.items()}, flush=True)
 (d50, i50), (d8, i8) = nearest(g50), nearest(g8)
 torch.save(dict(calls50_index=i50.cpu(), calls50_dist=d50.cpu(), calls8_index=i8.cpu(), calls8_dist=d8.cpu()), f"{OUT}/{TAG}_nearest.pt")
 torch.save({k: v.cpu() for k, v in net.state_dict().items()}, f"{OUT}/{TAG}.pt")
