@@ -232,3 +232,21 @@ MAR 顺序的权重（种子 0），N = 256，每个设置 2048 个样本。
 6. sweep8 的 stray 和 first64 差不多，但 near 低。它重抽了全部 token，可能给每个 patch 都加了小误差（nn_rms 高 0.008）。这也没有测量。
 
 一个要测的假设：散落 patch 和抽图偏向可能是同一个原因，即模型在已知 token 很少时不够跟随已知 token。准确的链式法则下，两者都不应该出现。
+
+## 最接近的工作（读了表，2026-11-04）
+
+| 工作 | 做法 | 表里的数字（ImageNet 256） |
+|---|---|---|
+| Token-Critic（Lezama 等，ECCV 2022，arXiv 2209.04439） | 每步用另外训练的网络选要重新遮挡的 token，不受上一步遮挡的限制，所以能撤销之前的决定 | 表 1，无外部分类器：MaskGIT FID 6.56，precision 0.79，recall 0.48；加 Token-Critic 4.69，0.76，0.53。18 步，每步 2 次前向 |
+| TensorAR（ICLR 2026，arXiv 2505.16324） | 相邻步的 token 窗口重叠，后面的预测修改前面的。离散 token，要改训练，没有测 MAR | LlamaGEN-B：FID 5.46 到 4.71，recall 0.45 到 0.45。LlamaGEN-L：3.80 到 2.78，0.52 到 0.56。页面没有说明 CFG |
+| Nitro-AR（AMD 博客） | 指出全遮挡的第一步，主干输出对同一提示是固定的，多样性受限。用缩略图编码的全局 token 做起点 | 没有多样性的测量 |
+| BERT as MRF（Wang 和 Cho，2019；kexue.fm/archives/8119） | 掩码模型加 Gibbs 采样，用于文本 | 没有图像的数字 |
+| DPC（Lezama 等，ICLR 2023） | 只读到摘要：校正步用学到的离散 MCMC，缓解并行抽样累积的错误 | 没读到全文：OpenReview 要浏览器验证 |
+
+我们的 first64 所在的格子：重新遮挡加重新抽样这一类。不同点：不训练判别网络，按抽样顺序选 token；token 连续，由 flow head 抽；只在结束时做一次，不是每步都做；在像素空间。
+
+对我们的提示：
+
+1. Token-Critic 的表说明，在真实数据的离散 token 上，校正同时降低 FID、提高 recall，代价是 precision 下降 0.03。
+2. 我们的 first64 不改变抽到哪张图（99.4% 到 99.9% 不变），所以它在过拟合测试里没有提高 distinct。它能否提高真实数据上的 recall，没有测。
+3. 抽图偏向还没有对应的办法。Nitro-AR 的全局 token 是一个方向，但它没有给出测量。
