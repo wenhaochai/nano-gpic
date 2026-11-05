@@ -268,6 +268,37 @@ res["loss"].backward()
 assert not [n for n, p in c2.named_parameters() if p.requires_grad and p.grad is None]
 print("14. random order: no leak, loss on masked tokens, each token drawn once, compiled path")
 
+# 18. The sampler variants through ar_sample, and the share of batches at few known tokens.
+torch.manual_seed(8)
+v_first = wake(ARJiT(**kw, order="random", ar_steps=64, redraw_first=8))
+calls_first = []
+keep_redraw = ARJiT.redraw
+def spy_redraw(self, tokens, pick, y, y_mask=None):
+    calls_first.append(pick.sum(1).tolist())
+    return keep_redraw(self, tokens, pick, y, y_mask)
+ARJiT.redraw = spy_redraw
+img_first = v_first.ar_sample(y, mask)
+ARJiT.redraw = keep_redraw
+assert calls_first == [[8, 8]] and img_first.shape == (2, 3, 64, 64)
+v_eta = wake(ARJiT(**kw, order="random", ar_steps=64, eta=2.0))
+assert v_eta.ar_sample(y, mask).shape == (2, 3, 64, 64)
+few = ARTrainer(null_condition_p=0.0, few_known_p=0.5, few_known_max=1)
+seen_known = []
+keep_fw = ARJiT.forward
+def spy_known2(self, tokens, y, y_mask=None, q=None, tau=None, known=None):
+    seen_known.append(known.sum(1).tolist())
+    return keep_fw(self, tokens, y, y_mask=y_mask, q=q, tau=tau, known=known)
+ARJiT.forward = spy_known2
+tiny = wake(ARJiT(**kw, order="random", ar_steps=6))
+xx = torch.rand(2, 3, 64, 64) * 2 - 1
+for _ in range(120):
+    few._impl_trainstep(tiny, None, None, xx, y, {"y_mask": mask})
+ARJiT.forward = keep_fw
+assert all(a == b for a, b in seen_known), "one known count per batch"
+share_few = sum(a <= 1 for a, _ in seen_known) / len(seen_known)
+assert 0.45 < share_few < 0.85, share_few   # on 16 tokens the MAR rule alone gives about 0.26 at 1 known or fewer, so 0.5 + 0.5 x 0.26 = 0.63
+print("18. ar_sample variants; few_known: share of batches at 1 known or fewer", round(share_few, 2))
+
 # 17. sample_eta: at eta = 0 the schedule of known counts equals _sample_random's, every token gets drawn once and the head draws N per image. At eta > 0 the counts after each step still follow the schedule, tokens go back and are drawn again, nothing stays masked at the end, and the backbone calls stay ar_steps.
 re = wake(ARJiT(**kw, order="random", ar_steps=64))
 log_known, log_pick = [], []

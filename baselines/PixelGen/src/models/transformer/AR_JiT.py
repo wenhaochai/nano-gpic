@@ -49,7 +49,7 @@ class TokenFlowHead(nn.Module):
 class ARJiT(JiT_T2I):
     is_ar = True
 
-    def __init__(self, head_width=1024, head_depth=3, head_steps=32, t_eps=0.05, context_noise=0.0, order="raster", ar_steps=64, temperature=1.0, **kwargs):
+    def __init__(self, head_width=1024, head_depth=3, head_steps=32, t_eps=0.05, context_noise=0.0, order="raster", ar_steps=64, temperature=1.0, eta=0.0, redraw_first=0, **kwargs):
         """context_noise: Gaussian noise of this std on the patches that the backbone reads, in training and at sampling, so that a drawn patch with small errors is like the inputs it trained on (the conditioning augmentation of Cascaded Diffusion). Targets stay clean. 0 is the first design."""
         super().__init__(**kwargs)
         self.patch_dim = self.in_channels * self.patch_size ** 2
@@ -57,7 +57,7 @@ class ARJiT(JiT_T2I):
         self.z_norm = self.final_layer.norm_final
         del self.final_layer   # the output is the head's; an unused parameter would stop DDP
         assert order in ("raster", "random"), order
-        self.order, self.ar_steps = order, ar_steps
+        self.order, self.ar_steps, self.eta, self.redraw_first = order, ar_steps, eta, redraw_first   # eta and redraw_first choose the sampler of ar_sample, in random order
         if order == "raster":
             self.bos = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
             self.register_buffer("causal", torch.tril(torch.ones(self.num_patches, self.num_patches, dtype=torch.bool)), persistent=False)
@@ -122,6 +122,15 @@ class ARJiT(JiT_T2I):
         """Images [B, C, H, W] for captions y: one patch per step, each drawn from its distribution given the patches before it. The whole sequence goes through the backbone at each step: the mask hides what is not drawn yet, and the shape stays fixed for the compiled graph.
         prefix [B, k, P] (diagnostics): the first k patches are given, and the rest are drawn. They are returned unchanged."""
         if self.order == "random":
+            if self.eta and prefix is None:
+                return self.sample_eta(y, y_mask, eta=self.eta)[0]
+            if self.redraw_first and prefix is None:
+                image, order = self._sample_random(y, y_mask, return_order=True)
+                N, side = self.num_patches, image.shape[-1]
+                rank = torch.zeros_like(order)
+                rank.scatter_(1, order, torch.arange(N - 1, -1, -1, device=y.device).repeat(y.shape[0], 1))   # 0 = drawn first
+                tokens = torch.nn.functional.unfold(image, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
+                return self.unpatchify(self.redraw(tokens, rank < self.redraw_first, y, y_mask), side, side)
             return self._sample_random(y, y_mask, prefix)
         B, N = y.shape[0], self.num_patches
         tokens = torch.zeros(B, N, self.patch_dim, device=y.device)   # what comes out

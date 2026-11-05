@@ -39,9 +39,10 @@ ap.add_argument("--head-width", type=int, default=1024)
 ap.add_argument("--head-depth", type=int, default=3)
 ap.add_argument("--name", default=None)
 ap.add_argument("--order", default="raster", choices=["raster", "random"])
+ap.add_argument("--few-known", type=float, default=0.0)
 ARGS = ap.parse_args()
 N, OUT, STEPS, SEED = ARGS.N, ARGS.out, ARGS.steps, ARGS.seed
-CHECKS = sorted({s for s in (1000, 4000, 8000, 16000) if s < STEPS} | {STEPS})
+CHECKS = sorted({s for s in (1000, 4000, 8000, 16000, 24000, 32000, 40000) if s < STEPS} | {STEPS})
 WC = "/scratch/gpfs/GROUP/USER"
 TAG = ARGS.name or f"n{N}" + (f"_s{SEED}" if SEED else "")
 os.makedirs(OUT, exist_ok=True)
@@ -71,7 +72,7 @@ mask = torch.zeros(B, T, dtype=torch.bool, device=dev)
 mask[:, 0] = True
 net = ARJiT(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num_blocks=9, num_text_blocks=2, patch_size=16, txt_embed_dim=2048, txt_max_length=320, bottleneck_dim=256, head_width=ARGS.head_width, head_depth=ARGS.head_depth, head_steps=32, context_noise=ARGS.context_noise, order=ARGS.order).to(dev)
 net.compile()
-tr = ARTrainer(P_mean=-0.8, P_std=1.6, t_eps=0.05, null_condition_p=0.0).to(dev)
+tr = ARTrainer(P_mean=-0.8, P_std=1.6, t_eps=0.05, few_known_p=ARGS.few_known, null_condition_p=0.0).to(dev)
 opt = torch.optim.AdamW(net.parameters(), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.0, fused=True)
 
 

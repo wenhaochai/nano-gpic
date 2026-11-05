@@ -2,3 +2,6 @@
 model:
   denoiser:
     class_path: src.models.transformer.AR_JiT.ARJiT
+    init_args:
+      order: random
+      ar_steps: 64

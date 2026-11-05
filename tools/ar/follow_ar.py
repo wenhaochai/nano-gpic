@@ -11,7 +11,7 @@ At k = 0 also which training image each draw lies nearest to:
   baseline_*              the same statistics for true patches of uniformly chosen images, plus noise of the same median rms as any_rms
   *_hit                   the same, only for draws within 0.2 of a training patch, against a baseline with as many draws. An error of another shape than the baseline's white noise can favour central patches, and these counts do not read that as a preference (review 2026-11-04)
 <out>_counts0.pt holds the counts; <out>_samples.png holds 16 samples, each row as drawn followed by a row with the first 64 tokens drawn again.
-usage: follow_ar.py <weights .pt> <N> <out .json> <sampling seed>    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
+usage: follow_ar.py <weights .pt> <N> <out .json> <sampling seed> [head depth]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
 """
 import io
 import json
@@ -103,6 +103,7 @@ def main():
     from src.models.transformer.AR_JiT import ARJiT
 
     W, N, OUT, SEED = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+    HEAD_DEPTH = int(sys.argv[5]) if len(sys.argv) > 5 else 3
     WC = "/scratch/gpfs/GROUP/USER"
     dev = "cuda"
     torch.manual_seed(SEED)
@@ -125,7 +126,7 @@ def main():
     mask[:, 0] = True
     sd = torch.load(W, map_location="cpu", weights_only=True)
     assert any("mask_token" in k for k in sd), "this script is for the random order"
-    net = ARJiT(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num_blocks=9, num_text_blocks=2, patch_size=16, txt_embed_dim=2048, txt_max_length=320, bottleneck_dim=256, head_width=1024, head_depth=3, head_steps=32, order="random", ar_steps=64)
+    net = ARJiT(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num_blocks=9, num_text_blocks=2, patch_size=16, txt_embed_dim=2048, txt_max_length=320, bottleneck_dim=256, head_width=1024, head_depth=HEAD_DEPTH, head_steps=32, order="random", ar_steps=64)
     net.load_state_dict(sd, strict=True)
     net = net.to(dev).eval().requires_grad_(False)
     net.compile()

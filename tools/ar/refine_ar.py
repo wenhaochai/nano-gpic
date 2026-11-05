@@ -5,7 +5,7 @@
   first64   the same with 64
   sweep8    8 steps over a random partition of all tokens into 8 groups of 32: each group is drawn again given the rest
 Metrics of each arm: tools/ar/overfit_ar.py's (near, covered, distinct, nn_rms) and tools/ar/eval_saved_ar.py's robust ones, with each sample's values in <out>_per_sample.pt, and each arm's paired difference from base under "paired". Also, for the base samples, the share of stray patches by draw rank: a patch is stray if its rms to the image with the largest best_share is above 0.2.
-usage: refine_ar.py <weights .pt> <N> <out .json> <sampling seed>    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
+usage: refine_ar.py <weights .pt> <N> <out .json> <sampling seed> [head depth]    Run from baselines/PixelGen with PYTHONPATH=. and one visible GPU.
 """
 import io
 import json
@@ -44,6 +44,7 @@ def paired(per_sample, n_images, resamples=1000):
 
 
 W, N, OUT, SEED = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+HEAD_DEPTH = int(sys.argv[5]) if len(sys.argv) > 5 else 3
 SAMPLES = 8 * N
 WC = "/scratch/gpfs/GROUP/USER"
 dev = "cuda"
@@ -66,7 +67,7 @@ mask = torch.zeros(B, T, dtype=torch.bool, device=dev)
 mask[:, 0] = True
 sd = torch.load(W, map_location="cpu", weights_only=True)
 assert any("mask_token" in k for k in sd), "this script is for the random order"
-net = ARJiT(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num_blocks=9, num_text_blocks=2, patch_size=16, txt_embed_dim=2048, txt_max_length=320, bottleneck_dim=256, head_width=1024, head_depth=3, head_steps=32, order="random", ar_steps=64)
+net = ARJiT(input_size=256, in_channels=3, num_groups=10, hidden_size=640, num_blocks=9, num_text_blocks=2, patch_size=16, txt_embed_dim=2048, txt_max_length=320, bottleneck_dim=256, head_width=1024, head_depth=HEAD_DEPTH, head_steps=32, order="random", ar_steps=64)
 net.load_state_dict(sd, strict=True)
 net = net.to(dev).eval().requires_grad_(False)
 net.compile()

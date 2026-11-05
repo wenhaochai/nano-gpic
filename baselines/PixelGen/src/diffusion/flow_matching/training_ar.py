@@ -10,9 +10,10 @@ from src.diffusion.base.training import BaseTrainer
 
 
 class ARTrainer(BaseTrainer):
-    def __init__(self, P_mean=-0.8, P_std=1.6, t_eps=0.05, min_mask=0.7, **kwargs):
+    def __init__(self, P_mean=-0.8, P_std=1.6, t_eps=0.05, min_mask=0.7, few_known_p=0.0, few_known_max=16, **kwargs):
         super().__init__(**kwargs)
         self.P_mean, self.P_std, self.t_eps, self.min_mask = P_mean, P_std, t_eps, min_mask
+        self.few_known_p, self.few_known_max = few_known_p, few_known_max   # share of batches with a uniform 0 to few_known_max known tokens (w1136: the model locks on after 4 to 8)
 
     def _impl_trainstep(self, net, ema_net, solver, x, y, metadata=None):
         patches = torch.nn.functional.unfold(x, kernel_size=net.patch_size, stride=net.patch_size).transpose(1, 2)
@@ -29,6 +30,8 @@ class ARTrainer(BaseTrainer):
             while rate < self.min_mask:
                 rate = 1 - 0.25 * torch.randn(1).abs().item()
             masked = math.ceil(N * rate)
+            if self.few_known_p and torch.rand(1).item() < self.few_known_p:
+                masked = N - torch.randint(0, self.few_known_max + 1, (1,)).item()
             order = torch.rand(B, N, device=x.device).argsort(dim=1)
             known = torch.ones(B, N, dtype=torch.bool, device=x.device)
             known.scatter_(1, order[:, :masked], False)
