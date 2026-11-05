@@ -268,6 +268,19 @@ res["loss"].backward()
 assert not [n for n, p in c2.named_parameters() if p.requires_grad and p.grad is None]
 print("14. random order: no leak, loss on masked tokens, each token drawn once, compiled path")
 
+# 15. temperature: 1 changes nothing on one seed; below 1 the draws are closer together on a fresh head that has learned nothing but a mean.
+tt = wake(ARJiT(**kw, temperature=1.0))
+torch.manual_seed(3)
+a = tt.draw_patch(torch.zeros(64, 64))
+torch.manual_seed(3)
+base_t = torch.randn(64, 768)   # the same start noise
+tt2 = copy.deepcopy(tt)
+tt2.temperature = 0.5
+torch.manual_seed(3)
+b = tt2.draw_patch(torch.zeros(64, 64))
+assert (a != b).any() and b.std(0).mean() < a.std(0).mean(), (a.std(0).mean(), b.std(0).mean())
+print("15. temperature scales the start noise")
+
 # 11. Hand count of the head's FLOPs at d640, 2 per multiply-add, against FlopCounterMode's 9.87 G.
 w, D = 1024, 640
 per = 768 * w + D * w + 256 * w + w * w + 3 * (2 * w * w + 3 * w * w) + w * 768

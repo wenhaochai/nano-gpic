@@ -49,11 +49,11 @@ class TokenFlowHead(nn.Module):
 class ARJiT(JiT_T2I):
     is_ar = True
 
-    def __init__(self, head_width=1024, head_depth=3, head_steps=32, t_eps=0.05, context_noise=0.0, order="raster", ar_steps=64, **kwargs):
+    def __init__(self, head_width=1024, head_depth=3, head_steps=32, t_eps=0.05, context_noise=0.0, order="raster", ar_steps=64, temperature=1.0, **kwargs):
         """context_noise: Gaussian noise of this std on the patches that the backbone reads, in training and at sampling, so that a drawn patch with small errors is like the inputs it trained on (the conditioning augmentation of Cascaded Diffusion). Targets stay clean. 0 is the first design."""
         super().__init__(**kwargs)
         self.patch_dim = self.in_channels * self.patch_size ** 2
-        self.head_steps, self.t_eps, self.context_noise = head_steps, t_eps, context_noise
+        self.head_steps, self.t_eps, self.context_noise, self.temperature = head_steps, t_eps, context_noise, temperature   # temperature: the scale of the head's start noise, an approximation of MAR's temperature
         self.z_norm = self.final_layer.norm_final
         del self.final_layer   # the output is the head's; an unused parameter would stop DDP
         assert order in ("raster", "random"), order
@@ -111,7 +111,7 @@ class ARJiT(JiT_T2I):
         """One draw from the distribution of one patch given z [B, D]: the head's flow from noise, on a uniform grid, with the last step on x_hat."""
         B, head = z.shape[0], self._fast_head()
         grid = torch.linspace(0, 1, self.head_steps + 1, device=z.device)
-        q = torch.randn(B, self.patch_dim, device=z.device)
+        q = self.temperature * torch.randn(B, self.patch_dim, device=z.device)
         for j in range(self.head_steps):
             hat = head(q, grid[j].repeat(B), z).float()
             q = hat if j == self.head_steps - 1 else q + (grid[j + 1] - grid[j]) * (hat - q) / (1 - grid[j]).clamp_min(self.t_eps)
