@@ -2,13 +2,14 @@
 #SBATCH -J gpic-gmflow
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=02:00:00
+#SBATCH --time=02:45:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
 #FETCHABLE
-# GMFlow on the real data (docs/gmflow.md): the Gaussian-mixture head with the transition loss (lambda 0.5) at d640 to C0/8, then FD at C0/16 and C0/8 at 50 calls with
-# each prompt's own noise, for GM-SDE and for the official Euler on the mixture mean. Same compute as the point model w1147 (66816 steps): STEPS is the largest multiple of 128
+# GMFlow on the real data (docs/gmflow.md): the Gaussian-mixture head with the transition loss (lambda 0.5) at d640 to C0/8, then FD at C0/16 and C0/8 with each prompt's own
+# noise, for GM-SDE (the main reading), GM-ODE and the official Euler on the mixture mean, at 50 and at 8 calls (owner 2026-11-05: the two call counts are judged apart).
+# Time: training about 36 min x (1 + r) plus the head's fp32 loss (w1147 trained in 36 min), 12 evaluations of about 2 to 5 min each; 02:45 leaves room. A rerun skips finished parts. Same compute as the point model w1147 (66816 steps): STEPS is the largest multiple of 128
 # with STEPS (1 + r) <= 66816, r = the added forward FLOPs / 34.72 GFLOP (FlopCounterMode, tools/gmflow/test_gmflow.py T9). No caption dropout, same shard order and crop as w1147.
 # usage: run_gmflow.sh <K: 8 | 1>      K = 1 is the control that isolates the mixture from the change of loss weighting (digest section 12, note 4).
 # Other samplers and call counts afterwards: jobs/eval_gmflow.sh. Code: this worktree, gpic-wt/gmflow, with no local changes.
@@ -36,11 +37,13 @@ echo "train rc=$rc"
 [ $rc -eq 0 ] || exit $rc
 fail=0
 for STEP in $((2 * MS)) $STEPS; do
-  for S in gm_sde euler_mean; do
-    D=$ROOT/exp_ladder_d640/eval_$(printf %06d $STEP)_${S}_calls50
-    if [ -f $D/metrics.json ]; then echo "eval $STEP $S done before"; continue; fi
-    bash $WT/jobs/eval_gmflow.sh $K $STEP $S 50 > $ROOT/eval_${STEP}_${S}_50.log 2>&1 || fail=1
-    echo "eval $STEP $S fail=$fail"
+  for C in 50 8; do
+    for S in gm_sde gm_ode euler_mean; do
+      D=$ROOT/exp_ladder_d640/eval_$(printf %06d $STEP)_${S}_calls$C
+      if [ -f $D/metrics.json ]; then echo "eval $STEP $S $C done before"; continue; fi
+      bash $WT/jobs/eval_gmflow.sh $K $STEP $S $C > $ROOT/eval_${STEP}_${S}_$C.log 2>&1 || fail=1
+      echo "eval $STEP $S $C fail=$fail"
+    done
   done
 done
 exit $fail
