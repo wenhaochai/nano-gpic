@@ -46,6 +46,22 @@ class TokenFlowHead(nn.Module):
         return self.out(self.norm(h))
 
 
+class HeadFlow(nn.Module):
+    """The head's flow as one module, so that torch.compile sees the whole loop: one graph per draw, not one Python call per flow step. Same math as draw_patch's loop. At evaluation the GPUs sat at 54 to 56% with one Python thread at 100% per GPU (w1151)."""
+
+    def __init__(self, head, steps, t_eps):
+        super().__init__()
+        self.head, self.steps, self.t_eps = head, steps, t_eps
+
+    def forward(self, q, z):
+        B = z.shape[0]
+        grid = torch.linspace(0, 1, self.steps + 1, device=z.device)
+        for j in range(self.steps):
+            hat = self.head(q, grid[j].repeat(B), z).float()
+            q = hat if j == self.steps - 1 else q + (grid[j + 1] - grid[j]) * (hat - q) / (1 - grid[j]).clamp_min(self.t_eps)
+        return q
+
+
 class ARJiT(JiT_T2I):
     is_ar = True
 
@@ -112,6 +128,12 @@ class ARJiT(JiT_T2I):
         B, head = z.shape[0], self._fast_head()
         grid = torch.linspace(0, 1, self.head_steps + 1, device=z.device)
         q = self.temperature * torch.randn(B, self.patch_dim, device=z.device)
+        if os.environ.get("GPIC_AR_HEAD_FLOW") == "1":   # the whole flow in one compiled graph
+            if getattr(self, "_flow_steps", None) != self.head_steps:
+                flow = HeadFlow(self.head, self.head_steps, self.t_eps)
+                object.__setattr__(self, "_flow", flow if os.environ.get("GPIC_AR_NO_COMPILE") == "1" else torch.compile(flow))
+                object.__setattr__(self, "_flow_steps", self.head_steps)
+            return self._flow(q, z).clamp(-1, 1)
         for j in range(self.head_steps):
             hat = head(q, grid[j].repeat(B), z).float()
             q = hat if j == self.head_steps - 1 else q + (grid[j + 1] - grid[j]) * (hat - q) / (1 - grid[j]).clamp_min(self.t_eps)

@@ -268,6 +268,23 @@ res["loss"].backward()
 assert not [n for n, p in c2.named_parameters() if p.requires_grad and p.grad is None]
 print("14. random order: no leak, loss on masked tokens, each token drawn once, compiled path")
 
+# 19. HeadFlow is the same flow as the loop: same seed, same draws.
+hf = wake(ARJiT(**kw, order="random", ar_steps=64))
+zz = torch.randn(7, 64)
+torch.manual_seed(11)
+d_loop = hf.draw_patch(zz)
+os.environ["GPIC_AR_HEAD_FLOW"] = "1"
+torch.manual_seed(11)
+d_flow = hf.draw_patch(zz)
+hf.head_steps = 4     # the flow follows a change of steps (overfit_ar.py's check at 128)
+torch.manual_seed(11)
+d_flow4 = hf.draw_patch(zz)
+del os.environ["GPIC_AR_HEAD_FLOW"]
+torch.manual_seed(11)
+d_loop4 = hf.draw_patch(zz)
+assert (d_loop == d_flow).all() and (d_loop4 == d_flow4).all() and (d_loop != d_loop4).any()
+print("19. HeadFlow draws equal the loop's, also after a change of steps")
+
 # 18. The sampler variants through ar_sample, and the share of batches at few known tokens.
 torch.manual_seed(8)
 v_first = wake(ARJiT(**kw, order="random", ar_steps=64, redraw_first=8))
