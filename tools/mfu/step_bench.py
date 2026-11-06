@@ -46,7 +46,7 @@ class Step(nn.Module):
         self.net, self.trainer = net, trainer
 
     def forward(self, x, y, meta):
-        return self.trainer(self.net, None, None, x, y, None, dict(meta))["loss"]
+        return self.trainer(self.net, None, None, x, y, None, {k: v for k, v in meta.items() if k != "y_real"})["loss"]
 
 
 def make_pack(lens, Tp, dev, max_T=320):
@@ -223,9 +223,10 @@ def main():
         """Built before the timed loop: a pageable host-to-device copy inside it would stall the host on the GPU."""
         lens = make_lengths(T, a.batch, rng)
         if a.packed or a.rebalance:
-            y = torch.cat([emb[b, :n] for b, n in enumerate(lens)])   # real rows only: the exchange pads after moving them
+            y = torch.cat([emb[b, :n] for b, n in enumerate(lens)])
             pk = make_pack(lens, T, dev)
-            return xs[i % pool_n], (y if a.rebalance else pack_rows(y, pk)), {"y_pack": pk}, lens
+            # the padded rows for a step without the exchange (warm-up); the exchange moves the real rows (pk["y_real"])
+            return xs[i % pool_n], pack_rows(y, pk), {"y_pack": pk, "y_real": y}, lens
         mask = torch.arange(T, device=dev)[None] < torch.tensor(lens, device=dev)[:, None]
         y = emb[:, :T] * mask[..., None]
         return xs[i % pool_n], y, {"y_mask": mask}, lens
@@ -243,6 +244,7 @@ def main():
 
     def train_step(x, y, meta, rec=None, ex=None):
         if ex is not None:   # lever E: the samples of this step move to the ranks the plan names
+            y = meta["y_real"]
             send, in_s, out_s, inv, tsend, tin, tout, tperm, meta = ex
             xr = torch.empty_like(x)
             dist.all_to_all_single(xr.view(x.shape[0], -1), x.index_select(0, send).view(x.shape[0], -1), out_s, in_s)
