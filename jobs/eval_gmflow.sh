@@ -7,16 +7,19 @@
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
 #FETCHABLE
-# GPIC evaluation of one GMFlow checkpoint (docs/gmflow.md) with one sampler at one number of network calls: 50K test captions, each prompt's own noise, EMA net, no CFG, FD-DINOv2 / PRDC / MMD
+# GPIC evaluation of one GMFlow checkpoint (docs/gmflow.md) with one sampler at one number of network calls: 50K test captions, the official noise (EVAL_NOISE below), EMA net, no CFG, FD-DINOv2 / PRDC / MMD
 # (the protocol of jobs/eval_energy.sh). K = 0 evaluates the point model w1147 (runs/gpic-speed/point_nodrop_d640) with the same samplers.
 # usage: eval_gmflow.sh <K: 0 or the run's K> <step> <sampler: gm_sde | gm_sde_final_mean | gm_ode | gm_sde2 | gm_ode2 | gm_ode_cal | euler_mean | euler> <calls>
 #   gm_sde: GM-SDE, first order, the last step returns a draw (for K = 0: DDPM with the small variance). gm_sde_final_mean: the last step returns the mixture mean.
 #   gm_ode: GM-ODE, first order, ceil(128 / calls) analytic sub-steps per call (3 at 50, 16 at 8). euler_mean / euler: the official Euler on the mixture mean (for K = 0: the official Euler).
 #   gm_sde2 / gm_ode2: GM-SDE 2 / GM-ODE 2 (order 2, docs/gmflow.md section 7); gm_ode2 keeps ceil(128 / calls) sub-steps, at least 2. K > 0 only.
-# Output: <run>/eval_<step>_<sampler>_calls<calls>/metrics.json (eval_dir below). It never overwrites a finished result; a directory without metrics.json is moved aside.
+# Output: <run>/eval_<step>_<sampler>_calls<calls>[_n<substeps>][_official]/metrics.json (eval_dir below). It never overwrites a finished result; a directory without metrics.json is moved aside.
 # Env: LADDER_RUN_ROOT (run root); EVAL_SIZE, EVAL_D, EVAL_NB, EVAL_NT (run directory exp_ladder_<size>, width and blocks; default d640, 640, 9, 2; jobs/evals_gmflow.sh sets them);
 # EVAL_SPREAD (image | pixel, default image: gm_spread of the model; the checkpoint must hold the per-pixel offset head if and only if it is pixel);
 # EVAL_LIMIT_BATCHES (smoke test only: predict only that many batches per rank, keep the samples, skip the FD).
+# EVAL_NOISE (official | prompt, default official; owner 2026-11-06: the official evaluation setup, except that CFG stays 1): official is the official noise, one
+# noise tensor for all prompts (gpic_jsonl_dataset noise_per_prompt false), and adds _official to the output directory; prompt is each prompt's own noise, the
+# protocol of every result before 2026-11-06, with the old directory names.
 # docs/gmflow_hn.md: gm_ode_cal (K = 0 only): GM-ODE on the point model with the spread table EVAL_SPREAD_TABLE (required; tools/gmflow/calibrate_spread.py), output
 # eval_<step>_gm_ode_cal-<first 8 hex of the table file's sha1>_calls<calls>. The table's ckpt must be ms-step=<step>, and at every call time t > 0 its s_x(t) must be
 # at most (1 - t) / t (owner 2026-11-06: no clipped or scaled tables; gm_spread.py check). EVAL_SUBSTEPS (gm_ode, gm_ode2 and gm_ode_cal only) overrides the
@@ -30,9 +33,9 @@ K=$1 STEP=$(printf %06d $2) SAMPLER=$3 CALLS=$4
 [ $# -eq 4 ] || { echo "usage: eval_gmflow.sh <K> <step> <sampler> <calls>"; exit 2; }
 [ -n "${GMFLOW_WT:-}" ] || { echo "GMFLOW_WT is not set: name the frozen worktree (jobs/evals_gmflow.sh --wt sets it); the development worktree moves"; exit 2; }
 WT=$GMFLOW_WT   # evals_gmflow.sh, train_gmflow.sh, run_gmflow.sh and eval_point_sampler.sh name the frozen worktree
-eval_dir() {   # <step, 6 digits> <sampler> <calls> <substeps or ""> <table or "">: the output directory's name. The same text is in eval_gmflow.sh and evals_gmflow.sh (T27).
+eval_dir() {   # <step, 6 digits> <sampler> <calls> <substeps or ""> <table or ""> <noise tag: official or "">: the output directory's name. The same text is in eval_gmflow.sh and evals_gmflow.sh (T27).
   local s=$2; [ "$2" != gm_ode_cal ] || s=gm_ode_cal-$(sha1sum < "$5" | cut -c1-8)
-  echo "eval_$1_${s}_calls$3${4:+_n$4}"
+  echo "eval_$1_${s}_calls$3${4:+_n$4}${6:+_$6}"
 }
 case $K in
   0) DEF_ROOT=$WC/runs/gpic-speed/point_nodrop_d640 ;;
@@ -41,6 +44,8 @@ case $K in
 esac
 SIZE=${EVAL_SIZE:-d640} WD=${EVAL_D:-640} NB=${EVAL_NB:-9} NT=${EVAL_NT:-2} SPREAD=${EVAL_SPREAD:-image}
 case $SPREAD in image|pixel) ;; *) echo "EVAL_SPREAD must be image or pixel"; exit 2 ;; esac
+NOISE=${EVAL_NOISE:-official}
+case $NOISE in official) NPP=false NTAG=official ;; prompt) NPP=true NTAG="" ;; *) echo "EVAL_NOISE must be official or prompt"; exit 2 ;; esac
 if [ $K -eq 0 ] && [ $SPREAD = pixel ]; then echo "the per-pixel spread needs a mixture (K > 0)"; exit 2; fi
 SUBSTEPS=$(( (128 + CALLS - 1) / CALLS )); [ $SUBSTEPS -ge 2 ] || SUBSTEPS=2
 NSUF=""
@@ -77,7 +82,7 @@ if [ $SPREAD = pixel ] || [ ${SAMPLER%2} != $SAMPLER ]; then
 fi
 RUN=${LADDER_RUN_ROOT:-$DEF_ROOT}/exp_ladder_$SIZE
 CKPT=$(ls -t $RUN/ms-*$STEP*.ckpt 2>/dev/null | head -1); [ -n "$CKPT" ] || { echo "no ms checkpoint for step $STEP in $RUN"; exit 2; }
-OUT=$RUN/$(eval_dir $STEP $SAMPLER $CALLS "$NSUF" "$TABLE")
+OUT=$RUN/$(eval_dir $STEP $SAMPLER $CALLS "$NSUF" "$TABLE" "$NTAG")
 [ ! -f $OUT/metrics.json ] || { echo "$OUT/metrics.json exists; not overwriting"; exit 3; }
 [ ! -d $OUT ] || mv $OUT $OUT.unfinished_$(date +%m%d_%H%M%S)
 cd $WT/baselines/PixelGen
@@ -100,7 +105,7 @@ assert any(n.startswith("ema_denoiser.gm_logstd") for n in sd) == (k > 0), "s-ML
 assert ("ema_denoiser.gm_spread_head.weight" in sd) == (spread == "pixel"), f"per-pixel offset head presence does not match EVAL_SPREAD={spread}"
 PY
 mkdir -p $OUT
-echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K spread=$SPREAD sampler=$SAMPLER calls=$CALLS substeps=$SUBSTEPS" | tee $OUT/ckpt.txt
+echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K spread=$SPREAD sampler=$SAMPLER calls=$CALLS substeps=$SUBSTEPS noise=$NOISE" | tee $OUT/ckpt.txt
 [ $SAMPLER != gm_ode_cal ] || { echo "spread_table=$TABLE sha1=$(sha1sum < "$TABLE" | cut -c1-40)" | tee -a $OUT/ckpt.txt; cp "$TABLE" $OUT/spread_table.json; }
 SPREAD_ARGS=(); [ $SPREAD = image ] || SPREAD_ARGS=(--model.denoiser.init_args.gm_spread $SPREAD)   # image: the command line of before this option
 LIMIT=(); [ -z "${EVAL_LIMIT_BATCHES:-}" ] || LIMIT=(--trainer.limit_predict_batches $EVAL_LIMIT_BATCHES)
@@ -109,7 +114,7 @@ WANDB_MODE=disabled python main.py predict --config configs_h100/lite_ladder_sam
   --trainer.default_root_dir "$OUT/pred" --ckpt_path "$CKPT" --model.diffusion_sampler.init_args.num_steps $CALLS \
   --model.denoiser.init_args.hidden_size $WD --model.denoiser.init_args.num_groups $((WD / 64)) \
   --model.denoiser.init_args.num_blocks $NB --model.denoiser.init_args.num_text_blocks $NT --model.denoiser.init_args.gm_k $K "${SPREAD_ARGS[@]}" \
-  --data.pred_dataset.init_args.noise_per_prompt true "${LIMIT[@]}" > $OUT/predict.log 2>&1
+  --data.pred_dataset.init_args.noise_per_prompt $NPP "${LIMIT[@]}" > $OUT/predict.log 2>&1
 t1=$(date +%s)
 NPZ=$(find "$OUT/pred" -name output.npz | head -1)
 [ -n "$NPZ" ] || { echo "no output.npz"; exit 4; }

@@ -73,7 +73,7 @@ export EVAL_LIMIT_BATCHES=2
 for C in 8 4; do
   log "START predict pixel gm_ode $C"
   EVAL_SPREAD=pixel timeout -k 30 240 bash $WT/jobs/eval_gmflow.sh 8 400 gm_ode $C > $OUT/eval_gm_ode_$C.log 2>&1
-  rc=$?; log "END predict pixel gm_ode $C rc=$rc $(cat $OUT/exp_ladder_d640/eval_000400_gm_ode_calls$C/sample_check.txt 2>/dev/null) $(cat $OUT/exp_ladder_d640/eval_000400_gm_ode_calls$C/phase_times.json 2>/dev/null)"; [ $rc -eq 0 ] || fail=1
+  rc=$?; log "END predict pixel gm_ode $C rc=$rc $(cat $OUT/exp_ladder_d640/eval_000400_gm_ode_calls${C}_official/sample_check.txt 2>/dev/null) $(cat $OUT/exp_ladder_d640/eval_000400_gm_ode_calls${C}_official/phase_times.json 2>/dev/null)"; [ $rc -eq 0 ] || fail=1
 done
 # the guard: the per-pixel checkpoint must be refused as image, by the guard's assert (not by a timeout or a missing file; review_gmflow2 L3)
 EVAL_SPREAD=image timeout -k 30 180 bash $WT/jobs/eval_gmflow.sh 8 400 gm_ode 2 > $OUT/eval_guard.log 2>&1
@@ -103,7 +103,7 @@ mkdir -p $OUT/w1173/exp_ladder_d640
 ln -s $W1173 $OUT/w1173/exp_ladder_d640/
 log "START predict w1173 gm_ode 8"
 LADDER_RUN_ROOT=$OUT/w1173 timeout -k 30 240 bash $WT/jobs/eval_gmflow.sh 8 62336 gm_ode 8 > $OUT/eval_w1173_gm_ode.log 2>&1
-rc=$?; log "END predict w1173 gm_ode 8 rc=$rc $(cat $OUT/w1173/exp_ladder_d640/eval_062336_gm_ode_calls8/sample_check.txt 2>/dev/null) $(cat $OUT/w1173/exp_ladder_d640/eval_062336_gm_ode_calls8/phase_times.json 2>/dev/null)"; [ $rc -eq 0 ] || fail=1
+rc=$?; log "END predict w1173 gm_ode 8 rc=$rc $(cat $OUT/w1173/exp_ladder_d640/eval_062336_gm_ode_calls8_official/sample_check.txt 2>/dev/null) $(cat $OUT/w1173/exp_ladder_d640/eval_062336_gm_ode_calls8_official/phase_times.json 2>/dev/null)"; [ $rc -eq 0 ] || fail=1
 grep -h "__recompiles" $OUT/exp_ladder_d640/eval_*/predict.log $OUT/w1173/exp_ladder_d640/eval_*/predict.log 2>/dev/null | grep -v qwen3 | head -5 | tee -a $OUT/phases.log
 log "DONE $OUT fail=$fail"
 exit $fail

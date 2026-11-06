@@ -1139,8 +1139,9 @@ def T26():
 
 @test
 def T27():
-    """G2/H3: eval_gmflow.sh names and arguments (gm_ode_cal with the table's hash, EVAL_SUBSTEPS, the 512 limit, GMFLOW_WT required) and evals_gmflow.sh task parsing
-    (3 and 4 fields, --wt, --table, the done-check with the same name rule), on stubbed copies (no env.sh, no GPU)."""
+    """G2/H3: eval_gmflow.sh names and arguments (gm_ode_cal with the table's hash, EVAL_SUBSTEPS, the 512 limit, GMFLOW_WT required, EVAL_NOISE: official by
+    default with _official, prompt with the old names) and evals_gmflow.sh task parsing (3 and 4 fields, --wt, --table, --noise, the done-check with the same name
+    rule, per protocol), on stubbed copies (no env.sh, no GPU)."""
     import glob
     import hashlib
     import shutil
@@ -1152,7 +1153,8 @@ def T27():
     head, sep, _ = src.partition("[ ! -f $OUT/metrics.json ]")
     assert sep, "eval_gmflow.sh changed shape"
     stub = os.path.join(tmp, "eval.sh")
-    open(stub, "w").write(head + 'echo "OUT=$(basename $OUT) SUBSTEPS=$SUBSTEPS SARGS=${SARGS[*]}"\n')
+    assert "--data.pred_dataset.init_args.noise_per_prompt $NPP" in src, "eval_gmflow.sh does not pass the noise protocol"
+    open(stub, "w").write(head + 'echo "OUT=$(basename $OUT) SUBSTEPS=$SUBSTEPS NPP=$NPP SARGS=${SARGS[*]}"\n')
     run_dir = os.path.join(tmp, "runs/gpic-speed/point_nodrop_d640/exp_ladder_d640")
     os.makedirs(run_dir)
     open(os.path.join(run_dir, "ms-step=066816.ckpt"), "w").close()
@@ -1169,17 +1171,17 @@ def T27():
         r = subprocess.run(["bash", stub, *map(str, args)], env=env, capture_output=True, text=True, cwd=cwd)
         return r.returncode, r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr
     rc, out = ev([0, 66816, "euler", 8])
-    assert rc == 0 and out.startswith("OUT=eval_066816_euler_calls8 SUBSTEPS=16 "), out
+    assert rc == 0 and out.startswith("OUT=eval_066816_euler_calls8_official SUBSTEPS=16 NPP=false "), out
     rc, out = ev([0, 66816, "euler", 8], wt=None)
     assert rc == 2 and "GMFLOW_WT is not set" in out, out   # review_gmflow2 M4: no default to the moving development worktree
     rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table)
-    assert rc == 0 and f"OUT=eval_066816_gm_ode_cal-{h8}_calls8 SUBSTEPS=16 " in out and f"spread_table {table}" in out and "substeps 16" in out, out
+    assert rc == 0 and f"OUT=eval_066816_gm_ode_cal-{h8}_calls8_official SUBSTEPS=16 " in out and f"spread_table {table}" in out and "substeps 16" in out, out
     rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table2)
-    assert rc == 0 and f"OUT=eval_066816_gm_ode_cal-{h8b}_calls8 " in out, out   # review_gmflow_hn F1: a second table gets its own directory
+    assert rc == 0 and f"OUT=eval_066816_gm_ode_cal-{h8b}_calls8_official " in out, out   # review_gmflow_hn F1: a second table gets its own directory
     rc, out = ev([0, 66816, "gm_ode_cal", 8], cwd=tmp, EVAL_SPREAD_TABLE="table.json")
     assert rc == 0 and f"spread_table {table} " in out + " ", out   # F8: a relative path becomes absolute before the cd
     rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table, EVAL_SUBSTEPS="4")
-    assert rc == 0 and f"OUT=eval_066816_gm_ode_cal-{h8}_calls8_n4 SUBSTEPS=4 " in out and "substeps 4" in out, out
+    assert rc == 0 and f"OUT=eval_066816_gm_ode_cal-{h8}_calls8_n4_official SUBSTEPS=4 " in out and "substeps 4" in out, out
     rc, out = ev([0, 66816, "gm_ode_cal", 8])
     assert rc == 2 and "EVAL_SPREAD_TABLE" in out, out
     rc, out = ev([0, 66816, "euler", 8], EVAL_SUBSTEPS="4")
@@ -1187,28 +1189,37 @@ def T27():
     k8 = os.path.join(tmp, "runs/gpic-speed/gmflow_k8_d640/exp_ladder_d640"); os.makedirs(k8)
     open(os.path.join(k8, "ms-step=062336.ckpt"), "w").close()
     rc, out = ev([8, 62336, "gm_ode", 4])
-    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls4 SUBSTEPS=32 "), out
+    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls4_official SUBSTEPS=32 "), out
     rc, out = ev([8, 62336, "gm_ode", 4], EVAL_SUBSTEPS="8")
-    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls4_n8 SUBSTEPS=8 "), out
+    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls4_n8_official SUBSTEPS=8 "), out
     rc, out = ev([8, 62336, "gm_ode2", 4], EVAL_SUBSTEPS="8")
-    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode2_calls4_n8 SUBSTEPS=8 "), out
+    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode2_calls4_n8_official SUBSTEPS=8 "), out
     rc, out = ev([8, 62336, "gm_ode_cal", 4], EVAL_SPREAD_TABLE=table)
     assert rc == 2 and "point model" in out, out
     # review_gmflow_hn F5: calls x sub-steps <= 512 (the G2 sweep's largest is 8 x 64 = 512); 8 x 128 = 1024 and 50 x 11 = 550 are refused
     rc, out = ev([8, 62336, "gm_ode", 8], EVAL_SUBSTEPS="64")
-    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls8_n64 SUBSTEPS=64 "), out
+    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls8_n64_official SUBSTEPS=64 "), out
     for calls, n, smp in ((8, 128, "gm_ode"), (50, 11, "gm_ode"), (4, 129, "gm_ode2")):
         rc, out = ev([8, 62336, smp, calls], EVAL_SUBSTEPS=str(n))
         assert rc == 2 and "> 512" in out, (calls, n, out)
     rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table, EVAL_SUBSTEPS="128")
     assert rc == 2 and "> 512" in out, out
-    print(f"  eval_gmflow.sh: default names unchanged; GMFLOW_WT required; gm_ode_cal needs the table and K = 0, its name carries the table's hash (-{h8}, a second"
+    # EVAL_NOISE (owner 2026-11-06: the official setup): prompt keeps the old names and noise_per_prompt true; anything else is refused
+    rc, out = ev([0, 66816, "euler", 8], EVAL_NOISE="prompt")
+    assert rc == 0 and out.startswith("OUT=eval_066816_euler_calls8 SUBSTEPS=16 NPP=true "), out
+    rc, out = ev([8, 62336, "gm_ode", 4], EVAL_NOISE="prompt", EVAL_SUBSTEPS="8")
+    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls4_n8 SUBSTEPS=8 NPP=true "), out
+    rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_NOISE="prompt", EVAL_SPREAD_TABLE=table)
+    assert rc == 0 and f"OUT=eval_066816_gm_ode_cal-{h8}_calls8 SUBSTEPS=16 NPP=true " in out, out
+    rc, out = ev([0, 66816, "euler", 8], EVAL_NOISE="shared")
+    assert rc == 2 and "EVAL_NOISE must be" in out, out
+    print(f"  eval_gmflow.sh: the official noise by default (noise_per_prompt false, names end in _official); EVAL_NOISE=prompt gives the old names and true; GMFLOW_WT required; gm_ode_cal needs the table and K = 0, its name carries the table's hash (-{h8}, a second"
           f" table -{h8b}), a relative table path is made absolute; EVAL_SUBSTEPS adds _n<n> (GM-ODE, GM-ODE 2, gm_ode_cal); calls x n > 512 refused, 512 accepted")
     # evals_gmflow.sh with a stub worktree gmflow_run3 (the frozen worktree of this merge, which does not exist yet) whose eval_gmflow.sh prints its arguments
     wt = os.path.join(tmp, "project/gpic-wt/gmflow_run3")
     os.makedirs(os.path.join(wt, "baselines/PixelGen/src/diffusion/flow_matching")); os.makedirs(os.path.join(wt, "jobs"))
     open(os.path.join(wt, "baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py"), "w").close()
-    open(os.path.join(wt, "jobs/eval_gmflow.sh"), "w").write('echo "ARGS=$* N=${EVAL_SUBSTEPS:-} T=${EVAL_SPREAD_TABLE:-} WT=$(basename $GMFLOW_WT) S=$EVAL_SPREAD"\n')
+    open(os.path.join(wt, "jobs/eval_gmflow.sh"), "w").write('echo "ARGS=$* N=${EVAL_SUBSTEPS:-} T=${EVAL_SPREAD_TABLE:-} WT=$(basename $GMFLOW_WT) S=$EVAL_SPREAD Z=$EVAL_NOISE"\n')
     subprocess.run("git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x", shell=True, cwd=wt, check=True)
     src = open(os.path.join(REPO, "jobs/evals_gmflow.sh")).read().replace("source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh", f"WC={tmp}")
     stub2 = os.path.join(tmp, "evals.sh"); open(stub2, "w").write(src)
@@ -1220,29 +1231,38 @@ def T27():
         return r.returncode, r.stdout, logs
     rc, out, logs = evs([0, "d640", 640, 9, 2, root, "66816:euler:8", "66816:gm_ode:8:4"])
     assert rc == 0, out
-    assert logs["eval_66816_euler_8.log"] == "ARGS=0 66816 euler 8 N= T= WT=gmflow_run3 S=image", logs
-    assert logs["eval_66816_gm_ode_8_n4.log"] == "ARGS=0 66816 gm_ode 8 N=4 T= WT=gmflow_run3 S=image", logs
+    assert logs["eval_66816_euler_8_official.log"] == "ARGS=0 66816 euler 8 N= T= WT=gmflow_run3 S=image Z=official", logs
+    assert logs["eval_66816_gm_ode_8_n4_official.log"] == "ARGS=0 66816 gm_ode 8 N=4 T= WT=gmflow_run3 S=image Z=official", logs
     shutil.rmtree(root)
     rc, out, logs = evs([0, "d640", 640, 9, 2, root, "66816:gm_ode_cal:8"])
     assert rc == 2 and "needs --table" in out, out
     rc, out, logs = evs([0, "d640", 640, 9, 2, root, "--table", "table.json", "66816:gm_ode_cal:8", "66816:gm_ode_cal:4:8"], cwd=tmp)
-    assert rc == 0 and logs[f"eval_66816_gm_ode_cal-{h8}_calls8.log"] == f"ARGS=0 66816 gm_ode_cal 8 N= T={table} WT=gmflow_run3 S=image", logs
-    assert logs[f"eval_66816_gm_ode_cal-{h8}_calls4_n8.log"] == f"ARGS=0 66816 gm_ode_cal 4 N=8 T={table} WT=gmflow_run3 S=image", logs
+    assert rc == 0 and logs[f"eval_66816_gm_ode_cal-{h8}_calls8_official.log"] == f"ARGS=0 66816 gm_ode_cal 8 N= T={table} WT=gmflow_run3 S=image Z=official", logs
+    assert logs[f"eval_66816_gm_ode_cal-{h8}_calls4_n8_official.log"] == f"ARGS=0 66816 gm_ode_cal 4 N=8 T={table} WT=gmflow_run3 S=image Z=official", logs
     # the done-check uses the same name rule: a finished table-1 result skips table 1 and not table 2
-    d1 = os.path.join(root, f"exp_ladder_d640/eval_066816_gm_ode_cal-{h8}_calls8"); os.makedirs(d1); open(os.path.join(d1, "metrics.json"), "w").close()
+    d1 = os.path.join(root, f"exp_ladder_d640/eval_066816_gm_ode_cal-{h8}_calls8_official"); os.makedirs(d1); open(os.path.join(d1, "metrics.json"), "w").close()
     rc, out, _ = evs([0, "d640", 640, 9, 2, root, "--table", table, "66816:gm_ode_cal:8"])
     assert rc == 0 and "done before" in out, out
     rc, out, _ = evs([0, "d640", 640, 9, 2, root, "--table", table2, "66816:gm_ode_cal:8"])
     assert rc == 0 and "done before" not in out, out
     old = os.path.join(root, "exp_ladder_d640/eval_066816_gm_ode_calls8_n4"); os.makedirs(old); open(os.path.join(old, "metrics.json"), "w").close()
     rc, out, _ = evs([0, "d640", 640, 9, 2, root, "66816:gm_ode:8:4"])
+    assert rc == 0 and "done before" not in out, out   # a result of each prompt's own noise does not stand in for the official noise
+    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "--noise", "prompt", "66816:gm_ode:8:4"])
     assert rc == 0 and "done before" in out, out
+    new = os.path.join(root, "exp_ladder_d640/eval_066816_euler_calls8_official"); os.makedirs(new); open(os.path.join(new, "metrics.json"), "w").close()
+    rc, out, _ = evs([0, "d640", 640, 9, 2, root, "66816:euler:8"])
+    assert rc == 0 and "done before" in out, out
+    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "--noise", "prompt", "66816:euler:8"])
+    assert rc == 0 and "done before" not in out and logs["eval_66816_euler_8.log"] == "ARGS=0 66816 euler 8 N= T= WT=gmflow_run3 S=image Z=prompt", (out, logs)
+    rc, out, _ = evs([0, "d640", 640, 9, 2, root, "--noise", "shared", "66816:euler:8"])
+    assert rc == 2 and "--noise must be" in out, out
     rc, out, _ = evs([0, "d640", 640, 9, 2, root, "66816:euler:8"], wtn="../gmflow")
     assert rc == 2 and "worktree name" in out, out   # review_gmflow2 L5
     # one name rule: the eval_dir function is the same text in both scripts
     fn = lambda path: re.search(r"^eval_dir\(\) \{.*?^\}", open(os.path.join(REPO, path)).read(), re.S | re.M).group(0)
     assert fn("jobs/eval_gmflow.sh") == fn("jobs/evals_gmflow.sh"), "eval_dir differs between eval_gmflow.sh and evals_gmflow.sh"
-    print("  evals_gmflow.sh: 3-field tasks unchanged; a 4th field sets EVAL_SUBSTEPS and _n<n>; --wt gmflow_run3 accepted, '../x' refused; gm_ode_cal needs --table,"
+    print("  evals_gmflow.sh: --noise official (default, _official) or prompt (old names), each protocol's done-check apart; 3-field tasks; a 4th field sets EVAL_SUBSTEPS and _n<n>; --wt gmflow_run3 accepted, '../x' refused; gm_ode_cal needs --table,"
           " which is made absolute; the done-check names the table's hash (table 1 done, table 2 not); eval_dir identical in both scripts")
 
 
