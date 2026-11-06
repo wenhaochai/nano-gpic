@@ -4,7 +4,8 @@ A point model (gm_k = 0) returns a tensor; it is read as K = 1 with s_x = 0. GM-
 No CFG: the guidance is asserted 1.0.
 order 2 (GM-SDE 2, GM-ODE 2; paper App. A.2, GMFlow gmflow.py:251-291 and 497-503): from the second call on, the call's mixture is reweighted by gm_second_order with the
 previous call's raw mixture converted to the current x_t (Eq. 10); then the first-order step or the sub-steps run on it. The first call is first order. order 1 is the
-code before this option, unchanged. On a point model (s = 0, K = 1) order 2 changes nothing (its surrogate variance is 0).
+code before this option, unchanged. On a point model (s = 0, K = 1) order 2 changes nothing (its surrogate variance is 0); GMODESampler refuses order 2 with a
+spread table, whose surrogate variance s_x^2 > 0 would make a new, untested sampler.
 """
 import os
 
@@ -94,10 +95,14 @@ class GMODESampler(_GMSampler):
     mixture to the current state (Eq. 10, gm_convert) and uses its mean. Each sub-step is the Euler step x' = x + (sigma' - sigma) (x - x0) / sigma, on a uniform sigma grid of
     num_steps * substeps points. The last sub-step (sigma' = 0) returns the re-weighted mixture mean. order 2: GM-ODE 2 (module docstring), the sub-steps on the
     second-order mixture."""
-    def __init__(self, *args, substeps: int = 3, **kwargs):
+    def __init__(self, *args, substeps: int = 3, spread_table: str = None, fused: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         assert substeps >= 1, substeps
         self.substeps = substeps
+        # docs/gmflow_hn.md: spread_table (a point model only) = a JSON of s_x(t) (tools/gmflow/calibrate_spread.py); fused = the Triton kernel for the sub-steps (gm_ode_triton.py)
+        self.spread = None if spread_table is None else __import__("src.diffusion.flow_matching.gm_spread", fromlist=["SpreadTable"]).SpreadTable(spread_table)
+        self.fused = fused
+        assert not (self.spread is not None and self.order == 2), "a spread table with order 2 is an untested sampler (review_gmflow_hn F7)"
 
     def _impl_sampling(self, net, noise, condition, uncondition):
         steps = self._start(noise)
@@ -107,14 +112,17 @@ class GMODESampler(_GMSampler):
         prev = None
         for t_cur, t_next in zip(steps[:-1], steps[1:]):
             gm = self._call(net, x, t_cur, condition)
-            gm = as_mixture(gm) if torch.is_tensor(gm) else gm
+            assert self.spread is None or torch.is_tensor(gm), "spread_table is for a point model (gm_k = 0)"
+            gm = self._point_gm(gm, t_cur) if torch.is_tensor(gm) else gm
             with torch.autocast(device_type=dev, enabled=False):
                 sigma_src, sigma_end = (1 - t_cur).view(1, 1, 1, 1), (1 - t_next).view(1, 1, 1, 1)
                 if self.order == 2:
                     gm, prev = self._second_order(gm, x, sigma_src, sigma_end, prev)
                 sig_src_b = sigma_src.expand(x.shape[0], -1, -1, -1)
                 x_src = x
-                for j in range(self.substeps):
+                if self.fused:
+                    x = self._fused_substeps(gm, sigma_src, sigma_end, sig_src_b, x)
+                for j in range(0 if self.fused else self.substeps):
                     s = sigma_src + (sigma_end - sigma_src) * (j / self.substeps)
                     s_next = sigma_src + (sigma_end - sigma_src) * ((j + 1) / self.substeps)
                     x0 = gm_mean(gm) if j == 0 else gm_convert_mean(gm, sig_src_b, s.expand(x.shape[0], -1, -1, -1), x_src, x)
@@ -123,3 +131,19 @@ class GMODESampler(_GMSampler):
             x_trajs.append(x)
         v_trajs.append(torch.zeros_like(x))
         return x_trajs, v_trajs
+
+    def _point_gm(self, x_hat, t_cur):
+        """A point model's output as a mixture: K = 1 with s_x = 0 (as_mixture), or with s_x = the spread table at the call's t (docs/gmflow_hn.md, H2)."""
+        if self.spread is None:
+            return as_mixture(x_hat)
+        from src.diffusion.flow_matching.gm_spread import point_mixture
+        return point_mixture(x_hat, self.spread(t_cur.float().reshape(1)), 1 - t_cur.float())
+
+    def _fused_substeps(self, gm, sigma_src, sigma_end, sig_src_b, x):
+        """All sub-steps of one call in one Triton launch (gm_ode_triton.py), on the sigma grid of the loop below."""
+        from src.diffusion.flow_matching.gm_ode_triton import gm_ode_substeps_fused
+        from src.diffusion.flow_matching.gmflow import logstd_x
+        n = self.substeps
+        sigmas = torch.stack([(sigma_src + (sigma_end - sigma_src) * (j / n)).reshape(()) for j in range(n + 1)])
+        s_x = logstd_x(gm, sig_src_b.unsqueeze(1)).exp()
+        return gm_ode_substeps_fused(gm["means"], gm["logweights"], s_x, x, sigmas)

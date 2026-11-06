@@ -877,6 +877,291 @@ def T14():
             print(f"  (information) one-Gaussian network, {name} {n} calls: " + " | ".join(line))
 
 
+# ---- T21 onward: docs/gmflow_hn.md (H: a spread for a point model; N: the fused sub-step kernel). T11-T20 belong to the gmflow branch. ----
+def _gauss_toy(B=64, C=3, H=4, W=4, c=0.5, seed=0):
+    """x0 ~ N(m, c^2 I) per dimension. The posterior of x0 given x_t is N((t c^2 x_t + (1 - t)^2 m) / v(t), c^2 (1 - t)^2 / v(t)), v(t) = t^2 c^2 + (1 - t)^2, and the
+    probability-flow ODE maps x_0 = eps at t = 0 to m + c eps at t = 1 (the marginal at t is N(t m, v(t)) and the flow is affine)."""
+    g = torch.Generator().manual_seed(seed)
+    m = torch.randn(1, C, H, W, generator=g) * 0.7
+    post_mean = lambda x, t: (t * c * c * x + (1 - t) ** 2 * m) / (t * t * c * c + (1 - t) ** 2)
+    post_std = lambda t: c * (1 - t) / math.sqrt(t * t * c * c + (1 - t) ** 2)
+    noise = torch.randn(B, C, H, W, generator=g)
+    return m, c, post_mean, post_std, noise
+
+
+def _write_table(path, ts, ss):
+    import json
+    json.dump({"t": [float(t) for t in ts], "s_x": [float(s) for s in ss]}, open(path, "w"))
+    return path
+
+
+def _tmp(name):
+    import tempfile
+    return os.path.join(tempfile.mkdtemp(dir=os.environ.get("TMPDIR")), name)
+
+
+@test
+def T21():
+    """H2: the spread table is linear in t between its points and constant beyond its ends; point_mixture gives s_x back through logstd_x."""
+    from src.diffusion.flow_matching.gm_spread import SpreadTable, point_mixture
+    tab = SpreadTable(_write_table(_tmp("t.json"), [0.1, 0.3, 0.9], [1.0, 3.0, 0.0]))
+    q = torch.tensor([0.0, 0.1, 0.15, 0.2, 0.3, 0.6, 0.75, 0.9, 0.95, 1.0])
+    want = torch.tensor([1.0, 1.0, 1.5, 2.0, 3.0, 1.5, 0.75, 0.0, 0.0, 0.0])
+    got = tab(q)
+    assert torch.allclose(got, want, atol=1e-6), (got, want)
+    assert tab(q.view(2, 5)).shape == (2, 5)
+    import numpy as np
+    r = torch.rand(1000, dtype=torch.float64)
+    assert np.allclose(tab(r).numpy(), np.interp(r.numpy(), [0.1, 0.3, 0.9], [1.0, 3.0, 0.0]), atol=1e-6)
+    x = torch.randn(2, 3, 4, 4)
+    for sx in (0.3, torch.tensor([0.2, 0.05])):
+        gm = point_mixture(x, sx, torch.tensor(0.4))
+        back = G.logstd_x(gm, torch.full((2, 1, 1, 1, 1), 0.4)).exp().view(-1)
+        assert torch.allclose(back, torch.as_tensor(sx, dtype=torch.float32).expand(2), rtol=1e-6), back
+    gm0 = point_mixture(x, 0.0, torch.tensor(0.4))
+    assert torch.isneginf(gm0["logstd"]).all() and torch.equal(gm0["means"][:, 0], x)
+    print("  table: linear between points (= numpy.interp), clamped beyond the ends; point_mixture returns s_x; s_x = 0 is log s_u = -inf")
+
+
+@test
+def T22():
+    """H2: with s_x = 0 everywhere, the calibrated GM-ODE is the uncalibrated one bitwise and the exact step (ImplicitSampler) to fp32 rounding."""
+    torch.manual_seed(0)
+    net = JiT_T2I(**small)
+    for p_ in net.parameters():
+        p_.data.add_(torch.randn_like(p_) * 0.02)
+    y = torch.randn(2, 8, 32); mask = torch.ones(2, 8, dtype=torch.bool); mask[:, 4:] = False
+    f = lambda x, t, c, **kw: net(x, t, c, y_mask=mask)
+    noise = torch.randn(2, 3, 64, 64)
+    zero = _write_table(_tmp("zero.json"), [0.01, 0.5, 0.99], [0.0, 0.0, 0.0])
+    with torch.no_grad():
+        for calls, n in ((8, 16), (4, 32), (5, 3)):
+            a = sampler(GMODESampler, calls, substeps=n, spread_table=zero, rank_seed=False)._impl_sampling(f, noise, y, None)[0][-1]
+            b = sampler(GMODESampler, calls, substeps=n, rank_seed=False)._impl_sampling(f, noise, y, None)[0][-1]
+            c = sampler(ImplicitSampler, calls)._impl_sampling(f, noise, y, None)[0][-1]
+            assert torch.equal(a, b), (calls, (a - b).abs().max())
+            assert torch.allclose(a, c, atol=1e-5), (calls, (a - c).abs().max())
+            print(f"  calls {calls}, n {n}: = no table bitwise; max |diff| to the exact step {(a - c).abs().max():.2e}")
+    try:
+        GMODESampler_ = sampler(GMODESampler, 4, substeps=2, spread_table=zero, rank_seed=False)
+        gmnet = FixedGM(torch.randn(2, 2, 3, 8, 8), torch.randn(2, 2, 1, 8, 8).log_softmax(1), torch.zeros(1, 1, 1, 1, 1))
+        GMODESampler_._impl_sampling(gmnet, torch.randn(2, 3, 8, 8), None, None); raise RuntimeError("no assert on a mixture with a table")
+    except AssertionError:
+        pass
+
+
+def _ode_err(sampler_obj, post_mean, m, c, noise):
+    f = lambda x, t, cond, **kw: post_mean(x, t.view(-1, 1, 1, 1))
+    out = sampler_obj._impl_sampling(f, noise, None, None)[0][-1]
+    exact = m + c * noise
+    return (out - exact).square().mean().sqrt().item()
+
+
+@test
+def T23():
+    """H: on Gaussian data with the exact posterior mean as the point model, the GM-ODE with the true posterior std as its table is closer to the exact ODE solution
+    than the exact step, at 8 and 4 calls; with s_x = 0 it is the exact step."""
+    m, c, post_mean, post_std, noise = _gauss_toy()
+    ts = [i / 400 * 0.995 for i in range(401)]
+    true = _write_table(_tmp("true.json"), ts, [post_std(t) for t in ts])
+    zero = _write_table(_tmp("zero.json"), ts, [0.0] * len(ts))
+    for calls in (8, 4, 2):
+        n = max(2, -(-128 // calls))
+        e_exact = _ode_err(sampler(ImplicitSampler, calls), post_mean, m, c, noise)
+        e_cal = _ode_err(sampler(GMODESampler, calls, substeps=n, spread_table=true, rank_seed=False), post_mean, m, c, noise)
+        e_zero = _ode_err(sampler(GMODESampler, calls, substeps=n, spread_table=zero, rank_seed=False), post_mean, m, c, noise)
+        e_half = _ode_err(sampler(GMODESampler, calls, substeps=n, spread_table=_write_table(_tmp("h.json"), ts, [post_std(t) ** 2 for t in ts]), rank_seed=False),
+                          post_mean, m, c, noise)
+        print(f"  calls {calls}, n {n}: rms error to the exact ODE: exact step {e_exact:.5f}, calibrated {e_cal:.5f}, table s_x^2 {e_half:.5f}, s_x = 0 {e_zero:.5f}")
+        assert abs(e_zero - e_exact) < 1e-5, (e_zero, e_exact)
+        assert e_cal < 0.1 * e_exact, (e_cal, e_exact)
+        assert e_cal < 0.5 * e_half, (e_cal, e_half)
+
+
+@test
+def T24():
+    """H1: calibrate_spread's error sums with the exact posterior mean recover the true posterior std; sharding changes nothing; merge and the table round-trip."""
+    sys.path.insert(0, os.path.join(REPO, "tools/gmflow"))
+    import calibrate_spread as CS
+    m, c, post_mean, post_std, _ = _gauss_toy()
+    N = 1500
+    g = torch.Generator().manual_seed(5)
+    images = m + c * torch.randn(N, 3, 4, 4, generator=g)
+    ts = [0.01, 0.2, 0.5, 0.8, 0.99]
+    predict = lambda x_t, t, rows: post_mean(x_t, t.view(-1, 1, 1, 1))
+    s1, s2 = CS.error_sums(predict, images, list(range(N)), ts, seed=0, batch=128)
+    got = (s1 / N).sqrt()
+    want = torch.tensor([post_std(t) for t in ts], dtype=torch.float64)
+    print("  s_x got  " + " ".join(f"{v:.4f}" for v in got.tolist()) + "\n  s_x true " + " ".join(f"{v:.4f}" for v in want.tolist()))
+    assert torch.allclose(got, want, rtol=0.02), (got, want)
+    orig = CS.T_GRID
+    try:
+        CS.T_GRID = ts   # noise_for draws one noise per point of the grid
+        s1, s2 = CS.error_sums(predict, images, list(range(N)), ts, seed=0, batch=128)
+        shards = []
+        for k in range(3):
+            rows = [i for i in range(N) if i % 3 == k]
+            a1, a2 = CS.error_sums(predict, images[rows], rows, ts, seed=0, batch=50)
+            shards.append(dict(t=ts, sum_mse=a1.tolist(), sum_sq=a2.tolist(), n=len(rows), ckpt="x", images=N, seed=0, data="toy", shard=k, shards=3))
+    finally:
+        CS.T_GRID = orig
+    tab = CS.merge(shards)
+    assert tab["n_images"] == N and torch.allclose(torch.tensor(tab["mse_x"], dtype=torch.float64), s1 / N, rtol=1e-12), (tab["mse_x"], s1 / N)
+    path = _tmp("tab.json")
+    import json
+    json.dump(tab, open(path, "w"))
+    from src.diffusion.flow_matching.gm_spread import SpreadTable
+    assert torch.allclose(SpreadTable(path)(torch.tensor(ts)).double(), torch.tensor(tab["s_x"], dtype=torch.float64), rtol=1e-6)
+    try:
+        CS.merge(shards[:2]); raise RuntimeError("merge took a missing shard")
+    except AssertionError:
+        pass
+    if os.path.exists(CS.VAL_TAR):   # the held-out data on a node that sees /scratch
+        data = CS.load_val(3)
+        assert all(x.shape == (3, 256, 256) and -1 <= x.min() and x.max() <= 1 and len(cap) > 0 for _, x, cap in data)
+        print(f"  load_val: {len(data)} images from {os.path.basename(CS.VAL_TAR)}, first caption '{data[0][2][:50]}...'")
+    print(f"  merge over 3 shards = one pass (rel. diff <= 1e-12); table rows {len(tab['t'])}")
+
+
+def _random_gm(B, K, H, W, per_pixel, seed):
+    g = torch.Generator().manual_seed(seed)
+    means = torch.randn(B, K, 3, H, W, generator=g)
+    lw = (torch.randn(B, K, 1, H, W, generator=g) * 2).log_softmax(1)
+    s_x = torch.rand(B, 1, 1, H, W, generator=g) * 0.6 + 0.01 if per_pixel else torch.rand(B, 1, 1, 1, 1, generator=g) * 0.6 + 0.01
+    x = torch.randn(B, 3, H, W, generator=g)
+    return means, lw, s_x, x
+
+
+class _GMNet(torch.nn.Module):
+    """A fixed mixture whose s_x at the call is given (any shape that broadcasts to (B, 1, 1, H, W))."""
+    def __init__(self, means, lw, s_x):
+        super().__init__(); self.means, self.lw, self.s_x = means, lw, s_x
+    def forward(self, x_t, t, y, y_mask=None, gm_mode="full"):
+        sigma = (1 - t[0]).clamp(min=G.EPS)
+        return dict(means=self.means, logweights=self.lw, logstd=torch.log(self.s_x) - torch.log(sigma))
+
+
+@test
+def T25():
+    """N1: the reference of the fused algorithm (gm_ode_triton.gm_ode_substeps_ref) equals GMODESampler's PyTorch sub-step loop, per image and per pixel s_x."""
+    from src.diffusion.flow_matching.gm_ode_triton import gm_ode_substeps_ref
+    for per_pixel in (False, True):
+        for K in (1, 3, 8):
+            means, lw, s_x, noise = _random_gm(2, K, 6, 5, per_pixel, seed=K)
+            calls, n = 3, 7
+            xs = sampler(GMODESampler, calls, substeps=n, rank_seed=False)._impl_sampling(_GMNet(means, lw, s_x), noise, None, None)[0]
+            steps = torch.linspace(0, 1, calls + 1)
+            for i in range(calls):
+                s0, s1 = 1 - steps[i], 1 - steps[i + 1]
+                sig = torch.stack([s0 + (s1 - s0) * (j / n) for j in range(n + 1)])
+                ref = gm_ode_substeps_ref(means, lw, s_x, xs[i], sig)
+                assert torch.allclose(ref, xs[i + 1], atol=2e-5, rtol=1e-5), (per_pixel, K, i, (ref - xs[i + 1]).abs().max())
+    print("  reference = the sampler's loop (K 1, 3, 8; s_x per image and per pixel; 3 calls x 7 sub-steps)")
+
+
+@test
+def T26():
+    """N1: the Triton kernel (TRITON_INTERPRET=1 on CPU, in a subprocess) equals the reference, and GMODESampler(fused=True) equals fused=False."""
+    if os.environ.get("TRITON_INTERPRET") != "1":
+        env = dict(os.environ, TRITON_INTERPRET="1")
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "T26"], env=env, capture_output=True, text=True, timeout=1200)
+        print("\n".join("  | " + l for l in r.stdout.splitlines() if l.strip() and not l.startswith("T26")))
+        assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+        return
+    from src.diffusion.flow_matching.gm_ode_triton import gm_ode_substeps_fused, gm_ode_substeps_ref
+    for per_pixel in (False, True):
+        for K, H, W, n in ((1, 8, 8, 2), (3, 12, 12, 5), (8, 9, 7, 16)):
+            means, lw, s_x, x = _random_gm(2, K, H, W, per_pixel, seed=10 + K)
+            for s0, s1 in ((1.0, 0.875), (0.5, 0.25), (0.125, 0.0)):
+                sig = torch.stack([torch.tensor(s0) + (torch.tensor(s1) - s0) * (j / n) for j in range(n + 1)])
+                a = gm_ode_substeps_fused(means, lw, s_x, x, sig, block=64)
+                b = gm_ode_substeps_ref(means, lw, s_x, x, sig)
+                assert torch.allclose(a, b, atol=1e-5, rtol=1e-5), (per_pixel, K, s0, (a - b).abs().max())
+    print("  kernel = reference (K 1, 3, 8; s_x per image and per pixel; pixels not a multiple of the block; sigma from 1 to 0)")
+    means, lw, s_x, noise = _random_gm(2, 8, 8, 8, False, seed=3)
+    net = _GMNet(means, lw, s_x)
+    a = sampler(GMODESampler, 4, substeps=8, fused=True, rank_seed=False)._impl_sampling(net, noise, None, None)[0][-1]
+    b = sampler(GMODESampler, 4, substeps=8, rank_seed=False)._impl_sampling(net, noise, None, None)[0][-1]
+    assert torch.allclose(a, b, atol=1e-5), (a - b).abs().max()
+    m, c, post_mean, post_std, noise = _gauss_toy(B=4)
+    ts = [i / 100 * 0.99 for i in range(101)]
+    true = _write_table(_tmp("true.json"), ts, [post_std(t) for t in ts])
+    f = lambda x, t, cond, **kw: post_mean(x, t.view(-1, 1, 1, 1))
+    a = sampler(GMODESampler, 4, substeps=8, fused=True, spread_table=true, rank_seed=False)._impl_sampling(f, noise, None, None)[0][-1]
+    b = sampler(GMODESampler, 4, substeps=8, spread_table=true, rank_seed=False)._impl_sampling(f, noise, None, None)[0][-1]
+    assert torch.allclose(a, b, atol=1e-5), (a - b).abs().max()
+    print("  sampler fused = not fused (K = 8 mixture; point model with a table)")
+
+
+
+@test
+def T27():
+    """G2/H3: eval_gmflow.sh names and arguments (gm_ode_cal, EVAL_SUBSTEPS) and evals_gmflow.sh task parsing (3 and 4 fields, --table), on stubbed copies (no env.sh, no GPU)."""
+    import re as _re
+    import tempfile
+    tmp = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+    # eval_gmflow.sh up to the output name, then print what it chose
+    src = open(os.path.join(REPO, "jobs/eval_gmflow.sh")).read()
+    src = src.replace("source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh", f"WC={tmp}")
+    head, sep, _ = src.partition("[ ! -f $OUT/metrics.json ]")
+    assert sep, "eval_gmflow.sh changed shape"
+    stub = os.path.join(tmp, "eval.sh")
+    open(stub, "w").write(head + 'echo "OUT=$(basename $OUT) SUBSTEPS=$SUBSTEPS SARGS=${SARGS[*]}"\n')
+    run_dir = os.path.join(tmp, "runs/gpic-speed/point_nodrop_d640/exp_ladder_d640")
+    os.makedirs(run_dir)
+    open(os.path.join(run_dir, "ms-step=066816.ckpt"), "w").close()
+    table = os.path.join(tmp, "table.json"); open(table, "w").write("{}")
+    env0 = {k: v for k, v in os.environ.items() if not k.startswith("EVAL_")}
+    env0["GMFLOW_WT"] = REPO
+    def ev(args, **extra):
+        r = subprocess.run(["bash", stub, *map(str, args)], env=dict(env0, **extra), capture_output=True, text=True)
+        return r.returncode, r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr
+    rc, out = ev([0, 66816, "euler", 8])
+    assert rc == 0 and out.startswith("OUT=eval_066816_euler_calls8 SUBSTEPS=16 "), out
+    rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table)
+    assert rc == 0 and "OUT=eval_066816_gm_ode_cal_calls8 SUBSTEPS=16 " in out and f"spread_table {table}" in out and "substeps 16" in out, out
+    rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table, EVAL_SUBSTEPS="4")
+    assert rc == 0 and "OUT=eval_066816_gm_ode_cal_calls8_n4 SUBSTEPS=4 " in out and "substeps 4" in out, out
+    rc, out = ev([0, 66816, "gm_ode_cal", 8])
+    assert rc == 2 and "EVAL_SPREAD_TABLE" in out, out
+    rc, out = ev([0, 66816, "euler", 8], EVAL_SUBSTEPS="4")
+    assert rc == 2 and "EVAL_SUBSTEPS is for" in out, out
+    k8 = os.path.join(tmp, "runs/gpic-speed/gmflow_k8_d640/exp_ladder_d640"); os.makedirs(k8)
+    open(os.path.join(k8, "ms-step=062336.ckpt"), "w").close()
+    rc, out = ev([8, 62336, "gm_ode", 4])
+    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls4 SUBSTEPS=32 "), out
+    rc, out = ev([8, 62336, "gm_ode", 4], EVAL_SUBSTEPS="8")
+    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls4_n8 SUBSTEPS=8 "), out
+    rc, out = ev([8, 62336, "gm_ode_cal", 4], EVAL_SPREAD_TABLE=table)
+    assert rc == 2 and "point model" in out, out
+    print("  eval_gmflow.sh: default names unchanged; gm_ode_cal needs the table and K = 0; EVAL_SUBSTEPS adds _n<n> and only for GM-ODE")
+    # evals_gmflow.sh with a stub worktree whose eval_gmflow.sh prints its arguments
+    wt = os.path.join(tmp, "project/gpic-wt/stubwt")   # merge: --wt <name> under $WC/project/gpic-wt replaces EVALS_WT
+    os.makedirs(os.path.join(wt, "baselines/PixelGen/src/diffusion/flow_matching")); os.makedirs(os.path.join(wt, "jobs"))
+    open(os.path.join(wt, "baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py"), "w").close()
+    open(os.path.join(wt, "jobs/eval_gmflow.sh"), "w").write('echo "ARGS=$* N=${EVAL_SUBSTEPS:-} T=${EVAL_SPREAD_TABLE:-}"\n')
+    subprocess.run("git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x", shell=True, cwd=wt, check=True)
+    src = open(os.path.join(REPO, "jobs/evals_gmflow.sh")).read().replace("source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh", f"WC={tmp}")
+    stub2 = os.path.join(tmp, "evals.sh"); open(stub2, "w").write(src)
+    root = os.path.join(tmp, "root")
+    def evs(args):
+        a = list(map(str, args)); a[6:6] = ["--wt", "stubwt"]
+        r = subprocess.run(["bash", stub2, *a], env=env0, capture_output=True, text=True)
+        logs = {os.path.basename(f): open(f).read().strip() for f in sorted(__import__("glob").glob(os.path.join(root, "eval_*.log")))}
+        return r.returncode, r.stdout, logs
+    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "66816:euler:8", "66816:gm_ode_cal:8:4"])
+    assert rc == 0, out
+    assert logs["eval_66816_euler_8.log"] == "ARGS=0 66816 euler 8 N= T=", logs
+    assert logs["eval_66816_gm_ode_cal_8_n4.log"] == "ARGS=0 66816 gm_ode_cal 8 N=4 T=", logs
+    import shutil; shutil.rmtree(root)
+    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "--table", table, "66816:gm_ode_cal:8"])
+    assert rc == 0 and logs["eval_66816_gm_ode_cal_8.log"] == f"ARGS=0 66816 gm_ode_cal 8 N= T={table}", logs
+    os.makedirs(os.path.join(root, "exp_ladder_d640/eval_066816_gm_ode_cal_calls8_n4")); open(os.path.join(root, "exp_ladder_d640/eval_066816_gm_ode_cal_calls8_n4/metrics.json"), "w").close()
+    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "66816:gm_ode_cal:8:4"])
+    assert rc == 0 and "done before" in out, out
+    print("  evals_gmflow.sh: 3-field tasks unchanged; a 4th field sets EVAL_SUBSTEPS and the _n<n> name; --table sets EVAL_SPREAD_TABLE; finished _n tasks skipped")
+
+
 if __name__ == "__main__":
     names = sys.argv[1:] or list(RESULTS)
     failed = []
