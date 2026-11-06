@@ -57,7 +57,7 @@ def make_pack(lens, Tp, dev, max_T=320):
     tok_b = torch.repeat_interleave(torch.arange(len(lens)), lt.long())
     pos = torch.cat([torch.arange(n) for n in lens])
     return {"lens": lt.to(dev), "cu": cu.to(dev), "tok_b": tok_b.to(dev), "pos": pos.to(dev),
-            "pidx": (tok_b * Tp + pos).to(dev), "Tp": Tp, "max_T": max_T}
+            "pidx": (tok_b * Tp + pos).to(dev), "kmask": (torch.arange(Tp)[None] < lt[:, None]).to(dev), "max_T": max_T}
 
 
 def rebalance_plan(all_lens, me, world, B):

@@ -45,7 +45,8 @@ def worker(rank, steps, q):
         ok &= cu[0] == 0 and cu[-1] == y2.shape[0] and all(cu[i + 1] - cu[i] == lens2[i] for i in range(B))
         ok &= torch.equal(pk["tok_b"], torch.repeat_interleave(torch.arange(B), torch.tensor(lens2)))
         ok &= torch.equal(pk["pos"], torch.cat([torch.arange(n) for n in lens2]))
-        ok &= torch.equal(pk["pidx"], pk["tok_b"] * pk["Tp"] + pk["pos"]) and pk["Tp"] >= max(lens2) and pk["Tp"] % 8 == 0
+        Tp = pk["kmask"].shape[1]
+        ok &= torch.equal(pk["pidx"], pk["tok_b"] * Tp + pk["pos"]) and Tp >= max(lens2) and Tp % 8 == 0 and torch.equal(pk["kmask"], torch.arange(Tp)[None] < pk["lens"][:, None].long())
         # the step's samples, over all ranks, are the original ones
         got = [None] * W
         dist.all_gather_object(got, [(s, i, lens2[i]) for i, s in enumerate(src)])

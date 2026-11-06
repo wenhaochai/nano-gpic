@@ -26,8 +26,10 @@ if _ATTN == "fa3":
 # only (no padded rows), the text blocks' attention is FA3 varlen, and the image blocks' keys keep the padded layout
 # [B, N + Tp] with per-sample key counts. The same math as the masked path (padded tokens never reach a real token there).
 # y_pack: lens [B] int32, cu [B + 1] int32 (offsets), tok_b [S] int64 (sample of each token), pos [S] int64 (position in
-# its caption), pidx [S] int64 (b * Tp + pos: the token's row in a padded [B * Tp] layout), Tp (int, >= the longest caption),
-# max_T (int, the bound for the varlen kernels: txt_max_length).
+# its caption), pidx [S] int64 (b * Tp + pos: the token's row in a padded [B * Tp] layout), kmask [B, Tp] bool (the valid
+# positions; Tp >= the longest caption comes from its shape, so torch.compile sees a dynamic size and not a new int per
+# step: as an int it recompiled per value and fell back to eager past the cache limit, w1323), max_T (int, the bound for
+# the varlen kernels: txt_max_length).
 
 
 def _rope_bshd(x, cos, sin):
@@ -104,7 +106,7 @@ class Attention(nn.Module):
     def forward(self, x: torch.Tensor, y, pos, mask=None) -> torch.Tensor:
         B, N, C = x.shape
         if isinstance(mask, dict):   # lever E: packed captions, y [S, C]
-            H, Hc, Tp = self.num_heads, C // self.num_heads, mask["Tp"]
+            H, Hc, Tp = self.num_heads, C // self.num_heads, mask["kmask"].shape[1]
             q, kx, vx = self.qkv_x(x).view(B, N, 3, H, Hc).unbind(2)
             q, kx = _rope_bshd(self.q_norm(q), pos[0], pos[1]), _rope_bshd(self.k_norm(kx), pos[0], pos[1])
             ky, vy = self.kv_y(y).view(-1, 2, H, Hc).unbind(1)
@@ -191,10 +193,9 @@ class TextRefineAttention(nn.Module):
             if _TEXT_ATTN == "fa3":
                 o = fa3_varlen(q, k, v, mask["cu"], mask["cu"], mask["max_T"], mask["max_T"])
             else:   # SDPA on the padded layout (faster than FA3 at T ~ 50, w1321); padded queries are dropped again
-                B, Tp = mask["lens"].shape[0], mask["Tp"]
+                B, Tp = mask["kmask"].shape
                 pad = lambda t: t.new_zeros(B * Tp, H, Hc).index_copy(0, mask["pidx"], t).view(B, Tp, H, Hc).transpose(1, 2)
-                km = (torch.arange(Tp, device=x.device)[None] < mask["lens"][:, None])[:, None, None, :]
-                o = attention(pad(q), pad(k), pad(v), attn_mask=km).transpose(1, 2).reshape(B * Tp, H, Hc)
+                o = attention(pad(q), pad(k), pad(v), attn_mask=mask["kmask"][:, None, None, :]).transpose(1, 2).reshape(B * Tp, H, Hc)
                 o = o.index_select(0, mask["pidx"])
             return self.proj_drop(self.proj(o.reshape(S, C)))
         B, N, C = x.shape
