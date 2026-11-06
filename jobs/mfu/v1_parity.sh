@@ -10,7 +10,7 @@
 # MFU freeze check (d) for the full ladder (genmodel, 2026-11-06): loss parity over >= 1000 steps on the production path
 # (jobs/mfu/arm.sh: Lightning, real GPIC Lite batches, the ladder's shard seed 20261106), the same batches in every arm
 # (GPIC_MFU_DET_DATA=1). Arms: levers off (twice: is the reference run-to-run identical?), A alone (FA3; accepted at
-# bf16 level in w1321: the floor), all levers (A + B FSDP2 + C + D + E). tools/mfu/parity_loss.py compares the per-step
+# bf16 level in w1321: the floor), all levers (A + B FSDP2 + C + D + E), all but E. tools/mfu/parity_loss.py compares the per-step
 # global loss (mean of the 8 ranks); step time and memory per arm from the step timer.
 # usage: v1_parity.sh <code worktree> <d640 | d1280> <steps>
 set -o pipefail
@@ -30,8 +30,9 @@ arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee 
 arm off_a ${A[@]} $STEPS
 GPIC_MFU_ATTN=fa3 arm A ${A[@]} $STEPS
 GPIC_MFU_ATTN=fa3 GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1 GPIC_MFU_UINT8=1 GPIC_MFU_GPU_RESIZE=1 arm all ${A[@]} $STEPS
+GPIC_MFU_ATTN=fa3 GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP GPIC_MFU_UINT8=1 GPIC_MFU_GPU_RESIZE=1 arm all_noE ${A[@]} $STEPS
 [ $SZ = d640 ] && arm off_b ${A[@]} $STEPS
 cd $WT
-python tools/mfu/bench_summary.py $OUT/off_a $OUT/A $OUT/all $( [ $SZ = d640 ] && echo $OUT/off_b ) --skip 100 | tee -a $OUT/summary.txt
-python tools/mfu/parity_loss.py $OUT/off_a $OUT/A $OUT/all $( [ $SZ = d640 ] && echo $OUT/off_b ) | tee -a $OUT/summary.txt
+python tools/mfu/bench_summary.py $OUT/off_a $OUT/A $OUT/all $OUT/all_noE $( [ $SZ = d640 ] && echo $OUT/off_b ) --skip 100 | tee -a $OUT/summary.txt
+python tools/mfu/parity_loss.py $OUT/off_a $OUT/A $OUT/all $OUT/all_noE $( [ $SZ = d640 ] && echo $OUT/off_b ) | tee -a $OUT/summary.txt
 echo "DONE $OUT"

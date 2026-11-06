@@ -27,9 +27,8 @@ if _ATTN == "fa3":
 # [B, N + Tp] with per-sample key counts. The same math as the masked path (padded tokens never reach a real token there).
 # y_pack: lens [B] int32, cu [B + 1] int32 (offsets), tok_b [S] int64 (sample of each token), pos [S] int64 (position in
 # its caption), pidx [S] int64 (b * Tp + pos: the token's row in a padded [B * Tp] layout), kmask [B, Tp] bool (the valid
-# positions; Tp >= the longest caption comes from its shape, so torch.compile sees a dynamic size and not a new int per
-# step: as an int it recompiled per value and fell back to eager past the cache limit, w1323), max_T (int, the bound for
-# the varlen kernels: txt_max_length).
+# positions; Tp >= the longest caption comes from its shape), onehot [S, B] bool (token s belongs to sample b), max_T
+# (int, the bound for the varlen kernels: txt_max_length).
 
 
 def _rope_bshd(x, cos, sin):
@@ -232,7 +231,11 @@ class TextRefineBlock(nn.Module):
 
     def forward(self, x, c, mask=None):
         if isinstance(mask, dict):   # lever E: x [S, C]; each token takes its sample's modulation
-            m = self.adaLN_modulation(c).squeeze(1).index_select(0, mask["tok_b"])
+            # each token takes its sample's modulation as a product with the [S, B] one-hot assignment: the forward gives
+            # exactly the gathered values (1.0 times one value, fp32 accumulation), and the backward sums each sample's
+            # tokens in one fp32-accumulated GEMM, as the padded path's broadcast does, where an index_select would
+            # accumulate them with bf16 atomics (index_add, through Inductor's proxy executor)
+            m = mask["onehot"].to(c.dtype) @ self.adaLN_modulation(c).squeeze(1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = m.chunk(6, dim=-1)
             x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), mask)
             return x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))

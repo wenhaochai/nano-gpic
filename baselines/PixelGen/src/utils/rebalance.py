@@ -122,6 +122,7 @@ class Rebalancer:
         tok_b = torch.repeat_interleave(torch.arange(B, device=dev), new_lens, output_size=S_new)
         pos = torch.arange(S_new, device=dev) - cu[:-1].long().index_select(0, tok_b)
         kmask = torch.arange(Tp, device=dev)[None] < new_lens[:, None]   # its shape carries Tp (a dynamic size, not an int)
+        onehot = tok_b[:, None] == torch.arange(B, device=dev)[None]
         pack = {"lens": new_lens.int(), "cu": cu, "tok_b": tok_b, "pos": pos, "pidx": tok_b * Tp + pos, "kmask": kmask,
-                "max_T": self.max_T}
+                "onehot": onehot, "max_T": self.max_T}
         return x, y, pack
