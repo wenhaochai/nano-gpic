@@ -25,7 +25,7 @@
 9. 表里还记了每个 t 的标准误和 s_x_trivial = (1 − t) / t（估计量 x_t / t 的误差）。
 10. `gm_spread.py` 的 `SpreadTable` 读表，在 t 上线性插值，超出两端取端点值。
 11. `GMODESampler(spread_table=...)`：每次调用把 x̂ 变成一个高斯 N(x̂, s_x(t)²)，再做和 K = 1 相同的解析子步。
-12. `eval_gmflow.sh` 新增采样器 `gm_ode_cal`：只用于 K = 0，必须给 `EVAL_SPREAD_TABLE`，输出目录是 `eval_<step>_gm_ode_cal_calls<calls>`，表会复制到输出目录。
+12. `eval_gmflow.sh` 新增采样器 `gm_ode_cal`：只用于 K = 0，必须给 `EVAL_SPREAD_TABLE`，表会复制到输出目录。合并后（2026-11-06）输出目录是 `eval_<step>_gm_ode_cal-<表文件 sha1 的前 8 位>_calls<calls>`，表的 ckpt 必须是 ms-step=<step>，每次调用的 s_x(t) 不能超过 (1 − t) / t（docs/gmflow.md 第 10 节）。
 
 ### 2.2 N：融合子步的 Triton 核
 
