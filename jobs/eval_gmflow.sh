@@ -9,21 +9,23 @@
 #FETCHABLE
 # GPIC evaluation of one GMFlow checkpoint (docs/gmflow.md) with one sampler at one number of network calls: 50K test captions, each prompt's own noise, EMA net, no CFG, FD-DINOv2 / PRDC / MMD
 # (the protocol of jobs/eval_energy.sh). K = 0 evaluates the point model w1147 (runs/gpic-speed/point_nodrop_d640) with the same samplers.
-# usage: eval_gmflow.sh <K: 8 | 1 | 0> <step> <sampler: gm_sde | gm_sde_final_mean | gm_ode | euler_mean | euler> <calls: 50 | 8>
+# usage: eval_gmflow.sh <K: 0 or the run's K> <step> <sampler: gm_sde | gm_sde_final_mean | gm_ode | euler_mean | euler> <calls>
 #   gm_sde: GM-SDE, first order, the last step returns a draw (for K = 0: DDPM with the small variance). gm_sde_final_mean: the last step returns the mixture mean.
 #   gm_ode: GM-ODE, first order, ceil(128 / calls) analytic sub-steps per call (3 at 50, 16 at 8). euler_mean / euler: the official Euler on the mixture mean (for K = 0: the official Euler).
 # Output: <run>/eval_<step>_<sampler>_calls<calls>/metrics.json. It never overwrites a finished result; a directory without metrics.json is moved aside.
-# Env (smoke test only): LADDER_RUN_ROOT (run root), EVAL_LIMIT_BATCHES (predict only that many batches per rank, keep the samples, skip the FD).
+# Env: LADDER_RUN_ROOT (run root); EVAL_SIZE, EVAL_D, EVAL_NB, EVAL_NT (run directory exp_ladder_<size>, width and blocks; default d640, 640, 9, 2; jobs/evals_gmflow.sh sets them);
+# EVAL_LIMIT_BATCHES (smoke test only: predict only that many batches per rank, keep the samples, skip the FD).
 set -eo pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 K=$1 STEP=$(printf %06d $2) SAMPLER=$3 CALLS=$4
 [ $# -eq 4 ] || { echo "usage: eval_gmflow.sh <K> <step> <sampler> <calls>"; exit 2; }
 WT=${GMFLOW_WT:-$WC/project/gpic-wt/gmflow}   # run_gmflow.sh and eval_point_sampler.sh name the frozen worktree
 case $K in
-  8|1) DEF_ROOT=$WC/runs/gpic-speed/gmflow_k${K}_d640 ;;
   0) DEF_ROOT=$WC/runs/gpic-speed/point_nodrop_d640 ;;
-  *) echo "K must be 8, 1 or 0"; exit 2 ;;
+  [1-9]|[1-9][0-9]) DEF_ROOT=$WC/runs/gpic-speed/gmflow_k${K}_d640 ;;
+  *) echo "K must be 0 to 99"; exit 2 ;;
 esac
+SIZE=${EVAL_SIZE:-d640} WD=${EVAL_D:-640} NB=${EVAL_NB:-9} NT=${EVAL_NT:-2}
 SUBSTEPS=$(( (128 + CALLS - 1) / CALLS )); [ $SUBSTEPS -ge 2 ] || SUBSTEPS=2
 case $SAMPLER in
   gm_sde) SARGS=(--config configs_h100/gmflow_sde_sample.yaml) ;;
@@ -35,20 +37,22 @@ esac
 if [ $K -eq 0 ] && { [ $SAMPLER = gm_ode ] || [ $SAMPLER = gm_sde_final_mean ]; }; then echo "$SAMPLER needs a mixture (K > 0)"; exit 2; fi
 if [ $K -gt 0 ] && [ $SAMPLER = euler ]; then echo "use euler_mean for K > 0"; exit 2; fi
 [ -f "$WT/baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py" ] || { echo "$WT holds old code"; exit 2; }
-RUN=${LADDER_RUN_ROOT:-$DEF_ROOT}/exp_ladder_d640
+RUN=${LADDER_RUN_ROOT:-$DEF_ROOT}/exp_ladder_$SIZE
 CKPT=$(ls -t $RUN/ms-*$STEP*.ckpt 2>/dev/null | head -1); [ -n "$CKPT" ] || { echo "no ms checkpoint for step $STEP in $RUN"; exit 2; }
 OUT=$RUN/eval_${STEP}_${SAMPLER}_calls${CALLS}
 [ ! -f $OUT/metrics.json ] || { echo "$OUT/metrics.json exists; not overwriting"; exit 3; }
 [ ! -d $OUT ] || mv $OUT $OUT.unfinished_$(date +%m%d_%H%M%S)
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
-# the checkpoint loads with strict=False, so a wrong head would give a wrong FD and no error
-python - "$CKPT" $K <<'PY'
-import sys, torch
+# the checkpoint loads with strict=False, so a wrong head or size would give a wrong FD and no error
+python - "$CKPT" $K $WD $NB $NT <<'PY'
+import re, sys, torch
 sd = torch.load(sys.argv[1], map_location="cpu", mmap=True, weights_only=False)["state_dict"]
-k = int(sys.argv[2])
+k, d, nb, nt = map(int, sys.argv[2:])
 out = sd["ema_denoiser.final_layer.linear.weight"].shape[0]
-assert sd["ema_denoiser.y_pos_embedding"].shape[-1] == 640, "not a d640 checkpoint"
+n = lambda part: len({m.group(1) for key in sd for m in [re.match(rf"ema_denoiser\.{part}\.(\d+)\.", key)] if m})
+got = (sd["ema_denoiser.y_pos_embedding"].shape[-1], n("blocks"), n("text_refine_blocks"))
+assert got == (d, nb, nt), f"checkpoint has d, nb, nt = {got}, arguments {(d, nb, nt)}"
 assert out == (k * 4 * 256 if k else 768), f"final layer has {out} outputs, K = {k}"
 assert any(n.startswith("ema_denoiser.gm_logstd") for n in sd) == (k > 0), "s-MLP presence does not match K"
 PY
@@ -58,8 +62,8 @@ LIMIT=(); [ -z "${EVAL_LIMIT_BATCHES:-}" ] || LIMIT=(--trainer.limit_predict_bat
 t0=$(date +%s)
 WANDB_MODE=disabled python main.py predict --config configs_h100/lite_ladder_sample.yaml "${SARGS[@]}" --trainer.devices 8 \
   --trainer.default_root_dir "$OUT/pred" --ckpt_path "$CKPT" --model.diffusion_sampler.init_args.num_steps $CALLS \
-  --model.denoiser.init_args.hidden_size 640 --model.denoiser.init_args.num_groups 10 \
-  --model.denoiser.init_args.num_blocks 9 --model.denoiser.init_args.num_text_blocks 2 --model.denoiser.init_args.gm_k $K \
+  --model.denoiser.init_args.hidden_size $WD --model.denoiser.init_args.num_groups $((WD / 64)) \
+  --model.denoiser.init_args.num_blocks $NB --model.denoiser.init_args.num_text_blocks $NT --model.denoiser.init_args.gm_k $K \
   --data.pred_dataset.init_args.noise_per_prompt true "${LIMIT[@]}" > $OUT/predict.log 2>&1
 t1=$(date +%s)
 NPZ=$(find "$OUT/pred" -name output.npz | head -1)
