@@ -10,7 +10,9 @@
 # MFU per-width table (docs/mfu.md): on the production path (jobs/mfu/arm.sh, real Lite batches, shard seed 20261106, the
 # same batches in every arm, each rank's loss per step), for each given width: levers off, then each given lever set.
 # usage: widths.sh <code worktree> <steps> <width>:<set>[,<set>...] ...   sets: ACD, ACDE, ABCD, ABCDE (A FA3, B FSDP2,
-#   C GPU resize, D uint8, E packed + rebalanced captions), off (a second levers-off arm, d<width>_off2)
+#   C GPU resize, D uint8, E packed + rebalanced captions, L AdamW and EMA on the local shards (B2), G<k> k blocks per
+#   FSDP2 unit, P torch.profiler over steps 500-505 and per-stage CUDA events: read the median), off (a second
+#   levers-off arm, d<width>_off2)
 # Parity floor (tools/mfu/parity_loss.py): off2 if listed, else the first set (put a rounding-only set first: ACD changes
 # only the attention kernel's rounding, C and D are bit-exact).
 set -o pipefail
@@ -39,6 +41,9 @@ for spec in "$@"; do
     [[ $s == *C* ]] && env+=(GPIC_MFU_GPU_RESIZE=1)
     [[ $s == *D* ]] && env+=(GPIC_MFU_UINT8=1)
     [[ $s == *E* ]] && env+=(GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1)
+    [[ $s == *L* ]] && env+=(GPIC_MFU_LOCAL_OPT=1)
+    [[ $s =~ G([0-9]+) ]] && env+=(GPIC_MFU_FSDP_GROUP=${BASH_REMATCH[1]})
+    [[ $s == *P* ]] && env+=(BENCH_STAGES=1 BENCH_PROFILE=500:505)
     ( export "${env[@]}"; arm d${d}_$s $d $nb $nt $STEPS )
   done
 done

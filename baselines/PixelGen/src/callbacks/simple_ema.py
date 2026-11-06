@@ -31,6 +31,10 @@ class SimpleEMA(Callback):
         self._groups = [([e for e, d in zip(self.ema_params, dt) if d == k], [n for n, d in zip(self.net_params, dt) if d == k])
                         for k in (True, False)]
         self._groups = [g for g in self._groups if g[0]]
+        # MFU lever B2 (GPIC_MFU_LOCAL_OPT=1): the lerp on the DTensors' local tensors, taken at every step (FSDP2 may
+        # re-point a shard's local tensor at its lazy init): the same kernel on the same data without DTensor's dispatch
+        import os
+        self._local = os.environ.get("GPIC_MFU_LOCAL_OPT") == "1"
 
     def ema_step(self):
         @torch.no_grad()
@@ -43,6 +47,9 @@ class SimpleEMA(Callback):
         self._stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._stream):
             for ema_g, net_g in self._groups:
+                if self._local:
+                    from src.utils.fsdp_setup import _local
+                    ema_g, net_g = _local(ema_g), _local(net_g)
                 ema_update(ema_g, net_g, self.decay)
         assert self.ema_params[0].dtype == torch.float32
 

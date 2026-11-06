@@ -168,6 +168,10 @@ class LightningModel(pl.LightningModule):
                             {"params": [p for p in params_denoiser if not is_dtensor(p)]}] + [g for g in param_groups[1:] if g["params"]]
         # optimizer: torch.optim.Optimizer = self.optimizer([*params_trainer, *params_denoiser])
         optimizer: torch.optim.Optimizer = self.optimizer(param_groups)
+        if os.environ.get("GPIC_MFU_FSDP") == "1" and os.environ.get("GPIC_MFU_LOCAL_OPT") == "1":
+            from src.utils.fsdp_setup import ShardLocalAdamW   # MFU lever B2: AdamW on the shards' local tensors
+            assert type(optimizer) is torch.optim.AdamW and optimizer.defaults["fused"], type(optimizer)
+            optimizer = ShardLocalAdamW.like(optimizer, param_groups)
         if self.lr_scheduler is None:
             return dict(
                 optimizer=optimizer

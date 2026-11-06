@@ -15,6 +15,7 @@
 """
 import torch
 import torch.distributed as dist
+from torch.optim.optimizer import _use_grad_for_differentiable
 
 
 def _keep(net):
@@ -25,15 +26,25 @@ def _keep(net):
     return keep
 
 
-def shard(net, mesh, compute_bf16, compile_blocks):
-    """fully_shard every text and main block, then the root. Returns the replicated (ignored) parameters."""
+def shard(net, mesh, compute_bf16, compile_blocks, group=None):
+    """fully_shard the text and main blocks, then the root. Returns the replicated (ignored) parameters.
+    group (GPIC_MFU_FSDP_GROUP, default 1): consecutive blocks per FSDP2 unit (a list of modules is one unit: one
+    all-gather, one reduce-scatter, one set of hooks), text and main blocks apart. Fewer units, less host work per step;
+    the same math (the same parameters gathered, the same gradients reduced)."""
+    import os
     from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16 if compute_bf16 else None, reduce_dtype=torch.float32,
                               cast_forward_inputs=False)   # the blocks' RoPE tables and masks stay as they are
     keep = _keep(net)
-    for blk in list(net.text_refine_blocks) + list(net.blocks):
-        fully_shard(blk, mesh=mesh, mp_policy=mp, reshard_after_forward=False, ignored_params=keep & set(blk.parameters()))
-        if compile_blocks:
+    g = int(group or os.environ.get("GPIC_MFU_FSDP_GROUP", "1"))
+    for blocks in (list(net.text_refine_blocks), list(net.blocks)):
+        for i in range(0, len(blocks), g):
+            unit = blocks[i:i + g]
+            own = keep & {p for b in unit for p in b.parameters()}
+            fully_shard(unit if len(unit) > 1 else unit[0], mesh=mesh, mp_policy=mp, reshard_after_forward=False,
+                        ignored_params=own)
+    if compile_blocks:
+        for blk in list(net.text_refine_blocks) + list(net.blocks):
             blk.compile()
     fully_shard(net, mesh=mesh, mp_policy=mp, reshard_after_forward=False, ignored_params=keep)
     return [p for p in net.parameters() if p in keep]
@@ -75,3 +86,44 @@ def clip_grad_norm_(params, max_norm):
     if rp:
         torch._foreach_mul_(rp, coef)
     return norm
+
+
+def _local(ts):
+    from torch.distributed.tensor import DTensor
+    return [t._local_tensor if isinstance(t, DTensor) else t for t in ts]
+
+
+class ShardLocalAdamW(torch.optim.AdamW):
+    """MFU lever B2 (GPIC_MFU_LOCAL_OPT=1, docs/mfu.md): AdamW's step on the local shards of the DTensor parameters. Adam.step
+    of torch 2.7 line for line (the same _init_group, so the state holds the same DTensors and the checkpoints keep their
+    layout), except that torch.optim.adam.adam receives each DTensor's local tensor: the same fused kernel on the same data,
+    without DTensor's dispatch of the 4 x 129-tensor op (CPU: 14.8 against 4.9 ms per step at d1024's sizes). Every
+    placement here is Shard(0) on one mesh, where DTensor runs exactly this local op."""
+
+    @classmethod
+    def like(cls, opt, param_groups):
+        d = opt.defaults
+        return cls(param_groups, lr=d["lr"], betas=d["betas"], eps=d["eps"], weight_decay=d["weight_decay"],
+                   amsgrad=d["amsgrad"], maximize=d["maximize"], foreach=d["foreach"], capturable=d["capturable"],
+                   differentiable=d["differentiable"], fused=d["fused"])
+
+    @_use_grad_for_differentiable
+    def step(self, closure=None):
+        from torch.optim.adam import adam
+        self._cuda_graph_capture_health_check()
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            params_with_grad, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs, state_steps = [], [], [], [], [], []
+            beta1, beta2 = group["betas"]
+            has_complex = self._init_group(group, params_with_grad, grads, exp_avgs, exp_avg_sqs, max_exp_avg_sqs,
+                                           state_steps)
+            adam(_local(params_with_grad), _local(grads), _local(exp_avgs), _local(exp_avg_sqs), _local(max_exp_avg_sqs),
+                 state_steps, amsgrad=group["amsgrad"], has_complex=has_complex, beta1=beta1, beta2=beta2, lr=group["lr"],
+                 weight_decay=group["weight_decay"], eps=group["eps"], maximize=group["maximize"], foreach=group["foreach"],
+                 capturable=group["capturable"], differentiable=group["differentiable"], fused=group["fused"],
+                 grad_scale=getattr(self, "grad_scale", None), found_inf=getattr(self, "found_inf", None),
+                 decoupled_weight_decay=group["decoupled_weight_decay"])
+        return loss

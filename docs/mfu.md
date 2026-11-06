@@ -149,6 +149,29 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   The AVG hook (no per-parameter divide kernels) and smaller buckets give nothing; FSDP2 does.
 - Correctness: pending (loss parity against DDP, production path).
 
+### B2. AdamW and EMA on the shards' local tensors, and blocks per FSDP2 unit (`GPIC_MFU_LOCAL_OPT=1`, `GPIC_MFU_FSDP_GROUP=k`)
+- Hypothesis: B costs host time per step that a short step cannot hide: d640 +19.5 ms, d768 +17.8, d1024 +6.7 against
+  DDP with A + C + D. Two sources: DTensor's dispatch of the optimizer and EMA ops, and FSDP2's hooks, one set per unit (16
+  units at d1024).
+- CPU (tools/mfu/dtensor_overhead.py, d1024's 129 sharded tensors, dispatch only): EMA lerp on DTensors 0.70 ms, on
+  local tensors 0.13; fused AdamW on DTensors 2.78 ms, ShardLocalAdamW 1.06, plain 0.88 (a loaded vis node gave 2.1 / 14.8 /
+  4.9 ms: the host's load scales it).
+- Setup: src/utils/fsdp_setup.ShardLocalAdamW (torch 2.7's Adam.step with each DTensor's local tensor passed to
+  torch.optim.adam.adam: the same fused kernel on the same data; the state keeps its DTensors, so checkpoints keep their
+  layout); SimpleEMA lerps the local tensors, taken at every step. shard(group=k) makes k consecutive blocks one FSDP2
+  unit (fully_shard of a module list: one all-gather, one reduce-scatter, one set of hooks).
+- Correctness (CPU, 2 ranks, gloo): tools/mfu/tests/test_local_opt.py: ShardLocalAdamW = AdamW(fused) on DTensors bitwise
+  over 6 steps (uneven and empty shards, a parameter without a gradient, weight decay 0 and 0.1, a group with its own lr),
+  the same state_dict, and it continues bitwise from AdamW's state_dict; the local EMA lerp = the DTensor lerp.
+  tools/mfu/tests/test_fsdp_group_cpu.py: a real FSDP2 step (forward, backward, replicated sync, clip, AdamW) with 1-block
+  units and AdamW = 3-block units and ShardLocalAdamW, bitwise, and both = plain data parallel within 2e-7 (gradients) after
+  one step. Note: gloo sums where FSDP2 asks for ReduceOp.AVG (the test translates it; NCCL averages). AdamW hides any
+  uniform or per-tensor gradient scale (and the clip rarely acts at grad norm ~0.2 against 1.0), so a scale error never
+  shows in the loss: check gradients or Adam's moments. The smoke's moments (exp_avg_sq FSDP2 / DDP: median 1.04 sharded,
+  1.30 replicated, inside the DDP / DDP scatter) rule out a scale error in production.
+- Expectation: B pays at d1024 (24% of the full ladder's GPU-h) and maybe d896.
+- Result: pending (GPU, prio 0).
+
 ### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
 - Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches
   (13%) make a step wait in about two thirds of the steps (5.9 ms at d640, 6.1 ms at d1280, w1316). A FLOP model of the
