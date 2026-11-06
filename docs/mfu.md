@@ -41,6 +41,35 @@ backward 115.5, optimizer 27.8. The backward is 2.7-2.85 x the forward: it inclu
 NCCL picks NVLS + Simple for the 1000 MiB buckets; a 1 GB bucket takes 13-15 ms while the backward runs beside it and 5.6
 ms alone (334 GB/s), so the all-reduce and the backward kernels slow each other.
 
+## Production path (Lightning, real GPIC Lite batches, 8 GPUs, the same batches in every arm), 2026-11-06
+
+Mean step over 1024-1216 steps (jobs/mfu/v1_parity.sh, probe11, widths.sh; mean of every step after the first 100):
+
+| width | levers off | A | A + C + D | A + B + C + D | A + C + D + E | job |
+|---|---|---|---|---|---|---|
+| d640 | 26.33 / 26.36 ms (12.8%) | 26.56 | 24.36 (13.8%) | 43.89 | 27.23 | w1389, w1394 |
+| d1024 | 52.14 (21.5%) | 47.65 (23.5%) | 48.20 | 54.87 | - | w1394 |
+| d1280 | 83.18 (24.2%) | 76.02 (26.5%) | - | 64.86 (31.0%) | - | w1390 |
+| d1536 | (136.5 median, 5cd3372 smoke w1322) | | | 102.9 median (A+B+C+D+F, smoke w1391) | | |
+| d1792 | (193.0 median, w1322) | | | 145.2 median (w1391) | | |
+
+- B (FSDP2) needs a GPU-bound step: it adds host work per block (hooks, per-block graphs), which costs where the host binds
+  (d640, d1024) and is hidden from d1280 on. Default: on from d1280.
+- C + D pay where the data path's CPUs bind (d640: -7.6%); E costs more than it saves at d640 even with bucketed rows
+  (its per-step gloo plan and two all_to_all calls add host work to a host-bound step). E stays off by default.
+- Saves (lever F, w1391): a save step adds up to 15.3 s at d1536 and 21.9 s at d1792 (36.6 s and 57.8 s before).
+
+Parity (the per-step global loss, mean of the 8 ranks): every arm, the levers-off repeat included, diverges from the
+reference chaotically, from about 1e-8 at step 100 to about 1% by step 1000; what differs is the onset. A (FA3) and the
+levers-off repeat stay below 1e-7 for 100 steps; arms with B start near 1e-5, and so does DDP with FSDP2's per-block
+compile units and nothing else (probe11 d640_perblock: 1.67e-5 over the first 100 steps), so B's earlier onset comes from
+the compile boundaries (the residual stream rounded to bf16 at every block boundary), not from FSDP2's math. Mean |loss
+difference| over the last 200 steps against levers off: d640 off repeat 1.64e-3, A 1.67e-3, A+B+C+D 2.41e-3 (w1389);
+A+C+D 6.5e-4 against the per-block control's 6.95e-4 (w1394, another seed of the chaos); d1024 A 1.98e-3, A+C+D 2.54e-3,
+A+B+C+D 2.14e-3; d1280 A 2.87e-3, A+B+C+D 1.91e-3. Mean loss over the last 500 steps: d640 off 0.176508 / repeat
+0.176503 / A 0.176514 / A+B+C+D 0.176917; d1024 off 0.181052 / A 0.181480 / A+C+D 0.180495 / A+B+C+D 0.180826; d1280 off
+0.173608 / A 0.173773 / A+B+C+D 0.173339: the lever arms fall inside the scatter of the same-math arms.
+
 ## Levers (hypothesis, setup, expectation, result, decision)
 
 ### A. FlashAttention-3 for the masked attention (`GPIC_MFU_ATTN=fa3`)
