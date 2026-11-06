@@ -16,9 +16,11 @@
 #    past the end of pass 0;
 # 3. tools/check_shard_resume.py: the checks of the shard log and the resume, the step-time table of part 1.
 # Exit 1 when any part fails. W&B runs get smoke ids, never the production ids ladder-full-<size>.
+# usage: smoke_full.sh [code worktree, default gpic-wt/ladder_full] (wq snapshots this script, not the code it runs, so a
+# smoke of a commit names a detached worktree at that commit)
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-WT=${SMOKE_WT:-$WC/project/gpic-wt/ladder_full}
+WT=${1:-$WC/project/gpic-wt/ladder_full}
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }
 TS=$(date +%m%d_%H%M)
 SMK=$WC/runs/gpic-speed/full_smoke_$TS
