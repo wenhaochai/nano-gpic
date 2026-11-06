@@ -52,18 +52,25 @@ class GMFlowTrainer(JiTTrainer):
             self._calls += 1
             if self._calls % self._print_every == 0:
                 d = self.diagnostics(gm, sigma_high.view(-1))
-                print(f"[gmflow] call {self._calls}: loss {out['loss'].item():.5f} s_u {d['gm/s_u'].item():.4f} n_eff {d['gm/n_eff'].item():.3f} max_w {d['gm/max_w'].item():.3f}", flush=True)
+                pix = f" logsu_pix_mean {d['gm/logsu_pix_mean'].item():.4f} logsu_pix_std {d['gm/logsu_pix_std'].item():.4f}" if "gm/logsu_pix_std" in d else ""
+                print(f"[gmflow] call {self._calls}: loss {out['loss'].item():.5f} s_u {d['gm/s_u'].item():.4f} n_eff {d['gm/n_eff'].item():.3f} max_w {d['gm/max_w'].item():.3f}{pix}", flush=True)
         return out
 
     @staticmethod
     @torch.no_grad()
     def diagnostics(gm, sigma):
-        """Mean s_u; per-pixel effective number of components exp(H(A)); the largest of the K mean weights; s_u and n_eff in four bins of sigma_high (NaN when a bin is empty)."""
+        """Mean s_u; per-pixel effective number of components exp(H(A)); the largest of the K mean weights; s_u and n_eff in four bins of sigma_high (NaN when a bin is empty).
+        With a per-pixel spread (logstd (B, 1, 1, H, W)): s_u is each sample's mean over its pixels, and gm/logsu_pix_mean and gm/logsu_pix_std are the mean and the
+        standard deviation over the pixels of log s_u, averaged over the batch."""
         lw = gm["logweights"].squeeze(2)                                   # (B, K, H, W)
         w = lw.exp()
         n_eff = torch.exp(-(w * lw).sum(1)).mean((1, 2))                   # (B,)
-        s_u = gm["logstd"].view(-1).exp()                                  # (B,)
+        ls = gm["logstd"]
+        s_u = ls.exp().flatten(1).mean(1)                                  # (B,); one value per sample unless the spread is per pixel
         out = {"gm/s_u": s_u.mean(), "gm/n_eff": n_eff.mean(), "gm/max_w": w.mean((0, 2, 3)).max()}
+        if ls[0].numel() > 1:
+            out["gm/logsu_pix_mean"] = ls.flatten(1).mean(1).mean()
+            out["gm/logsu_pix_std"] = ls.flatten(1).std(1).mean()
         for lo, hi in zip(SIGMA_BINS[:-1], SIGMA_BINS[1:]):
             m = ((sigma >= lo) & (sigma < hi)).float()
             n = m.sum()

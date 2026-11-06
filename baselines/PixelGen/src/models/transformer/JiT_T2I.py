@@ -329,6 +329,7 @@ class JiT_T2I(nn.Module):
             code_rate=0.0,
             head_width=0,
             gm_k=0,
+            gm_spread="image",
     ):
         """xi_dim > 0 makes the model an implicit sampler of p(x | x_t, y) (docs/distribution_step.md): before block xi_block the batch
         forks into m copies, and each copy gets its own noise. xi_dim = 0 is the official point model, unchanged.
@@ -337,11 +338,16 @@ class JiT_T2I(nn.Module):
         head_width > 0 is test E (docs/energy_head.md): the backbone runs once per input and EnergyHead, in place of FinalLayer, draws m samples, each with its own noise.
         head_width = 0 is the official point model, unchanged.
         gm_k > 0 is GMFlow (docs/gmflow.md): per pixel, a mixture of gm_k Gaussians over the clean RGB value, with K x-means, K logits and one std per sample (s_x = (1 - t) s_u).
-        gm_k = 0 is the official point model, unchanged."""
+        gm_k = 0 is the official point model, unchanged.
+        gm_spread (gm_k > 0 only, docs/gmflow.md section 7): "image" = one log s_u per sample, as GMFlow; "pixel" = that log s_u plus an offset per pixel from
+        gm_spread_head, a zero-initialized Linear(hidden, p^2) per token on the detached input of the final linear. The offset is shared by the C channels and the
+        K components of a pixel. "image" is the model before this option, unchanged."""
         super().__init__()
         assert not (head_width and xi_dim), "the energy head and the implicit fork are two different models"
         assert not (gm_k and (head_width or xi_dim or code_dim)), "the GMFlow head is a model of its own"
+        assert gm_spread in ("image", "pixel") and (gm_spread == "image" or gm_k), (gm_spread, gm_k)
         self.gm_k = gm_k
+        self.gm_spread = gm_spread
         self.head_width = head_width
         self.xi_dim, self.xi_block = xi_dim, xi_block
         self.code_dim, self.code_rate = code_dim, code_rate
@@ -391,6 +397,11 @@ class JiT_T2I(nn.Module):
             self.code_prior = CodePrior(code_dim, txt_embed_dim)
 
         self.initialize_weights()
+        if gm_spread == "pixel":   # after initialize_weights and with the CPU RNG restored, so every other parameter and every later draw are the "image" model's;
+            with torch.random.fork_rng(devices=[]):   # zero, so at init it is that model
+                self.gm_spread_head = nn.Linear(hidden_size, patch_size ** 2)
+            nn.init.constant_(self.gm_spread_head.weight, 0)
+            nn.init.constant_(self.gm_spread_head.bias, 0)
         self.precompute_pos = dict()
         self.weight_path = weight_path
         self.load_ema = load_ema
@@ -516,7 +527,7 @@ class JiT_T2I(nn.Module):
         official unmasked path (y padded to txt_max_length). m: samples per input of the implicit sampler; the
         output is [B * m, C, H, W], each input's samples next to each other. z: plan A's code, [B, code_dim].
         gm_mode (gm_k > 0 only): "mean" returns the mixture mean sum_k A_k mu_k as the x prediction, so the point model's samplers run on it unchanged;
-        "full" returns dict(means (B, K, C, H, W), logweights (B, K, 1, H, W), log-softmax over K, fp32, logstd (B, 1, 1, 1, 1) = log s_u, fp32)."""
+        "full" returns dict(means (B, K, C, H, W), logweights (B, K, 1, H, W), log-softmax over K, fp32, logstd (B, 1, 1, 1, 1) = log s_u, fp32; (B, 1, 1, H, W) with gm_spread "pixel")."""
         B, _, H, W = x.shape
         x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
@@ -548,14 +559,21 @@ class JiT_T2I(nn.Module):
                 feat = x
             x = block(x, y, condition, xpos) if full_mask is None else block(x, y, condition, xpos, full_mask)
             
-        x = self.final_layer(x, condition, m) if self.head_width else self.final_layer(x)
+        spread = None
+        if self.gm_k and self.gm_spread == "pixel" and gm_mode == "full":   # FinalLayer has no adaLN: its linear's input is norm_final(x)
+            h = self.final_layer.norm_final(x)
+            x = self.final_layer.linear(h)
+            spread = self.unpatchify(self.gm_spread_head(h.detach()), H, W).float().unsqueeze(1)   # (B, 1, 1, H, W): shared by the K components and the C channels
+        else:
+            x = self.final_layer(x, condition, m) if self.head_width else self.final_layer(x)
         if self.gm_k:
             assert return_layer is None and gm_mode in ("mean", "full"), gm_mode
             means, logits = self.gm_unpatchify(x, H, W)
             logweights = logits.float().log_softmax(dim=1)
             if gm_mode == "mean":
                 return (logweights.exp() * means.float()).sum(1)
-            return dict(means=means, logweights=logweights, logstd=self.gm_logstd(gm_cond).float().view(B, 1, 1, 1, 1))
+            logstd = self.gm_logstd(gm_cond).float().view(B, 1, 1, 1, 1)
+            return dict(means=means, logweights=logweights, logstd=logstd if spread is None else logstd + spread)
         output = self.unpatchify(x, H, W)
         if return_layer is not None:
             return output, feat
