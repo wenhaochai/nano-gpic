@@ -16,6 +16,12 @@ MUTANTS = {
     "c3_dropped": (F + "gmflow.py", "    c3 = beta_over_sigma_sq * sigma_to ** 2\n", "    c3 = 0 * beta_over_sigma_sq * sigma_to ** 2\n"),
     "s_x_equals_s_u": (F + "gmflow.py", '    return gm["logstd"] + torch.log(sigma.clamp(min=EPS))\n', '    return gm["logstd"] + 0 * sigma\n'),
     "no_bridge_noise": (F + "sampling_gmflow.py", "c3.clamp(min=0).sqrt() * torch.randn_like(x)", "0 * torch.randn_like(x)"),
+    # section 7: the per-pixel spread and the second-order samplers
+    "spread_input_not_detached": ("models/transformer/JiT_T2I.py", "self.gm_spread_head(h.detach())", "self.gm_spread_head(h)"),
+    "spread_varies_over_channels": ("models/transformer/JiT_T2I.py", "H, W).float().unsqueeze(1)", "H, W).float().unsqueeze(1) * torch.arange(1, 4, device=h.device).view(1, 1, 3, 1, 1)"),
+    "avg_var_wrong_axis": (F + "gmflow.py", "return mean.squeeze(1), var.mean((-1, -2), keepdim=True)", "return mean.squeeze(1), var.mean((0, -1), keepdim=True)"),
+    "k_without_half": (F + "gmflow.py", "    k = 0.5 * h / prev_h\n", "    k = h / prev_h\n"),
+    "no_first_order_fallback": (F + "sampling_gmflow.py", "        if prev is None:\n            return gm, state\n", "        if prev is None:\n            prev = state\n"),
 }
 
 
