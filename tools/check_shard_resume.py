@@ -1,9 +1,9 @@
 """Checks of jobs/smoke_full.sh (docs/ladder_plan.md section 12). Run in baselines/PixelGen with PYTHONPATH=$PWD.
 usage: check_shard_resume.py <smoke dir>
 1. stop and resume (resume/exp_ladder_d640): both launches used one shard seed; launch 2 kept exactly the lines of launch 1
-   up to its checkpoint's time; launch 2 read no shard that the log kept; over the two launches each rank read each of its
-   pass-0 shards once; every pass-1 line is a shard of that rank in the pass-1 permutation, each once; every rank with kept
-   shards printed its resume with that number
+   up to its checkpoint's time (the shards started before it); launch 2 started no shard that the log kept; over the two
+   launches each rank started each of its pass-0 shards once; every pass-1 line is a shard of that rank in the pass-1
+   permutation, each once; every rank with kept shards printed its resume with that number
 2. d1536 and d1792 (bench/<size>/steps_rank*.json): median start-to-start step time after step 20 without the save steps,
    the extra time of a save step, the peak allocated and reserved memory over the 8 ranks (fails above 76 GiB reserved)
 Exit 1 when a check fails.
@@ -53,8 +53,8 @@ def main():
     prefix_ok = skip_ok = cover_ok = next_ok = print_ok = True
     n_kept = n_dropped = n_next = 0
     for r in range(WORLD):
-        a = lines(os.path.join(snap, f"shards_done_rank{r}.txt"))
-        f = lines(os.path.join(run, f"shards_done_rank{r}.txt"))
+        a = lines(os.path.join(snap, f"shards_started_rank{r}.txt"))
+        f = lines(os.path.join(run, f"shards_started_rank{r}.txt"))
         kept = [x for x in a if float(x.split()[0]) <= keep_t]
         n_kept += len(kept)
         n_dropped += len(a) - len(kept)
@@ -73,7 +73,7 @@ def main():
           f"launch 2 kept {n_kept} lines up to {keep_t:.0f} and dropped {n_dropped} later ones; kept lines are the log's head")
     check("1c. no shard read twice", skip_ok, "launch 2 read none of the kept shards")
     check("1d. pass 0 whole", cover_ok, "kept + launch 2 = each rank's 8 pass-0 shards, each once")
-    check("1e. pass 1", next_ok and n_next >= 1, f"{n_next} pass-1 shards finished, all in the pass-1 permutation of their rank")
+    check("1e. pass 1", next_ok and n_next >= 1, f"{n_next} pass-1 shards started, all in the pass-1 permutation of their rank")
     check("1f. resume print", print_ok, f"ranks printed {printed}")
 
     for size in ("d1536", "d1792"):

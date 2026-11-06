@@ -45,7 +45,7 @@ BENCH_OUT=$SMK/bench/d1792 LADDER_PARTIAL_OK=1 LADDER_LAST_EVERY=100 run d1792 $
 R=$SMK/resume
 DATA=(--data.train_dataset.init_args.tar_pattern 'gpic_train_{00000..00063}.tar' --data.train_num_workers 2)
 LADDER_PARTIAL_OK=1 LADDER_LAST_EVERY=200 run resume_a $R d640 640 9 2 6400 "${DATA[@]}" --trainer.max_steps 1300
-mkdir -p $SMK/resume_snap && cp $R/exp_ladder_d640/shards_done_rank*.txt $R/exp_ladder_d640/launches.txt $SMK/resume_snap/ || fail=1
+mkdir -p $SMK/resume_snap && cp $R/exp_ladder_d640/shards_started_rank*.txt $R/exp_ladder_d640/launches.txt $SMK/resume_snap/ || fail=1
 LADDER_PARTIAL_OK=1 LADDER_LAST_EVERY=200 run resume_b $R d640 640 9 2 6400 "${DATA[@]}" --trainer.max_steps 4800
 # 3. checks
 cd $WT/baselines/PixelGen

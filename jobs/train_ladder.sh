@@ -37,21 +37,22 @@ CKPT_ARGS=()
 LASTCK=$(ls -t $RUN/last*.ckpt 2>/dev/null | head -1)
 if [ -n "$LASTCK" ]; then CKPT_ARGS=(--ckpt_path "$LASTCK"); echo "resuming from $LASTCK"; fi
 # Full ladder (docs/ladder_plan.md section 12): the run keeps the shard seed of its first launch (shard_seed.txt), so every
-# launch draws the same permutation in each pass, and the data workers log each shard they read to its end
-# (shards_done_rank<r>.txt; EpochShuffledShards in src/data/dataset/gpic_dataset.py), so a resumed launch skips the shards
-# finished before. Only the lines up to the resumed checkpoint's time stay: a shard finished later was read for steps that
-# this launch trains again. A fresh start (no checkpoint) keeps no line. A test may fix GPIC_SHARD_SEED.
+# launch draws the same permutation in each pass, and the data workers log each shard they start
+# (shards_started_rank<r>.txt; EpochShuffledShards in src/data/dataset/gpic_dataset.py), so a resumed launch skips the shards
+# started before its checkpoint and trains no sample twice in a pass. Only the lines up to the resumed checkpoint's time
+# stay: a shard started later was read only for steps that this launch trains again, so it is read again. A fresh start
+# (no checkpoint) keeps no line. A test may fix GPIC_SHARD_SEED.
 if [ -z "${GPIC_SHARD_SEED:-}" ]; then
   [ -s $RUN/shard_seed.txt ] || date +%s > $RUN/shard_seed.txt
   GPIC_SHARD_SEED=$(cat $RUN/shard_seed.txt)
 fi
 KEEP_T=0
 if [ -n "$LASTCK" ]; then KEEP_T=$(stat -L -c %Y "$LASTCK") || { echo "no mtime for $LASTCK"; exit 2; }; fi
-for f in $RUN/shards_done_rank*.txt; do
+for f in $RUN/shards_started_rank*.txt; do
   [ -f "$f" ] || continue
   awk -v T=$KEEP_T '$1 <= T' "$f" > "$f.tmp" && mv "$f.tmp" "$f" || { echo "cannot filter $f"; exit 2; }
 done
-echo "$(date -u +%FT%TZ) shard seed $GPIC_SHARD_SEED, shard log kept up to $KEEP_T: $(cat $RUN/shards_done_rank*.txt 2>/dev/null | wc -l) lines" >> $RUN/launches.txt
+echo "$(date -u +%FT%TZ) shard seed $GPIC_SHARD_SEED, shard log kept up to $KEEP_T: $(cat $RUN/shards_started_rank*.txt 2>/dev/null | wc -l) lines" >> $RUN/launches.txt
 BENCH_CB=""
 if [ -n "${BENCH_OUT:-}" ]; then BENCH_CB=',{"class_path":"src.callbacks.bench.BenchTimer"}'; fi
 # the ms hook first: a kill between the two saves must not leave last.ckpt ahead of a missing ms file (review N1)
