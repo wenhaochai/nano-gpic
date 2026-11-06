@@ -20,12 +20,30 @@
 # Env (smoke tests only): LADDER_WT (code worktree), LADDER_RUN_ROOT (run root), BENCH_OUT (adds the step timer),
 # LADDER_PARTIAL_OK (a launch stopped early by --trainer.max_steps counts as done). LADDER_LAST_EVERY: the steps between
 # two last.ckpt saves (default max_steps/32; jobs/train_full.sh).
+# Code by width (2026-11-06, docs/ladder_plan.md section 12.7): from d1280 a run trains on the MFU levers (branch mfu, the frozen worktree
+# gpic-wt/ladder_full_mfu, FSDP2 from d1280) from its first step, because FSDP2 pays only there and a run cannot change strategy at a resume;
+# narrower widths keep this code for every segment, so no run changes code mid-way. The run's first launch decides: a run that started on
+# this branch keeps this code, a run that started on the MFU worktree's commit goes there again, any other first commit stops the launch.
+# LADDER_MFU_WT (smoke tests only): another MFU worktree.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 SIZE=$1 D=$2 NB=$3 NT=$4 STEPS=$5; shift 5
 WT=${LADDER_WT:-$WC/project/gpic-wt/ladder_full_run}
 ROOT=${LADDER_RUN_ROOT:-$WC/runs/gpic-speed}
 RUN=$ROOT/exp_ladder_$SIZE   # main.py: <default_root_dir>/exp_<tags.exp>
+MFU_WT=${LADDER_MFU_WT:-$WC/project/gpic-wt/ladder_full_mfu}
+if [ "$D" -ge 1280 ] 2>/dev/null && [ "$(realpath -m $WT)" != "$(realpath -m $MFU_WT)" ]; then
+  [ -e "$MFU_WT/.git" ] || { echo "no worktree $MFU_WT"; exit 2; }
+  MFU_SHA=$(git -C $MFU_WT rev-parse HEAD)
+  FIRST=$(awk 'NR == 1 {print $2; exit}' $RUN/launches.txt 2>/dev/null)
+  if [ -z "$FIRST" ] || [ "$FIRST" = "$MFU_SHA" ]; then
+    [ -z "$(git -C $MFU_WT status --porcelain --untracked-files=no)" ] || { echo "$MFU_WT has local changes"; exit 2; }
+    echo "d$D: the MFU worktree $MFU_WT ($MFU_SHA)"
+    export LADDER_WT=$MFU_WT
+    exec bash $MFU_WT/jobs/train_ladder.sh $SIZE $D $NB $NT $STEPS "$@"
+  fi
+  git -C $WT merge-base --is-ancestor $FIRST HEAD 2>/dev/null || { echo "$RUN started on $FIRST: neither this branch nor $MFU_WT ($MFU_SHA)"; exit 2; }
+fi
 if [ $((STEPS % 32)) -ne 0 ] || [ $((D % 64)) -ne 0 ]; then echo "max_steps must be a multiple of 32 and d of 64"; exit 2; fi
 MS=$((STEPS / 4)); LAST=${LADDER_LAST_EVERY:-$((STEPS / 32))}   # jobs/train_full.sh sets LADDER_LAST_EVERY per size
 [ "$LAST" -gt 0 ] 2>/dev/null || { echo "bad LADDER_LAST_EVERY $LAST"; exit 2; }
