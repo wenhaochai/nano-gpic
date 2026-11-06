@@ -5,6 +5,7 @@ Run on a vis node from baselines/PixelGen: CUDA_VISIBLE_DEVICES= PYTHONPATH=. py
 Each test prints PASS or FAIL; the exit code is the number of failed tests. tools/gmflow/mutate.py runs this file on mutated copies of the source."""
 import math
 import os
+import re
 import subprocess
 import sys
 import traceback
@@ -512,7 +513,20 @@ def T11():
             res = gm_trainer(P_mean=P_mean, P_std=0.0)._impl_trainstep(c, None, None, x.clamp(-1, 1), y, {"y_mask": mask})
             res["loss"].backward()
             assert torch.isfinite(res["loss"]) and all(torch.isfinite(p_.grad).all() for p_ in c.parameters() if p_.grad is not None), (K, P_mean)
-        print(f"  K={K}: image = {SPREAD_BASE} bitwise (outputs and gradients, fp32 and bf16); pixel at init = image; offset head trained, input detached; "
+        # review_gmflow2 L1: the offset lands on its pixel, the way the means do. Head bias = r * 16 + c for in-patch position (r, c), weights 0; the same pattern in
+        # the final linear's bias for the means' channel (k = 0, c = 0, fold channel 0). A transposed or shifted offset fails here.
+        with torch.no_grad():
+            al = JiT_T2I(**small, gm_k=K, gm_spread="pixel")
+            pos = torch.arange(256, dtype=torch.float32)
+            al.gm_spread_head.weight.zero_(); al.gm_spread_head.bias.copy_(pos)
+            al.final_layer.linear.weight.zero_(); bb = torch.zeros_like(al.final_layer.linear.bias); bb[:256] = pos; al.final_layer.linear.bias.copy_(bb)
+            o = al(x, t, y, y_mask=mask, gm_mode="full")
+            off = o["logstd"] - o["logstd"][:, :, :, :1, :1]
+            rr, cc = torch.meshgrid(torch.arange(64), torch.arange(64), indexing="ij")
+            want = ((rr % 16) * 16 + (cc % 16)).float().expand(2, -1, -1)
+            assert torch.allclose(off[:, 0, 0], want, atol=1e-3), "the offset does not land on its pixel"
+            assert torch.allclose(o["means"][:, 0, 0].float(), want, atol=1e-3), "the means' channel does not unpatchify as the offset"
+        print(f"  K={K}: image = {SPREAD_BASE} bitwise (outputs and gradients, fp32 and bf16); pixel at init = image; offset head trained, input detached; offset at pixel (r, c) = means' (r, c); "
               f"log s_u over pixels after a perturbation: std {out['logstd'].flatten(1).std(1).mean().item():.4f}")
 
 
@@ -1100,14 +1114,33 @@ def T26():
     a = sampler(GMODESampler, 4, substeps=8, fused=True, spread_table=true, rank_seed=False)._impl_sampling(f, noise, None, None)[0][-1]
     b = sampler(GMODESampler, 4, substeps=8, spread_table=true, rank_seed=False)._impl_sampling(f, noise, None, None)[0][-1]
     assert torch.allclose(a, b, atol=1e-5), (a - b).abs().max()
-    print("  sampler fused = not fused (K = 8 mixture; point model with a table)")
+    # review_gmflow_hn section 5: fused=True on the per-pixel logstd of the merged JiT_T2I (gm_spread pixel, K = 8, offset head with nonzero weights), whole sampler
+    torch.manual_seed(4)
+    net = JiT_T2I(**small, gm_k=8, gm_spread="pixel")
+    for p_ in net.parameters():
+        p_.data.add_(torch.randn_like(p_) * 0.03)
+    y = torch.randn(2, 8, 32); mask = torch.ones(2, 8, dtype=torch.bool); mask[:, 5:] = False
+    fnet = lambda x, t, c, **kw: net(x, t, c, y_mask=mask, **kw)
+    with torch.no_grad():
+        ls = net(torch.randn(2, 3, 64, 64), torch.full((2,), 0.3), y, y_mask=mask, gm_mode="full")["logstd"]
+        assert ls.shape == (2, 1, 1, 64, 64) and ls.flatten(1).std(1).min() > 1e-3, ls.shape
+        noise = torch.randn(2, 3, 64, 64)
+        for calls, n in ((4, 8), (8, 16)):
+            a = sampler(GMODESampler, calls, substeps=n, fused=True, rank_seed=False)._impl_sampling(fnet, noise, y, None)[0][-1]
+            b = sampler(GMODESampler, calls, substeps=n, rank_seed=False)._impl_sampling(fnet, noise, y, None)[0][-1]
+            assert torch.isfinite(a).all() and torch.allclose(a, b, atol=1e-4, rtol=1e-4), (calls, (a - b).abs().max())
+            print(f"  JiT_T2I gm_spread pixel (K = 8, per-pixel log s_u std {ls.flatten(1).std(1).mean():.3f}): fused = not fused at {calls} x {n}, max |diff| {(a - b).abs().max():.1e}")
+    print("  sampler fused = not fused (K = 8 mixture; point model with a table; per-pixel JiT_T2I)")
 
 
 
 @test
 def T27():
-    """G2/H3: eval_gmflow.sh names and arguments (gm_ode_cal, EVAL_SUBSTEPS) and evals_gmflow.sh task parsing (3 and 4 fields, --table), on stubbed copies (no env.sh, no GPU)."""
-    import re as _re
+    """G2/H3: eval_gmflow.sh names and arguments (gm_ode_cal with the table's hash, EVAL_SUBSTEPS, the 512 limit, GMFLOW_WT required) and evals_gmflow.sh task parsing
+    (3 and 4 fields, --wt, --table, the done-check with the same name rule), on stubbed copies (no env.sh, no GPU)."""
+    import glob
+    import hashlib
+    import shutil
     import tempfile
     tmp = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
     # eval_gmflow.sh up to the output name, then print what it chose
@@ -1120,18 +1153,30 @@ def T27():
     run_dir = os.path.join(tmp, "runs/gpic-speed/point_nodrop_d640/exp_ladder_d640")
     os.makedirs(run_dir)
     open(os.path.join(run_dir, "ms-step=066816.ckpt"), "w").close()
-    table = os.path.join(tmp, "table.json"); open(table, "w").write("{}")
-    env0 = {k: v for k, v in os.environ.items() if not k.startswith("EVAL_")}
-    env0["GMFLOW_WT"] = REPO
-    def ev(args, **extra):
-        r = subprocess.run(["bash", stub, *map(str, args)], env=dict(env0, **extra), capture_output=True, text=True)
+    table = os.path.join(tmp, "table.json"); open(table, "w").write('{"ckpt": "/x/ms-step=066816.ckpt"}')
+    h8 = hashlib.sha1(open(table, "rb").read()).hexdigest()[:8]
+    table2 = os.path.join(tmp, "table2.json"); open(table2, "w").write('{"ckpt": "/x/ms-step=066816.ckpt", "other": 1}')
+    h8b = hashlib.sha1(open(table2, "rb").read()).hexdigest()[:8]
+    assert h8 != h8b
+    env0 = {k: v for k, v in os.environ.items() if not k.startswith("EVAL_") and k != "GMFLOW_WT"}
+    def ev(args, wt=REPO, cwd=None, **extra):
+        env = dict(env0, **extra)
+        if wt:
+            env["GMFLOW_WT"] = wt
+        r = subprocess.run(["bash", stub, *map(str, args)], env=env, capture_output=True, text=True, cwd=cwd)
         return r.returncode, r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr
     rc, out = ev([0, 66816, "euler", 8])
     assert rc == 0 and out.startswith("OUT=eval_066816_euler_calls8 SUBSTEPS=16 "), out
+    rc, out = ev([0, 66816, "euler", 8], wt=None)
+    assert rc == 2 and "GMFLOW_WT is not set" in out, out   # review_gmflow2 M4: no default to the moving development worktree
     rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table)
-    assert rc == 0 and "OUT=eval_066816_gm_ode_cal_calls8 SUBSTEPS=16 " in out and f"spread_table {table}" in out and "substeps 16" in out, out
+    assert rc == 0 and f"OUT=eval_066816_gm_ode_cal-{h8}_calls8 SUBSTEPS=16 " in out and f"spread_table {table}" in out and "substeps 16" in out, out
+    rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table2)
+    assert rc == 0 and f"OUT=eval_066816_gm_ode_cal-{h8b}_calls8 " in out, out   # review_gmflow_hn F1: a second table gets its own directory
+    rc, out = ev([0, 66816, "gm_ode_cal", 8], cwd=tmp, EVAL_SPREAD_TABLE="table.json")
+    assert rc == 0 and f"spread_table {table} " in out + " ", out   # F8: a relative path becomes absolute before the cd
     rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table, EVAL_SUBSTEPS="4")
-    assert rc == 0 and "OUT=eval_066816_gm_ode_cal_calls8_n4 SUBSTEPS=4 " in out and "substeps 4" in out, out
+    assert rc == 0 and f"OUT=eval_066816_gm_ode_cal-{h8}_calls8_n4 SUBSTEPS=4 " in out and "substeps 4" in out, out
     rc, out = ev([0, 66816, "gm_ode_cal", 8])
     assert rc == 2 and "EVAL_SPREAD_TABLE" in out, out
     rc, out = ev([0, 66816, "euler", 8], EVAL_SUBSTEPS="4")
@@ -1142,34 +1187,123 @@ def T27():
     assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls4 SUBSTEPS=32 "), out
     rc, out = ev([8, 62336, "gm_ode", 4], EVAL_SUBSTEPS="8")
     assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls4_n8 SUBSTEPS=8 "), out
+    rc, out = ev([8, 62336, "gm_ode2", 4], EVAL_SUBSTEPS="8")
+    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode2_calls4_n8 SUBSTEPS=8 "), out
     rc, out = ev([8, 62336, "gm_ode_cal", 4], EVAL_SPREAD_TABLE=table)
     assert rc == 2 and "point model" in out, out
-    print("  eval_gmflow.sh: default names unchanged; gm_ode_cal needs the table and K = 0; EVAL_SUBSTEPS adds _n<n> and only for GM-ODE")
-    # evals_gmflow.sh with a stub worktree whose eval_gmflow.sh prints its arguments
-    wt = os.path.join(tmp, "project/gpic-wt/stubwt")   # merge: --wt <name> under $WC/project/gpic-wt replaces EVALS_WT
+    # review_gmflow_hn F5: calls x sub-steps <= 512 (the G2 sweep's largest is 8 x 64 = 512); 8 x 128 = 1024 and 50 x 11 = 550 are refused
+    rc, out = ev([8, 62336, "gm_ode", 8], EVAL_SUBSTEPS="64")
+    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls8_n64 SUBSTEPS=64 "), out
+    for calls, n, smp in ((8, 128, "gm_ode"), (50, 11, "gm_ode"), (4, 129, "gm_ode2")):
+        rc, out = ev([8, 62336, smp, calls], EVAL_SUBSTEPS=str(n))
+        assert rc == 2 and "> 512" in out, (calls, n, out)
+    rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table, EVAL_SUBSTEPS="128")
+    assert rc == 2 and "> 512" in out, out
+    print(f"  eval_gmflow.sh: default names unchanged; GMFLOW_WT required; gm_ode_cal needs the table and K = 0, its name carries the table's hash (-{h8}, a second"
+          f" table -{h8b}), a relative table path is made absolute; EVAL_SUBSTEPS adds _n<n> (GM-ODE, GM-ODE 2, gm_ode_cal); calls x n > 512 refused, 512 accepted")
+    # evals_gmflow.sh with a stub worktree gmflow_run3 (the frozen worktree of this merge, which does not exist yet) whose eval_gmflow.sh prints its arguments
+    wt = os.path.join(tmp, "project/gpic-wt/gmflow_run3")
     os.makedirs(os.path.join(wt, "baselines/PixelGen/src/diffusion/flow_matching")); os.makedirs(os.path.join(wt, "jobs"))
     open(os.path.join(wt, "baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py"), "w").close()
-    open(os.path.join(wt, "jobs/eval_gmflow.sh"), "w").write('echo "ARGS=$* N=${EVAL_SUBSTEPS:-} T=${EVAL_SPREAD_TABLE:-}"\n')
+    open(os.path.join(wt, "jobs/eval_gmflow.sh"), "w").write('echo "ARGS=$* N=${EVAL_SUBSTEPS:-} T=${EVAL_SPREAD_TABLE:-} WT=$(basename $GMFLOW_WT) S=$EVAL_SPREAD"\n')
     subprocess.run("git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x", shell=True, cwd=wt, check=True)
     src = open(os.path.join(REPO, "jobs/evals_gmflow.sh")).read().replace("source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh", f"WC={tmp}")
     stub2 = os.path.join(tmp, "evals.sh"); open(stub2, "w").write(src)
     root = os.path.join(tmp, "root")
-    def evs(args):
-        a = list(map(str, args)); a[6:6] = ["--wt", "stubwt"]
-        r = subprocess.run(["bash", stub2, *a], env=env0, capture_output=True, text=True)
-        logs = {os.path.basename(f): open(f).read().strip() for f in sorted(__import__("glob").glob(os.path.join(root, "eval_*.log")))}
+    def evs(args, wtn="gmflow_run3", cwd=None):
+        a = list(map(str, args)); a[6:6] = ["--wt", wtn]
+        r = subprocess.run(["bash", stub2, *a], env=env0, capture_output=True, text=True, cwd=cwd)
+        logs = {os.path.basename(f): open(f).read().strip() for f in sorted(glob.glob(os.path.join(root, "eval_*.log")))}
         return r.returncode, r.stdout, logs
-    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "66816:euler:8", "66816:gm_ode_cal:8:4"])
+    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "66816:euler:8", "66816:gm_ode:8:4"])
     assert rc == 0, out
-    assert logs["eval_66816_euler_8.log"] == "ARGS=0 66816 euler 8 N= T=", logs
-    assert logs["eval_66816_gm_ode_cal_8_n4.log"] == "ARGS=0 66816 gm_ode_cal 8 N=4 T=", logs
-    import shutil; shutil.rmtree(root)
-    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "--table", table, "66816:gm_ode_cal:8"])
-    assert rc == 0 and logs["eval_66816_gm_ode_cal_8.log"] == f"ARGS=0 66816 gm_ode_cal 8 N= T={table}", logs
-    os.makedirs(os.path.join(root, "exp_ladder_d640/eval_066816_gm_ode_cal_calls8_n4")); open(os.path.join(root, "exp_ladder_d640/eval_066816_gm_ode_cal_calls8_n4/metrics.json"), "w").close()
-    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "66816:gm_ode_cal:8:4"])
+    assert logs["eval_66816_euler_8.log"] == "ARGS=0 66816 euler 8 N= T= WT=gmflow_run3 S=image", logs
+    assert logs["eval_66816_gm_ode_8_n4.log"] == "ARGS=0 66816 gm_ode 8 N=4 T= WT=gmflow_run3 S=image", logs
+    shutil.rmtree(root)
+    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "66816:gm_ode_cal:8"])
+    assert rc == 2 and "needs --table" in out, out
+    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "--table", "table.json", "66816:gm_ode_cal:8", "66816:gm_ode_cal:4:8"], cwd=tmp)
+    assert rc == 0 and logs[f"eval_66816_gm_ode_cal-{h8}_calls8.log"] == f"ARGS=0 66816 gm_ode_cal 8 N= T={table} WT=gmflow_run3 S=image", logs
+    assert logs[f"eval_66816_gm_ode_cal-{h8}_calls4_n8.log"] == f"ARGS=0 66816 gm_ode_cal 4 N=8 T={table} WT=gmflow_run3 S=image", logs
+    # the done-check uses the same name rule: a finished table-1 result skips table 1 and not table 2
+    d1 = os.path.join(root, f"exp_ladder_d640/eval_066816_gm_ode_cal-{h8}_calls8"); os.makedirs(d1); open(os.path.join(d1, "metrics.json"), "w").close()
+    rc, out, _ = evs([0, "d640", 640, 9, 2, root, "--table", table, "66816:gm_ode_cal:8"])
     assert rc == 0 and "done before" in out, out
-    print("  evals_gmflow.sh: 3-field tasks unchanged; a 4th field sets EVAL_SUBSTEPS and the _n<n> name; --table sets EVAL_SPREAD_TABLE; finished _n tasks skipped")
+    rc, out, _ = evs([0, "d640", 640, 9, 2, root, "--table", table2, "66816:gm_ode_cal:8"])
+    assert rc == 0 and "done before" not in out, out
+    old = os.path.join(root, "exp_ladder_d640/eval_066816_gm_ode_calls8_n4"); os.makedirs(old); open(os.path.join(old, "metrics.json"), "w").close()
+    rc, out, _ = evs([0, "d640", 640, 9, 2, root, "66816:gm_ode:8:4"])
+    assert rc == 0 and "done before" in out, out
+    rc, out, _ = evs([0, "d640", 640, 9, 2, root, "66816:euler:8"], wtn="../gmflow")
+    assert rc == 2 and "worktree name" in out, out   # review_gmflow2 L5
+    # one name rule: the eval_dir function is the same text in both scripts
+    fn = lambda path: re.search(r"^eval_dir\(\) \{.*?^\}", open(os.path.join(REPO, path)).read(), re.S | re.M).group(0)
+    assert fn("jobs/eval_gmflow.sh") == fn("jobs/evals_gmflow.sh"), "eval_dir differs between eval_gmflow.sh and evals_gmflow.sh"
+    print("  evals_gmflow.sh: 3-field tasks unchanged; a 4th field sets EVAL_SUBSTEPS and _n<n>; --wt gmflow_run3 accepted, '../x' refused; gm_ode_cal needs --table,"
+          " which is made absolute; the done-check names the table's hash (table 1 done, table 2 not); eval_dir identical in both scripts")
+
+
+@test
+def T28():
+    """gm_ode_cal guards (owner 2026-11-06, review_gmflow_hn F1, F2, F5): the sampler refuses a table with s_x(t) > (1 - t) / t at any call time t > 0 it reads, and
+    takes it at fewer calls; the table must name ms-step=<step>; gm_spread.py check (the eval's pre-check) agrees; calls x sub-steps = 1024 shows the clamp of F5."""
+    from src.diffusion.flow_matching.gm_spread import SpreadTable, check_table_ckpt
+    import json
+    ts = [0.01 + 0.98 * i / 63 for i in range(64)]
+    # a table like the 8-image smoke of w1147: above the bound for t > about 0.94 (s_x(0.99) = 0.055 > 0.0101), below it at t <= 0.875
+    smoke = [min(0.6, 0.06 + 0.5 * (1 - t)) for t in ts]
+    assert smoke[-1] > (1 - ts[-1]) / ts[-1] and all(sv <= (1 - t) / t for t, sv in zip(ts, smoke) if t <= 0.9)
+    path = _tmp("smoke.json")
+    json.dump({"t": ts, "s_x": smoke, "ckpt": "/runs/x/ms-step=066816.ckpt"}, open(path, "w"))
+    for calls in (8, 4):
+        sampler(GMODESampler, calls, substeps=8, spread_table=path, rank_seed=False)   # last call at t = 0.875 / 0.75: accepted
+    for calls in (50, 16):
+        try:
+            sampler(GMODESampler, calls, substeps=3, spread_table=path, rank_seed=False); raise RuntimeError(f"{calls} calls: the bound guard did not fire")
+        except ValueError as e:
+            assert "(1 - t) / t" in str(e) and "t = 0.9" in str(e), str(e)
+            msg = str(e)
+    # exactly at the bound passes; just above fails; the first call t = 0 is never checked (the bound is infinite there)
+    t8 = [i / 8 for i in range(8)]
+    at = _tmp("at.json"); json.dump({"t": [0.01] + t8[1:], "s_x": [50.0] + [(1 - t) / t for t in t8[1:]]}, open(at, "w"))
+    SpreadTable(at).check_bound(torch.tensor(t8))
+    above = _tmp("above.json"); json.dump({"t": [0.01] + t8[1:], "s_x": [50.0] + [(1 - t) / t * (1 + 1e-3) for t in t8[1:]]}, open(above, "w"))
+    try:
+        SpreadTable(above).check_bound(torch.tensor(t8)); raise RuntimeError("a table above the bound passed")
+    except ValueError:
+        pass
+    try:
+        sampler(GMODESampler, 8, substeps=8, spread_table=path, order=2, rank_seed=False); raise RuntimeError("a table with order 2 passed")
+    except AssertionError:
+        pass
+    # F1: the table must come from the evaluated checkpoint
+    check_table_ckpt(path, 66816)
+    for step in (33408, 6681):
+        try:
+            check_table_ckpt(path, step); raise RuntimeError("a table of another checkpoint passed")
+        except ValueError as e:
+            assert "not on ms-step" in str(e)
+    # the eval's pre-check: python -m src.diffusion.flow_matching.gm_spread check <table> <step> <calls>
+    cli = lambda *a: subprocess.run([sys.executable, "-m", "src.diffusion.flow_matching.gm_spread", "check", *map(str, a)], capture_output=True, text=True)
+    r = cli(path, 66816, 8); assert r.returncode == 0 and "table ok" in r.stdout, r.stdout + r.stderr
+    r = cli(path, 66816, 4); assert r.returncode == 0, r.stdout + r.stderr
+    r = cli(path, 33408, 8); assert r.returncode == 2 and "not on ms-step=033408" in r.stdout, r.stdout + r.stderr
+    r = cli(path, 66816, 50); assert r.returncode == 2 and "exceeds the bound" in r.stdout, r.stdout + r.stderr
+    print(f"  bound guard: smoke-like table accepted at 8 and 4 calls, refused at 16 and 50 ({msg[:110]}...); at the bound passes, 0.1% above fails; order 2 refused")
+    print("  ckpt check: ms-step=066816 table accepted for 66816, refused for 33408 and 6681; gm_spread check CLI agrees (rc 0 / 2)")
+    # F5: with s_x = 0, calls x sub-steps <= 512 is the exact step to fp32 rounding; 1024 is not (gm_convert's clamp norm >= 1e-6); eval_gmflow.sh refuses > 512 (T27)
+    torch.manual_seed(0)
+    net = JiT_T2I(**small)
+    for p_ in net.parameters():
+        p_.data.add_(torch.randn_like(p_) * 0.02)
+    y = torch.randn(2, 8, 32); mask = torch.ones(2, 8, dtype=torch.bool)
+    f = lambda x, t, c, **kw: net(x, t, c, y_mask=mask)
+    noise = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        exact = sampler(ImplicitSampler, 8)._impl_sampling(f, noise, y, None)[0][-1]
+        d = {n: (sampler(GMODESampler, 8, substeps=n, rank_seed=False)._impl_sampling(f, noise, y, None)[0][-1] - exact).square().mean().sqrt().item() for n in (64, 128)}
+    print(f"  clamp (F5), s_x = 0, 8 calls: rms to the exact step at n = 64 (512 total) {d[64]:.1e}, at n = 128 (1024 total) {d[128]:.1e}")
+    assert d[64] < 1e-5 and d[128] > 1e-3, d
 
 
 if __name__ == "__main__":
