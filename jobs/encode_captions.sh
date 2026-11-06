@@ -2,16 +2,18 @@
 #SBATCH -J gpic-encode-captions
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=02:00:00
+#SBATCH --time=06:00:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable-partial
 #FETCHABLE
-# The text encoder's outputs for every GPIC Lite training shard (tools/encode_captions.py, docs/text_cache.md), one
-# process per GPU, every 8th shard each. A rerun skips finished shards, so a failed or stopped job is requeued as is.
-# Exit 0 only when tools/check_text_cache.py finds every shard complete.
-# The fileset is shared and the job writes 1.66 TiB, so it starts writing only with 3.5 TiB free, counting what an
-# earlier run has written (controller, 2026-11-03). Otherwise exit 98: wq puts it back in the queue for 30 min.
+# The text encoder's outputs for every GPIC training shard in data/gpic/train (tools/encode_captions.py of the frozen
+# worktree gpic-wt/ladder_cache, docs/text_cache.md), one process per GPU, every 8th shard each. A rerun skips finished
+# shards, so a failed or stopped job is requeued as is. Exit 0 only when tools/check_text_cache.py finds every shard complete.
+# GPIC Full (owner 2026-11-06: the full cache for the full ladder): 8000 shards, the cache grows from 1.66 TiB (Lite's 801
+# shards) to about 16.6 TiB, about 36 GPU-h. The fileset is shared, so the job starts writing only when the free space
+# plus what is already written is at least 20 TiB, which leaves about 3.4 TiB free at the end (the Lite guard was 3.5 TiB
+# for 1.66 TiB). Otherwise exit 98: wq puts it back in the queue for 30 min.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 WT=${CACHE_WT:-$WC/project/gpic-wt/ladder_cache}
@@ -23,7 +25,7 @@ rm -f "$OUT"/*.tmp*
 free_g=$(df -BG --output=avail $WC | tail -1 | tr -d ' G')
 written_g=$(du -s --apparent-size -BG $OUT | cut -f1 | tr -d G)
 echo "free ${free_g} GiB, already written ${written_g} GiB"
-[ $((free_g + written_g)) -ge 3584 ] || { echo "less than 3.5 TiB free: waiting"; exit 98; }
+[ $((free_g + written_g)) -ge 20480 ] || { echo "less than 20 TiB free plus written: waiting"; exit 98; }
 git -C $WT rev-parse HEAD > $OUT/commit.txt
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
