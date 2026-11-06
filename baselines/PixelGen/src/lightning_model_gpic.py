@@ -216,16 +216,6 @@ class LightningModel(pl.LightningModule):
                 else:
                     pass
 
-    def on_before_batch_transfer(self, batch, dataloader_idx):
-        """MFU lever E: plan on the host which rank computes each sample of this step (src/utils/rebalance.py)."""
-        if (self.trainer is not None and self.trainer.training and isinstance(batch, (list, tuple)) and len(batch) == 3
-                and isinstance(batch[2], dict) and "text_lens" in batch[2]):
-            if getattr(self, "_rebalancer", None) is None:
-                from src.utils.rebalance import Rebalancer
-                self._rebalancer = Rebalancer(rebalance=os.environ.get("GPIC_MFU_REBALANCE") == "1")
-            batch[2]["mfu_plan"] = self._rebalancer.host_plan(batch[2]["text_lens"], batch[2].get("caption_type"))
-        return batch
-
     def training_step(self, batch, batch_idx):
         # print(f"Received training batch with batch_idx={batch_idx}")
         x, y, metadata = batch
@@ -242,8 +232,13 @@ class LightningModel(pl.LightningModule):
         with torch.no_grad():
             x = self.vae.encode(x)
             condition, uncondition = self.conditioner(y, metadata)
-            if "mfu_plan" in metadata:   # MFU lever E: images and caption tokens to the ranks the plan names; y_pack
-                p = metadata.pop("mfu_plan")
+            if "text_lens" in metadata:   # MFU lever E: plan which rank computes each sample (host, src/utils/rebalance.py),
+                # then move the images and caption tokens there and build y_pack. Planned here, not in on_before_batch_transfer:
+                # the DataModule defines that hook too, and Lightning then calls only the DataModule's (w1374).
+                if getattr(self, "_rebalancer", None) is None:
+                    from src.utils.rebalance import Rebalancer
+                    self._rebalancer = Rebalancer(rebalance=os.environ.get("GPIC_MFU_REBALANCE") == "1")
+                p = self._rebalancer.host_plan(metadata["text_lens"], metadata.get("caption_type"))
                 x, condition, metadata["y_pack"] = self._rebalancer.exchange(x, condition, p)
                 if p.get("types") is not None:
                     metadata["caption_type"] = p["types"]

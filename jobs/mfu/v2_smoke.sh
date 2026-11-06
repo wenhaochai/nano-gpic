@@ -21,7 +21,8 @@ mkdir -p $OUT
 git -C $WT rev-parse HEAD > $OUT/commit.txt
 IFS=, read -ra G <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export PIXGEN_SRC=$WT/baselines/PixelGen
-( cd $WT && CUDA_VISIBLE_DEVICES=${G[0]} timeout 300 python tools/mfu/fa3_check.py > $OUT/fa3_check.log 2>&1 ) || { tail -20 $OUT/fa3_check.log; echo "FA3 check failed"; exit 3; }
+source $WT/jobs/mfu/gpu_checks.sh
+gpu_checks $WT $OUT || { echo "GPU checks failed"; exit 3; }
 bash $WT/jobs/smoke_full.sh $WT all > $OUT/smoke_full.log 2>&1
 echo "[$(date +%T)] smoke_full rc=$?" | tee -a $OUT/summary.txt
 grep -h "DONE\|ok\|FAIL\|fail" $OUT/smoke_full.log | tail -15 | tee -a $OUT/summary.txt

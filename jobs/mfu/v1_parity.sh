@@ -23,7 +23,8 @@ git -C $WT rev-parse HEAD > $OUT/commit.txt
 python $WT/tools/gpu_health.py > $OUT/gpu_health.txt 2>&1 || { tail -3 $OUT/gpu_health.txt; echo "unhealthy GPU on $(hostname); exit 98"; exit 98; }
 IFS=, read -ra G <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export PIXGEN_SRC=$WT/baselines/PixelGen
-( cd $WT && CUDA_VISIBLE_DEVICES=${G[0]} timeout 300 python tools/mfu/fa3_check.py > $OUT/fa3_check.log 2>&1 ) || { tail -20 $OUT/fa3_check.log; echo "FA3 check failed"; exit 3; }
+source $WT/jobs/mfu/gpu_checks.sh
+gpu_checks $WT $OUT || { echo "GPU checks failed"; exit 3; }
 export MFU_WT=$WT MFU_LIMIT=780 GPIC_MFU_DET_DATA=1 GPIC_SHARD_SEED=20261106
 FSDP='{"class_path":"lightning.pytorch.strategies.ModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
 arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }

@@ -17,7 +17,7 @@ OUT = 256
 @triton.jit
 def _pass_kernel(src_ptr, src_off_ptr, out_ptr, out_off_ptr, xmin_ptr, kk_ptr,
                  n_i_ptr, s_in_i_ptr, s_in_a_ptr, len_a_ptr, s_out_i_ptr, s_out_o_ptr, p,
-                 K: tl.constexpr, BLOCK_I: tl.constexpr, BLOCK_O: tl.constexpr):
+                 K: tl.constexpr, BLOCK_I: tl.constexpr, BLOCK_O: tl.constexpr, NOUT: tl.constexpr):
     """One pass for sample b: out[i, o, c] = clip8(2^21 + sum_j in[i, xmin[o] + j, c] * kk[o, j]); i runs over the axis
     the pass keeps, o over the OUT outputs along the axis it resamples. Strides in bytes of uint8 RGB (3 per pixel)."""
     b = tl.program_id(0)
@@ -36,7 +36,7 @@ def _pass_kernel(src_ptr, src_off_ptr, out_ptr, out_off_ptr, xmin_ptr, kk_ptr,
     s_out_o = tl.load(s_out_o_ptr + b)
     src = src_ptr + tl.load(src_off_ptr + b)
     dst = out_ptr + tl.load(out_off_ptr + b)
-    tab = (b * 2 + p) * OUT
+    tab = (b * 2 + p) * NOUT   # a constexpr argument: a compiled kernel cannot read a module global (the interpreter can)
     xmin = tl.load(xmin_ptr + tab + o)
     acc0 = tl.full([BLOCK_I, BLOCK_O], 1 << 21, tl.int32)
     acc1 = tl.full([BLOCK_I, BLOCK_O], 1 << 21, tl.int32)
@@ -117,5 +117,5 @@ def run(job):
         g = geo[p]
         grid = (B, triton.cdiv(job["n_i_max"][p], BI), OUT // BO)
         _pass_kernel[grid](s_ptr, s_off, d_ptr, d_off, job["xmin"], job["kk"], g[0], g[1], g[2], g[3], g[4], g[5], p,
-                           K=job["K"], BLOCK_I=BI, BLOCK_O=BO)
+                           K=job["K"], BLOCK_I=BI, BLOCK_O=BO, NOUT=OUT)
     return out
