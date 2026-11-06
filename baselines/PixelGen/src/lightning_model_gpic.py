@@ -132,8 +132,11 @@ class LightningModel(pl.LightningModule):
         check = getattr(self.denoiser, "code_dim", 0) and trainer._calls % trainer._check_every == 0   # plan A: the flow's parameters get only the prior's gradient, the others only the main loss's
         prior = torch.stack([p.grad.norm() for p in self.denoiser.code_prior.parameters() if p.grad is not None]).norm().item() if check else None
         total = torch.nn.utils.clip_grad_norm_(params, gradient_clip_val, foreach=True)
-        if getattr(self.denoiser, "gm_k", 0) and getattr(self, "_log_now", False):   # GMFlow: the pre-clip norm, on the steps whose logs are written (no extra host sync)
+        if getattr(self, "_log_now", False):   # the pre-clip norm of every model (review F4), on the steps whose logs are written (no extra host sync)
             self.log("train/grad_norm_preclip", total, on_step=True, sync_dist=False)
+        grad_print = int(os.environ.get("GPIC_GRAD_PRINT") or 0)   # diagnostics only: rank 0 prints the global pre-clip norm every N optimizer steps (a host sync)
+        if grad_print and self.global_step % grad_print == 0 and self.global_rank == 0:
+            print(f"[grad] step {self.global_step}: grad norm before the clip {total.item():.4f}", flush=True)
         if getattr(self.denoiser, "gm_k", 0) and trainer._print_every and trainer._calls % trainer._print_every == 0:   # smoke test only (GPIC_GM_PRINT): a host sync
             print(f"[gmflow] call {trainer._calls}: grad norm before the clip {total.item():.4f}", flush=True)
         if check:
