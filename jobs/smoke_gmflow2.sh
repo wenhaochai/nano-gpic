@@ -11,6 +11,8 @@
 # 1. gm_k 8 with gm_spread pixel at d640: train to 400 steps (an ms checkpoint at 400), resume from last.ckpt to 500;
 # 2. predictions of that checkpoint on 512 prompts with gm_ode at 8 and 4 calls (EVAL_SPREAD=pixel);
 # 3. the guard: the per-pixel checkpoint must be refused as image, with the guard's own message;
+# 3b. lambda = 1 (the plain mixture NLL, docs/gmflow.md section 11): gm_k 8, gm_spread image, train to 300 steps in its own root; lam 1.0 in the saved config,
+#    finite losses and grad norms;
 # 4. a regression check of the merged sampler on a trained model: gm_ode at 8 calls on w1173's checkpoint (gm_spread image, K = 8, C0/8) through a link in this
 #    smoke's directory (about 80 s; the smoke of 2026-11-05 took 75 s for it).
 # No second-order sampler (owner 2026-11-06: GM-SDE 2 / GM-ODE 2 are not run). It reports s/step, the recompiles after the warm-up, the loss, s_u and the per-pixel
@@ -78,6 +80,24 @@ EVAL_SPREAD=image timeout -k 30 180 bash $WT/jobs/eval_gmflow.sh 8 400 gm_ode 2 
 rc=$?
 if [ $rc -ne 0 ] && grep -q "per-pixel offset head presence does not match EVAL_SPREAD=image" $OUT/eval_guard.log; then log "guard refused the per-pixel checkpoint as image (rc=$rc)"
 else log "the guard did not refuse the per-pixel checkpoint as image with its message (rc=$rc)"; fail=1; fi
+# lambda = 1 (owner's popup 2026-11-06: the plain mixture NLL without the transition loss, docs/gmflow.md section 11): K = 8, gm_spread image, 300 steps in its
+# own root; the saved config must hold lam 1.0, and the losses and grad norms must be finite (its log lines have no per-pixel fields, so check() does not apply)
+log "START train lambda = 1 to 300 (K = 8, gm_spread image)"
+TRAIN_L1=(--config configs_h100/gmflow_train.yaml --model.denoiser.init_args.gm_k 8 --model.diffusion_trainer.init_args.lam 1.0 --trainer.log_every_n_steps 50)
+LADDER_RUN_ROOT=$OUT/lam1 BENCH_OUT=$OUT/bench/lam1 timeout -k 60 420 bash $WT/jobs/train_ladder.sh d640 640 9 2 1600 "${TRAIN_L1[@]}" --trainer.max_steps 300 > $OUT/lam1.log 2>&1
+rc=$?; log "END train lambda = 1 rc=$rc"; [ $rc -eq 0 ] || fail=1
+grep -q "lam: 1.0" $OUT/lam1/exp_ladder_d640/config-*.yaml 2>/dev/null || { log "lam: 1.0 is not in the saved config"; fail=1; }
+python3 -I - $OUT/lam1.log <<'PY' | tee -a $OUT/phases.log || fail=1
+import math, re, sys
+s = open(sys.argv[1], errors="replace").read()
+F = r"([-+]?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|nan|inf))"
+rows = re.findall(r"\[gmflow\] call (\d+): loss " + F + " s_u " + F + " n_eff " + F + " max_w " + F, s)
+g = [float(v) for v in re.findall(r"\[gmflow\] call \d+: grad norm before the clip " + F, s)]
+ok = bool(rows) and all(math.isfinite(float(v)) for r in rows for v in r[1:]) and bool(g) and all(math.isfinite(v) for v in g) and "[warmup] done" in s
+print("lambda = 1 check:", "PASS" if ok else "FAIL", "| lines", len(rows), "| first", rows[0] if rows else None, "| last", rows[-1] if rows else None,
+      "| grad norm first", g[:3], "last", g[-3:])
+sys.exit(0 if ok else 1)
+PY
 # w1173's checkpoint (K = 8, gm_spread image, C0/8) through a link, so nothing is written in its run directory
 mkdir -p $OUT/w1173/exp_ladder_d640
 ln -s $W1173 $OUT/w1173/exp_ladder_d640/
