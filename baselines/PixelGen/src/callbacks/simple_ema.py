@@ -23,6 +23,14 @@ class SimpleEMA(Callback):
     def setup_models(self, net: nn.Module, ema_net: nn.Module):
         self.net_params = list(net.parameters())
         self.ema_params = list(ema_net.parameters())
+        # MFU lever B (FSDP2): sharded (DTensor) and replicated parameters go to separate foreach calls; the EMA module is
+        # sharded like the denoiser, so each rank updates its own shard (src/utils/fsdp_setup.py)
+        from torch.distributed.tensor import DTensor
+        dt = [isinstance(p, DTensor) for p in self.net_params]
+        assert dt == [isinstance(p, DTensor) for p in self.ema_params], "EMA and denoiser sharded alike"
+        self._groups = [([e for e, d in zip(self.ema_params, dt) if d == k], [n for n, d in zip(self.net_params, dt) if d == k])
+                        for k in (True, False)]
+        self._groups = [g for g in self._groups if g[0]]
 
     def ema_step(self):
         @torch.no_grad()
@@ -34,7 +42,8 @@ class SimpleEMA(Callback):
             self._stream = torch.cuda.Stream(device=self.ema_params[0].device)
         self._stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._stream):
-            ema_update(self.ema_params, self.net_params, self.decay)
+            for ema_g, net_g in self._groups:
+                ema_update(ema_g, net_g, self.decay)
         assert self.ema_params[0].dtype == torch.float32
 
     def _join(self):

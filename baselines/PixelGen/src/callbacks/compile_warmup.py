@@ -8,6 +8,7 @@ encoder, CFG dropout, denoiser forward and backward, under the training precisio
 position embedding (its own guard), and 192 checks that no new graph is needed. The gradients are discarded before the first step, and DDP's reducer ignores this backward because it runs
 before any DDP forward. The only trace left in training is the position of the RNG streams.
 """
+import contextlib
 import os
 import time
 
@@ -48,7 +49,8 @@ class CompileWarmup(Callback):
                         x, condition, metadata["y_pack"] = Rebalancer(rebalance=False).exchange(x, condition, pack_plan)
                 # inside DDP's forward context: dynamo checks it at compile time, and only then splits the graph at
                 # the DDP buckets (DDPOptimizer), so these are the graphs a real step would compile (review S2)
-                with trainer.strategy.model._inside_ddp_forward():
+                ddp_ctx = getattr(trainer.strategy.model, "_inside_ddp_forward", None)   # FSDP2 (MFU lever B): no DDP
+                with (ddp_ctx() if ddp_ctx is not None else contextlib.nullcontext()):
                     loss = pl_module.diffusion_trainer(pl_module.denoiser, pl_module.ema_denoiser,
                                                        pl_module.diffusion_sampler, x, condition, uncondition, metadata)
             loss["loss"].backward()

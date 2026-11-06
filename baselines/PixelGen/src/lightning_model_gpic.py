@@ -108,6 +108,13 @@ class LightningModel(pl.LightningModule):
         # no_grad(self.diffusion_sampler)
         no_grad(self.ema_denoiser)
 
+        if os.environ.get("GPIC_MFU_FSDP") == "1":   # MFU lever B: FSDP2 per block, same math (src/utils/fsdp_setup.py)
+            from src.utils.fsdp_setup import shard
+            mesh = self.trainer.strategy.device_mesh["data_parallel"]
+            self._replicated = shard(self.denoiser, mesh, compute_bf16=True, compile_blocks=True)
+            shard(self.ema_denoiser, mesh, compute_bf16=False, compile_blocks=False)
+            print("FSDP2: blocks sharded and compiled", flush=True)
+            return
         # torch.compile
         print("Compiling models...")
         # GPIC_PROF_*: profiling switches (jobs/prof_ladder.sh, jobs/smoke_ladder_kernels.sh), unset in every production run
@@ -123,6 +130,13 @@ class LightningModel(pl.LightningModule):
         """perf C3: Lightning's mixed-precision plugin refuses to clip when the optimizer is fused (it assumes the
         optimizer unscales gradients), although bf16 autocast has no gradient scaler. Clip exactly as Lightning's
         'norm' algorithm does: the global 2-norm over every parameter of the optimizer."""
+        if os.environ.get("GPIC_MFU_FSDP") == "1":   # MFU lever B: replicated grads averaged, the same global-norm clip
+            from src.utils.fsdp_setup import sync_replicated_grads, clip_grad_norm_
+            sync_replicated_grads(self._replicated)
+            if gradient_clip_val:
+                assert gradient_clip_algorithm in (None, "norm"), gradient_clip_algorithm
+                clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], gradient_clip_val)
+            return
         if not gradient_clip_val:
             return
         assert gradient_clip_algorithm in (None, "norm"), gradient_clip_algorithm
@@ -141,6 +155,10 @@ class LightningModel(pl.LightningModule):
             {"params": params_trainer,},
             {"params": params_sampler, "lr": 1e-3},
         ]
+        if os.environ.get("GPIC_MFU_FSDP") == "1":   # MFU lever B: sharded and replicated tensors in separate fused calls
+            from src.utils.fsdp_setup import is_dtensor
+            param_groups = [{"params": [p for p in params_denoiser if is_dtensor(p)]},
+                            {"params": [p for p in params_denoiser if not is_dtensor(p)]}] + param_groups[1:]
         # optimizer: torch.optim.Optimizer = self.optimizer([*params_trainer, *params_denoiser])
         optimizer: torch.optim.Optimizer = self.optimizer(param_groups)
         if self.lr_scheduler is None:
@@ -172,7 +190,8 @@ class LightningModel(pl.LightningModule):
 
     def on_train_start(self) -> None:
         print(f"[rank {self.trainer.global_rank}] on_train_start")
-        self.ema_denoiser.to(torch.float32)
+        if os.environ.get("GPIC_MFU_FSDP") != "1":   # FSDP2: the sharded EMA is fp32 already
+            self.ema_denoiser.to(torch.float32)
         self.ema_tracker.setup_models(net=self.denoiser, ema_net=self.ema_denoiser)
         print(f"[rank {self.trainer.global_rank}] on_train_start done")
 

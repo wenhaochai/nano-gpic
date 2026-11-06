@@ -4,6 +4,7 @@
 # shard seed) with the step timer (src/callbacks/bench.py) and without checkpoints or W&B. Sourced env: jobs/env.sh.
 # usage: arm.sh <out dir> <tag> <d> <nb> <nt> <steps> [main.py arguments...]
 #   env: MFU_WT (code worktree, default this script's worktree), BENCH_PROFILE / BENCH_STAGES (bench.py), MFU_LIMIT (s,
+#   MFU_STRATEGY (a trainer.strategy JSON, e.g. FSDP2's ModelParallelStrategy for GPIC_MFU_FSDP=1),
 #   default 1200), anything else the arm changes (NCCL_*, GPIC_* switches), set by the caller.
 set -o pipefail
 OUT=$1 TAG=$2 D=$3 NB=$4 NT=$5 STEPS=$6; shift 6
@@ -21,7 +22,8 @@ timeout -k 60 ${MFU_LIMIT:-1200} python main.py fit --config configs_h100/lite_l
   --trainer.max_steps $STEPS --trainer.callbacks "$CB" \
   --model.denoiser.init_args.hidden_size $D --model.denoiser.init_args.num_groups $((D / 64)) \
   --model.denoiser.init_args.num_blocks $NB --model.denoiser.init_args.num_text_blocks $NT \
-  --trainer.enable_checkpointing false --tags.exp mfu_$TAG --trainer.logger.init_args.name mfu_$TAG "$@" > $OUT/$TAG/train.log 2>&1
+  --trainer.enable_checkpointing false --tags.exp mfu_$TAG --trainer.logger.init_args.name mfu_$TAG \
+  ${MFU_STRATEGY:+--trainer.strategy "$MFU_STRATEGY"} "$@" > $OUT/$TAG/train.log 2>&1
 rc=$?
 rm -f $OUT/$TAG/exp_mfu_$TAG/*.ckpt
 echo "$(date -u +%FT%TZ) tag=$TAG rc=$rc" >> $OUT/arms.txt
