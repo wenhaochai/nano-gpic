@@ -14,19 +14,27 @@
 # data: ladder = train_ladder.sh's defaults (shard order per launch, the region crop), as the ladder's point models; w1147 = the fixed shard seed and the official
 # crop of w1147, w1173 and w1174 (the C0/8 comparison).
 # Optional evaluation tasks after the training (<step>:<sampler>:<calls>, jobs/evals_gmflow.sh); long runs evaluate in separate jobs.
-# usage: train_gmflow.sh <K> <size> <d> <nb> <nt> <steps> <tag> <data: ladder | w1147> [--wt <worktree>] [--spread pixel] [step:sampler:calls ...]
+# usage: train_gmflow.sh <K> <size> <d> <nb> <nt> <steps> <tag> <data: ladder | w1147> [--wt <worktree>] [--spread pixel] [--lam <value>] [step:sampler:calls ...]
 # --spread pixel: train with gm_spread pixel (a per-pixel offset on log s_u, docs/gmflow.md section 7) and evaluate with it; default image. The run records its spread
 # and refuses another. --wt: the frozen worktree gpic-wt/<worktree> instead of gpic-wt/gmflow_run2 (the per-pixel spread needs a commit that has it).
+# --lam: the transition loss's lambda (GMFlowTrainer lam, default 0.5 as configs_h100/gmflow_train.yaml); lam 1 is the plain mixture NLL of x (docs/gmflow.md section 11).
+# The run records it in lam.txt next to spread.txt (a run without lam.txt is 0.5) and refuses another value.
 # Output: runs/gpic-speed/gmflow_k<K>_<size>_<tag>/exp_ladder_<size>; W&B gmflow-k<K>-<size>-<tag>. Code: the frozen worktree gpic-wt/gmflow_run2; the run records its
 # commit and refuses a worktree that moved.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-[ $# -ge 8 ] || { echo "usage: train_gmflow.sh <K> <size> <d> <nb> <nt> <steps> <tag> <ladder | w1147> [--wt <worktree>] [--spread pixel] [tasks...]"; exit 2; }
+[ $# -ge 8 ] || { echo "usage: train_gmflow.sh <K> <size> <d> <nb> <nt> <steps> <tag> <ladder | w1147> [--wt <worktree>] [--spread pixel] [--lam <value>] [tasks...]"; exit 2; }
 K=$1 SIZE=$2 WD=$3 NB=$4 NT=$5 STEPS=$6 TAG=$7 DATA=$8; shift 8
 WTN=gmflow_run2
-if [ "$1" = "--wt" ]; then WTN=$2; shift 2; fi
+if [ "$1" = "--wt" ]; then WTN=$2; shift 2; [[ $WTN =~ ^[A-Za-z0-9_-]+$ ]] || { echo "--wt takes a worktree name under gpic-wt/"; exit 2; }; fi
 SPREAD=image
 if [ "$1" = "--spread" ]; then SPREAD=$2; shift 2; case $SPREAD in image|pixel) ;; *) echo "--spread must be image or pixel"; exit 2 ;; esac; fi
+LAM=0.5
+if [ "$1" = "--lam" ]; then
+  LAM=$2; shift 2
+  [[ $LAM =~ ^(0\.[0-9]*[1-9]|1|1\.0)$ ]] || { echo "--lam must be in (0, 1], written as 0.x or 1"; exit 2; }
+  [ $LAM != 1.0 ] || LAM=1
+fi
 case $DATA in
   ladder) ;;
   w1147) export GPIC_SHARD_SEED=1730000000 GPIC_REGION_CROP=0 ;;
@@ -36,6 +44,7 @@ esac
 WT=$WC/project/gpic-wt/$WTN
 [ -d "$WT/baselines/PixelGen" ] || { echo "no worktree $WT"; exit 2; }
 grep -q "lam: 0.5" $WT/baselines/PixelGen/configs_h100/gmflow_train.yaml || { echo "$WT holds old code"; exit 2; }
+LAM_ARGS=(); [ $LAM = 0.5 ] || LAM_ARGS=(--model.diffusion_trainer.init_args.lam $LAM)   # 0.5: the command line of before this option
 SPREAD_ARGS=()
 if [ $SPREAD = pixel ]; then
   grep -q "gm_spread" $WT/baselines/PixelGen/src/models/transformer/JiT_T2I.py || { echo "$WT has no per-pixel spread"; exit 2; }
@@ -51,11 +60,15 @@ if [ ! -f $ROOT/spread.txt ]; then   # a run started before this option has a ch
   if ls $ROOT/exp_ladder_$SIZE/last*.ckpt > /dev/null 2>&1; then echo image > $ROOT/spread.txt; else echo $SPREAD > $ROOT/spread.txt; fi
 fi
 [ "$(cat $ROOT/spread.txt)" = "$SPREAD" ] || { echo "$ROOT was started with spread $(cat $ROOT/spread.txt), not $SPREAD"; exit 2; }
+if [ ! -f $ROOT/lam.txt ]; then   # a run started before this option has a checkpoint and no lam.txt: it is 0.5
+  if ls $ROOT/exp_ladder_$SIZE/last*.ckpt > /dev/null 2>&1; then echo 0.5 > $ROOT/lam.txt; else echo $LAM > $ROOT/lam.txt; fi
+fi
+[ "$(cat $ROOT/lam.txt)" = "$LAM" ] || { echo "$ROOT was started with lam $(cat $ROOT/lam.txt), not $LAM"; exit 2; }
 export LADDER_WT=$WT LADDER_RUN_ROOT=$ROOT GMFLOW_WT=$WT
 if ls $ROOT/exp_ladder_$SIZE/ms-step=$(printf %06d $STEPS)*.ckpt > /dev/null 2>&1; then
   echo "training done before"
 else
-  bash $WT/jobs/train_ladder.sh $SIZE $WD $NB $NT $STEPS --config configs_h100/gmflow_train.yaml --model.denoiser.init_args.gm_k $K "${SPREAD_ARGS[@]}" \
+  bash $WT/jobs/train_ladder.sh $SIZE $WD $NB $NT $STEPS --config configs_h100/gmflow_train.yaml --model.denoiser.init_args.gm_k $K "${SPREAD_ARGS[@]}" "${LAM_ARGS[@]}" \
     --trainer.logger.init_args.name gmflow_k${K}_${SIZE}_${TAG} --trainer.logger.init_args.id gmflow-k${K}-${SIZE}-${TAG} >> $ROOT/train.log 2>&1
   rc=$?
   echo "train rc=$rc launches=$(wc -l < $ROOT/exp_ladder_$SIZE/launches.txt 2>/dev/null)"

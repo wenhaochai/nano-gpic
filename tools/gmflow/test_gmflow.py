@@ -1304,6 +1304,99 @@ def T28():
     assert d[64] < 1e-5 and d[128] > 1e-3, d
 
 
+@test
+def T29():
+    """lambda = 1 (train_gmflow.sh --lam 1, docs/gmflow.md section 11): sigma_low = 0, so x_low = x, c1 = 0, c2 = 1, c3 = 0 (log c3 = -inf, which logaddexp drops), and
+    the loss equals 2 x the plain per-pixel NLL of x under the predicted x-mixture, s_x = sigma_high s_u (gm_nll's inverse-std floor 1 / EPS is the only clamp); values
+    and gradients are equal to that NLL's and finite, for image and per-pixel spread, K = 8 and 1, t near 0 and near 1."""
+    B, C, H, W = 4, 3, 8, 8
+    for K in (8, 1):
+        for per_pixel in (False, True):
+            torch.manual_seed(K + 10 * per_pixel)
+            x = torch.rand(B, C, H, W) * 2 - 1
+            mu = torch.randn(B, K, C, H, W).requires_grad_(True)
+            lw0 = torch.randn(B, K, 1, H, W).requires_grad_(True)
+            ls = (torch.randn(B, 1, 1, H, W) if per_pixel else torch.randn(B, 1, 1, 1, 1)).mul(0.5).requires_grad_(True)
+            net = FixedGM(mu, lw0.log_softmax(1), ls)
+            net.logstd = ls   # keep the per-pixel shape (FixedGM expands a per-image logstd to (B, 1, 1, 1, 1))
+            net.forward = lambda x_t, t, y, y_mask=None, gm_mode="full", _n=net: (setattr(_n, "t", t.detach().clone()), setattr(_n, "x_t", x_t.detach().clone()),
+                                                                                  dict(means=_n.means, logweights=_n.logweights, logstd=_n.logstd))[2]
+            torch.manual_seed(5)
+            loss = gm_trainer(lam=1.0)._impl_trainstep(net, None, None, x, None, None)["loss"]
+            sigma = (1 - net.t).view(-1, 1, 1, 1, 1)
+            want = 2 * G.gm_nll(x, mu, lw0.log_softmax(1), ls + torch.log(sigma)).mean((1, 2)).mean()
+            ga = torch.autograd.grad(loss, (mu, lw0, ls), retain_graph=True)
+            gb = torch.autograd.grad(want, (mu, lw0, ls))
+            assert torch.allclose(loss, want, rtol=1e-6, atol=1e-6), (K, per_pixel, loss.item(), want.item())
+            assert all(torch.allclose(a, b, rtol=1e-5, atol=1e-7) for a, b in zip(ga, gb)), (K, per_pixel, [(a - b).abs().max().item() for a, b in zip(ga, gb)])
+            c1, c2, c3 = G.bridge_coefs(sigma.view(-1, 1, 1, 1), sigma.view(-1, 1, 1, 1) * 0)
+            assert (c1 == 0).all() and (c2 == 1).all() and (c3 == 0).all(), (c1, c2, c3)
+    # the real model at t near 0 and near 1: finite loss and gradients at lambda = 1
+    for K, spread in ((8, "image"), (8, "pixel"), (1, "image")):
+        x, t, y, mask = model_io(K)
+        torch.manual_seed(2)
+        net = JiT_T2I(**small, gm_k=K, gm_spread=spread)
+        for P_mean in (-12.0, 0.0, 12.0):
+            net.zero_grad()
+            res = gm_trainer(lam=1.0, P_mean=P_mean, P_std=0.0)._impl_trainstep(net, None, None, x.clamp(-1, 1), y, {"y_mask": mask})
+            res["loss"].backward()
+            bad = [k for k, p_ in net.named_parameters() if p_.grad is not None and not torch.isfinite(p_.grad).all()]
+            assert torch.isfinite(res["loss"]) and not bad, (K, spread, P_mean, res["loss"], bad[:3])
+    print("  lambda = 1: loss = 2 x plain NLL of x under the x-mixture (values to 1e-6, gradients on means, weights and log s_u to 1e-5), K 8 and 1, image and pixel;"
+          " c1 = 0, c2 = 1, c3 = 0; the real model's loss and gradients finite at t = sigmoid(-12), 0.5, sigmoid(12)")
+
+
+@test
+def T30():
+    """train_gmflow.sh options on a stub worktree gmflow_run3 (stub train_ladder.sh and evals_gmflow.sh that print their arguments): the old call passes the old
+    arguments; --wt gmflow_run3 --spread pixel --lam 1 passes gm_spread pixel and lam 1 and records spread.txt and lam.txt; a restart with another lam is refused;
+    a run with a checkpoint and no lam.txt is 0.5; bad values are refused."""
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+    wt = os.path.join(tmp, "project/gpic-wt/gmflow_run3")
+    for d in ("baselines/PixelGen/configs_h100", "baselines/PixelGen/src/models/transformer", "jobs"):
+        os.makedirs(os.path.join(wt, d))
+    open(os.path.join(wt, "baselines/PixelGen/configs_h100/gmflow_train.yaml"), "w").write("      lam: 0.5\n")
+    open(os.path.join(wt, "baselines/PixelGen/src/models/transformer/JiT_T2I.py"), "w").write("gm_spread\n")
+    open(os.path.join(wt, "jobs/train_ladder.sh"), "w").write('echo "TRAIN $*" >> $LADDER_RUN_ROOT/calls.txt\n')
+    open(os.path.join(wt, "jobs/evals_gmflow.sh"), "w").write('echo "EVALS $*" >> $7/calls.txt 2>/dev/null; echo "EVALS $*" >> $6/calls.txt\n')
+    subprocess.run("git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x", shell=True, cwd=wt, check=True)
+    shutil.copytree(wt, os.path.join(tmp, "project/gpic-wt/gmflow_run2"), symlinks=True)
+    src = open(os.path.join(REPO, "jobs/train_gmflow.sh")).read().replace("source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh", f"WC={tmp}")
+    stub = os.path.join(tmp, "train.sh"); open(stub, "w").write(src)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("EVAL_", "GPIC_", "LADDER_"))}
+    def tr(*args):
+        r = subprocess.run(["bash", stub, *map(str, args)], env=env, capture_output=True, text=True)
+        return r.returncode, r.stdout + r.stderr
+    root = lambda tag, K=8: os.path.join(tmp, f"runs/gpic-speed/gmflow_k{K}_d640_{tag}")
+    calls = lambda tag, K=8: open(os.path.join(root(tag, K), "calls.txt")).read().splitlines()
+    rc, out = tr(8, "d640", 640, 9, 2, 62336, "old", "w1147", "31168:gm_ode:8")
+    assert rc == 0, out
+    c = calls("old")
+    assert c[0] == "TRAIN d640 640 9 2 62336 --config configs_h100/gmflow_train.yaml --model.denoiser.init_args.gm_k 8 --trainer.logger.init_args.name gmflow_k8_d640_old --trainer.logger.init_args.id gmflow-k8-d640-old", c
+    assert c[1].startswith("EVALS 8 d640 640 9 2 ") and c[1].endswith(" 31168:gm_ode:8") and "--wt" not in c[1], c
+    assert open(os.path.join(root("old"), "lam.txt")).read().strip() == "0.5" and open(os.path.join(root("old"), "spread.txt")).read().strip() == "image"
+    rc, out = tr(1, "d640", 640, 9, 2, 66560, "c08lam1", "w1147", "--wt", "gmflow_run3", "--lam", "1", "33280:gm_ode:8")
+    assert rc == 0, out
+    c = calls("c08lam1", 1)
+    assert "--model.diffusion_trainer.init_args.lam 1 " in c[0] + " " and "gm_spread" not in c[0], c
+    assert "--wt gmflow_run3 33280:gm_ode:8" in c[1], c
+    assert open(os.path.join(root("c08lam1", 1), "lam.txt")).read().strip() == "1"
+    rc, out = tr(8, "d640", 640, 9, 2, 62208, "px", "w1147", "--wt", "gmflow_run3", "--spread", "pixel", "--lam", "1.0")
+    assert rc == 0 and "--model.denoiser.init_args.gm_spread pixel --model.diffusion_trainer.init_args.lam 1 " in calls("px")[0] + " ", out + str(calls("px"))
+    rc, out = tr(1, "d640", 640, 9, 2, 66560, "c08lam1", "w1147", "--wt", "gmflow_run3")
+    assert rc == 2 and "started with lam 1, not 0.5" in out, out
+    os.makedirs(os.path.join(root("pre"), "exp_ladder_d640")); open(os.path.join(root("pre"), "exp_ladder_d640/last.ckpt"), "w").close()
+    rc, out = tr(8, "d640", 640, 9, 2, 62336, "pre", "w1147", "--lam", "1")
+    assert rc == 2 and "started with lam 0.5, not 1" in out, out
+    for bad in ("0", "1.5", "abc", "0.50"):
+        rc, out = tr(8, "d640", 640, 9, 2, 62336, "bad", "w1147", "--lam", bad)
+        assert rc == 2 and "--lam must be" in out, (bad, out)
+    print("  train_gmflow.sh: the old call is unchanged (lam.txt 0.5); --wt gmflow_run3 [--spread pixel] --lam 1 passes init_args.lam 1 and records lam.txt;"
+          " another lam refused on restart; a run of before the option (checkpoint, no lam.txt) is 0.5; 0, 1.5, 0.50, abc refused")
+
+
 if __name__ == "__main__":
     names = sys.argv[1:] or list(RESULTS)
     failed = []
