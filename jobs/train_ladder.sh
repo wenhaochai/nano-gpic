@@ -76,14 +76,14 @@ export GPIC_SHARD_SEED GPIC_SHARD_LOG_DIR=$RUN   # one shard order per run and p
 export GPIC_REGION_CROP=${GPIC_REGION_CROP:-1}   # the crop resizes only the region it keeps: d640 29.5 -> 26.7 ms (w1117); the same random draws; 0.035% of the channel values differ, by at most 2 of 255
 export TORCHINDUCTOR_CPP_WRAPPER=1   # kernels launched from C++: d640 39.3 -> 32.6 ms; the same math up to bf16 rounding (tools/test_cpp_launcher.py)
 # MFU levers (docs/mfu.md, branch mfu): the same math, each behind its own switch, on by default; set one to 0 (A: sdpa) to
-# turn it off. A: FlashAttention-3 for the masked attention of the image blocks. B: FSDP2 per block in place of DDP
+# turn it off (E is off by default). A: FlashAttention-3 for the masked attention of the image blocks. B: FSDP2 per block in place of DDP
 # (bf16 compute parameters, fp32 reduce-scatter, sharded AdamW and EMA; ModelParallelStrategy below). C: the region crop's
 # resize on the GPU, bit for bit Pillow's. D: uint8 batches, mapped to the transform's floats on the GPU. E: packed captions,
 # the samples of each step dealt over the ranks by caption length. F: checkpoint writes in a separate process.
 export GPIC_MFU_ATTN=${GPIC_MFU_ATTN:-fa3}
 export GPIC_MFU_FSDP=${GPIC_MFU_FSDP:-1}
 export GPIC_MFU_GPU_RESIZE=${GPIC_MFU_GPU_RESIZE:-1} GPIC_MFU_UINT8=${GPIC_MFU_UINT8:-1}
-export GPIC_MFU_PACK=${GPIC_MFU_PACK:-1} GPIC_MFU_REBALANCE=${GPIC_MFU_REBALANCE:-1}
+export GPIC_MFU_PACK=${GPIC_MFU_PACK:-0} GPIC_MFU_REBALANCE=${GPIC_MFU_REBALANCE:-0}   # E: off until its slowdown is fixed (docs/mfu.md)
 GPIC_MFU_ASYNC_CKPT=${GPIC_MFU_ASYNC_CKPT:-1}
 MFU_ARGS=()
 [ "$GPIC_MFU_FSDP" = 1 ] && MFU_ARGS+=(--trainer.strategy '{"class_path":"lightning.pytorch.strategies.ModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}')

@@ -30,6 +30,15 @@ SMK=$(ls -dt $WC/runs/gpic-speed/full_smoke_* | head -1)
 REF=$WC/runs/gpic-speed/full_smoke_1106_1433/resume/exp_ladder_d640
 ( cd $WT/baselines/PixelGen && PYTHONPATH=$PWD python $WT/tools/mfu/compare_ckpt_layout.py $REF/ms-step=001600.ckpt $SMK/resume/exp_ladder_d640/ms-step=001600.ckpt \
   $REF/ms-step=004800.ckpt $SMK/resume/exp_ladder_d640/ms-step=004800.ckpt $REF/last.ckpt $SMK/resume/exp_ladder_d640/last.ckpt ) 2>&1 | tee -a $OUT/summary.txt
+# 4. (a) the real evaluation path (genmodel, 2026-11-06): gmflow_run4's own eval_gmflow.sh on the smoke's ms-step=001600
+#    through a scratch root with a link to it, one batch per rank; pass = exit 0 and a sample_check.txt
+EV=$OUT/eval
+mkdir -p $EV/exp_ladder_d640 && ln -sf $SMK/resume/exp_ladder_d640/ms-step=001600.ckpt $EV/exp_ladder_d640/
+EWT=$WC/project/gpic-wt/gmflow_run4
+GMFLOW_WT=$EWT WANDB_MODE=disabled EVAL_LIMIT_BATCHES=1 LADDER_RUN_ROOT=$EV timeout -k 60 900 bash $EWT/jobs/eval_gmflow.sh 0 1600 euler 8 > $OUT/eval.log 2>&1
+rc=$?
+chk=$(cat $EV/exp_ladder_d640/eval_001600_euler_calls8*/sample_check.txt 2>/dev/null)
+echo "[$(date +%T)] eval path rc=$rc sample_check: $chk" | tee -a $OUT/summary.txt
 # 2. the full data set
 LADDER_WT=$WT LADDER_RUN_ROOT=$OUT/full LADDER_PARTIAL_OK=1 BENCH_OUT=$OUT/full/bench GPIC_SHARD_SEED=20261106 \
   bash $WT/jobs/train_ladder.sh d640 640 9 2 6400 --data.train_dataset.init_args.tar_pattern 'gpic_train_{00000..07999}.tar' \
