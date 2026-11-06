@@ -53,12 +53,42 @@ ms alone (334 GB/s), so the all-reduce and the backward kernels slow each other.
 - Expectation: attention 3-4x faster; d1280 about -6 ms per step.
 - Result: probe2 (w1317), pending.
 
+### Where the 8-GPU step loses against one GPU (w1316, step_bench, synthetic batches, no data path)
+
+| width | 1 GPU | 8 GPUs, one T for all ranks | 8 GPUs, own T per rank | production (real data) |
+|---|---|---|---|---|
+| d640 | 19.78 ms | 23.06 (+3.3 communication and DDP) | 28.96 (+5.9 rank imbalance) | 30.94 (+2.0 data and host) |
+| d1280 | 70.88 | 82.11 (+11.2) | 88.16 (+6.1) | 92.74 (+4.6) |
+
+Same-GPU repeats of step_bench agree within 0.5% (w1318). Loss floor for parity checks (w1318, d640, 300 steps, SDPA vs
+SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6 relative at the end, grad norm by 1.6e-3.
+
 ### B. Communication and the optimizer (planned)
 - Hypothesis: at d1280 and above, about 22-24% of the step is communication, the wait for the rank with the longest
   captions, and host work (8-GPU production vs one GPU); the optimizer and EMA cost 11 ms (d1280) and 28 + 7 ms (d1792).
   Sharding the optimizer and the EMA over the 8 ranks (reduce-scatter in DDP's buckets, AdamW and EMA on each rank's shard,
   all-gather of the updated parameters) divides their work by 8 with the same math.
 - Pending: the DDP arms of w1316 (own T per rank vs one T for all ranks) split communication from rank imbalance.
+
+### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
+- Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches
+  (13%) make a step wait in about two thirds of the steps (5.9 ms at d640, 6.1 ms at d1280, w1316). A FLOP model of the
+  measured length histogram puts the slowest rank at 1.11x the mean rank at every width; packing the captions and dealing
+  the samples of each batch position over the ranks brings it to 0.99x (packing alone: 1.10x).
+- Same math: a sample keeps its batch position (so its t and noise: the official seeding draws them alike on all ranks);
+  each rank keeps 32 samples; loss and gradient are the same sums over the same 256 samples (up to fp32 order).
+- Setup: model path with y_pack (text blocks and caption key projections on the real tokens; FA3 varlen in the text
+  blocks; padded key layout with per-sample key counts in the image blocks); `src/utils/rebalance.py` (host plan through a
+  gloo all_gather of lengths and caption types, device exchange by two all_to_all); collate packing; packed warm-up.
+- Tests: exchange logic (tools/mfu/tests/test_rebalance_plan.py, 300 trials; test_rebalancer_gloo.py, 8 gloo ranks x 40
+  steps): every sample once, at its position, tokens intact; after the plan the busiest rank holds 1.03x the mean caption
+  tokens (worst 1.085). GPU: probe4 (w1323), production path probe5 (w1324, w1325), pending.
+
+### D. uint8 crops (`GPIC_MFU_UINT8=1`)
+- The workers keep the crop as uint8 HWC; the training step maps it with a 256-entry table that train_transform's own
+  ToTensor + Normalize computed (no device arithmetic, so no question of how CUDA rounds x / 255). Bit-identical on 300 real
+  crops (tools/mfu/tests/test_uint8_path.py). Saves the workers' ToTensor + Normalize (0.56 ms of 7.3 ms CPU per image on
+  vis1) and 3/4 of the collate, pin and copy bytes. Matters only where the CPUs bind (d640, d768).
 
 ### C. Data path at the small widths (planned)
 - d640 is bound by the node's CPUs (7.3 ms of worker CPU per image on vis1: decode 2.79, crop and resize 2.25, ToTensor
