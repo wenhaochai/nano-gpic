@@ -27,11 +27,15 @@ class CachedTextConditioner(BaseConditioner):
         return t if t.is_cuda else t.pin_memory().cuda(non_blocking=True)
 
     def _impl_condition(self, y, metadata: dict = {}):
+        if "text_lens" in metadata:   # MFU lever E: packed captions [S, embed_dim]; y_pack comes from src/utils/rebalance.py
+            return self._to_cuda(metadata["text_emb"])
         out, mask = self._to_cuda(metadata["text_emb"]), self._to_cuda(metadata["text_mask"])
         metadata["y_mask"] = mask.bool()
         return out
 
     def _impl_uncondition(self, y, metadata: dict = None):
+        if "text_lens" in metadata:   # MFU lever E: no caption dropout in packed mode (BaseTrainer.preproprocess refuses it)
+            return metadata["text_emb"][:0]
         # the null caption: one eos token at position 0, zeros after; the CFG-dropout code sets its mask row
         if self.null_embedding is None:
             self.null_embedding = self.null_cpu.to(metadata["text_emb"].device)

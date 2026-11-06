@@ -14,6 +14,8 @@ class BaseTrainer(nn.Module):
 
     def preproprocess(self, x, condition, uncondition, metadata):
         bsz = x.shape[0]
+        if self.null_condition_p > 0 and isinstance(metadata, dict) and metadata.get("y_pack") is not None:
+            raise NotImplementedError("MFU lever E (packed captions) has no caption dropout; the ladder uses none")
         if self.null_condition_p > 0:
             mask = torch.rand((bsz), device=condition.device) < self.null_condition_p
             if isinstance(metadata, dict) and metadata.get("y_mask") is not None:   # ladder option B (masked text)

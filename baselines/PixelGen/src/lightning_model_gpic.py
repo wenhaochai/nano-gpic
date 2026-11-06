@@ -197,9 +197,22 @@ class LightningModel(pl.LightningModule):
                 else:
                     pass
 
+    def on_before_batch_transfer(self, batch, dataloader_idx):
+        """MFU lever E: plan on the host which rank computes each sample of this step (src/utils/rebalance.py)."""
+        if (self.trainer is not None and self.trainer.training and isinstance(batch, (list, tuple)) and len(batch) == 3
+                and isinstance(batch[2], dict) and "text_lens" in batch[2]):
+            if getattr(self, "_rebalancer", None) is None:
+                from src.utils.rebalance import Rebalancer
+                self._rebalancer = Rebalancer(rebalance=os.environ.get("GPIC_MFU_REBALANCE") == "1")
+            batch[2]["mfu_plan"] = self._rebalancer.host_plan(batch[2]["text_lens"], batch[2].get("caption_type"))
+        return batch
+
     def training_step(self, batch, batch_idx):
         # print(f"Received training batch with batch_idx={batch_idx}")
         x, y, metadata = batch
+        if x.dtype == torch.uint8:   # MFU lever D: uint8 HWC from the workers (GPIC_MFU_UINT8=1), the transform's floats here
+            from src.data.dataset.gpic_dataset import uint8_to_float
+            x = uint8_to_float(x)
         # print(f"Training step: batch_idx={batch_idx}, x.shape={x.shape}, y.shape={y.shape if isinstance(y, torch.Tensor) else 'N/A'},")
         if metadata is None:
             metadata = {}
@@ -207,6 +220,11 @@ class LightningModel(pl.LightningModule):
         with torch.no_grad():
             x = self.vae.encode(x)
             condition, uncondition = self.conditioner(y, metadata)
+            if "mfu_plan" in metadata:   # MFU lever E: images and caption tokens to the ranks the plan names; y_pack
+                p = metadata.pop("mfu_plan")
+                x, condition, metadata["y_pack"] = self._rebalancer.exchange(x, condition, p)
+                if p.get("types") is not None:
+                    metadata["caption_type"] = p["types"]
         loss = self.diffusion_trainer(self.denoiser, self.ema_denoiser, self.diffusion_sampler, x, condition, uncondition, metadata)
 
         # --- GPIC: log per-caption-type training loss ---

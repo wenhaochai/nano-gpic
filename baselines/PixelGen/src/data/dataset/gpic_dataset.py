@@ -16,6 +16,8 @@ from .augmentation import center_crop_arr, random_crop_arr, random_crop_arr_regi
 global train_transform, val_transform
 
 _train_crop = random_crop_arr_region if os.environ.get("GPIC_REGION_CROP") == "1" else random_crop_arr   # docs/text_cache.md; jobs/train_ladder.sh sets it
+_UINT8 = os.environ.get("GPIC_MFU_UINT8") == "1"   # MFU lever D: grouped training batches carry uint8 HWC images
+_PACK = os.environ.get("GPIC_MFU_PACK") == "1"     # MFU lever E: packed captions (src/utils/rebalance.py)
 train_transform = T.Compose([
     T.Lambda(lambda pil_image: _train_crop(pil_image, 256)),
     T.ToTensor(),
@@ -364,7 +366,10 @@ class GPICWebDataset(IterableDataset):
         on every image must not train on one image, so 8 failures in a row stop the run."""
         text = {"text_emb": s["text_emb"], "text_len": s["text_len"]} if self.emb_dir else {"input_ids": s["input_ids"]}
         try:
-            out = (self._post(self._crop_uint8(s)), s["caption"], {"caption_type": s["caption_type"], **text})
+            # MFU lever D (docs/mfu.md): GPIC_MFU_UINT8=1 keeps the crop as uint8 HWC; the training step maps it to the same
+            # float32 values the transform's ToTensor + Normalize give (uint8_to_float: a table made by those transforms)
+            img = torch.from_numpy(self._crop_uint8(s)) if _UINT8 else self._post(self._crop_uint8(s))
+            out = (img, s["caption"], {"caption_type": s["caption_type"], **text})
         except Exception as exn:
             self._repeats += 1
             if self._last_sample is None or self._repeats > 8:
@@ -377,6 +382,14 @@ class GPICWebDataset(IterableDataset):
     def _collate_cached(self, samples):
         imgs = torch.stack([s[0] for s in samples])
         lens = [s[2]["text_len"] for s in samples]
+        if _PACK:   # MFU lever E: the real caption tokens back to back, [sum(lens), EMB_DIM]; no mask, no padding
+            emb = torch.empty((sum(lens), EMB_DIM), dtype=torch.bfloat16)
+            off = 0
+            for s, n in zip(samples, lens):
+                emb[off:off + n] = torch.frombuffer(bytearray(s[2]["text_emb"]), dtype=torch.bfloat16).view(n, EMB_DIM)
+                off += n
+            return imgs, [s[1] for s in samples], {"caption_type": [s[2]["caption_type"] for s in samples],
+                                                   "text_emb": emb, "text_lens": lens}
         T = min(-(-max(lens) // self.pad_multiple) * self.pad_multiple, self.text_max_length)
         emb = torch.zeros((len(samples), T, EMB_DIM), dtype=torch.bfloat16)
         text_mask = torch.zeros((len(samples), T), dtype=torch.bool)
@@ -545,3 +558,20 @@ if __name__ == "__main__":
     )
     dataset = ds.create_dataset()
     ds.test(dataset)
+
+_U8_TABLE = None
+
+
+def uint8_to_float(x):
+    """MFU lever D: uint8 images [B, H, W, 3] (any device) to the float32 [B, 3, H, W] that train_transform's ToTensor +
+    Normalize give, bit for bit: a 256-entry table computed by those transforms on the CPU, looked up on x's device. A
+    table avoids any question of how the device rounds x / 255 (CUDA divides by a scalar through its reciprocal)."""
+    global _U8_TABLE
+    if _U8_TABLE is None or _U8_TABLE.device != x.device:
+        post = T.Compose(train_transform.transforms[1:])
+        v = np.arange(256, dtype=np.uint8).reshape(16, 16, 1).repeat(3, axis=2)
+        t = post(v)                                   # [3, 16, 16] float32, the training transform's own numbers
+        assert torch.equal(t[0], t[1]) and torch.equal(t[1], t[2])
+        _U8_TABLE = t[0].reshape(256).contiguous().to(x.device)
+    assert x.dtype == torch.uint8 and x.shape[-1] == 3, (x.dtype, x.shape)
+    return _U8_TABLE.index_select(0, x.reshape(-1).int()).view(x.shape).permute(0, 3, 1, 2).contiguous()

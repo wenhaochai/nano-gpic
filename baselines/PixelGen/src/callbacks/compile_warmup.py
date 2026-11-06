@@ -8,6 +8,7 @@ encoder, CFG dropout, denoiser forward and backward, under the training precisio
 position embedding (its own guard), and 192 checks that no new graph is needed. The gradients are discarded before the first step, and DDP's reducer ignores this backward because it runs
 before any DDP forward. The only trace left in training is the position of the RNG streams.
 """
+import os
 import time
 
 import torch
@@ -32,11 +33,19 @@ class CompileWarmup(Callback):
                 pad = pl_module.conditioner.tokenizer.pad_token_id
                 text = {"input_ids": torch.full((B, T), pad, dtype=torch.long, device=dev)}
             metadata = {**text, "text_mask": mask, "global_step": trainer.global_step}
+            if os.environ.get("GPIC_MFU_PACK") == "1":   # MFU lever E: packed captions, lengths below T as real batches
+                from src.utils.rebalance import Rebalancer
+                lens = [max(1, T // 2 - (i % 5)) for i in range(B)]
+                metadata = {"text_emb": torch.zeros(sum(lens), pl_module.conditioner.embed_dim, dtype=torch.bfloat16,
+                                                    device=dev), "text_lens": lens, "global_step": trainer.global_step}
+                pack_plan = Rebalancer(rebalance=False).host_plan(lens)
             x = torch.zeros(B, 3, self.image_size, self.image_size, device=dev)
             with trainer.precision_plugin.train_step_context():
                 with torch.no_grad():
                     x = pl_module.vae.encode(x)
                     condition, uncondition = pl_module.conditioner([""] * B, metadata)
+                    if "text_lens" in metadata:
+                        x, condition, metadata["y_pack"] = Rebalancer(rebalance=False).exchange(x, condition, pack_plan)
                 # inside DDP's forward context: dynamo checks it at compile time, and only then splits the graph at
                 # the DDP buckets (DDPOptimizer), so these are the graphs a real step would compile (review S2)
                 with trainer.strategy.model._inside_ddp_forward():
