@@ -2,12 +2,15 @@
 num_steps is the number of network calls. The network is called as net(x, t, condition, gm_mode="full") and returns the per-pixel mixture over x (training_gmflow.py).
 A point model (gm_k = 0) returns a tensor; it is read as K = 1 with s_x = 0. GM-SDE on it is DDPM with the small variance, the sampler control of the point model.
 No CFG: the guidance is asserted 1.0.
+order 2 (GM-SDE 2, GM-ODE 2; paper App. A.2, GMFlow gmflow.py:251-291 and 497-503): from the second call on, the call's mixture is reweighted by gm_second_order with the
+previous call's raw mixture converted to the current x_t (Eq. 10); then the first-order step or the sub-steps run on it. The first call is first order. order 1 is the
+code before this option, unchanged. On a point model (s = 0, K = 1) order 2 changes nothing (its surrogate variance is 0).
 """
 import os
 
 import torch
 
-from src.diffusion.flow_matching.gmflow import bridge_coefs, gm_convert_mean, gm_draw, gm_mean
+from src.diffusion.flow_matching.gmflow import bridge_coefs, gm_convert_mean, gm_draw, gm_mean, gm_second_order
 from src.diffusion.flow_matching.sampling import EulerSamplerJiT
 
 
@@ -22,9 +25,11 @@ def as_mixture(out):
 
 
 class _GMSampler(EulerSamplerJiT):
-    def __init__(self, *args, rank_seed: bool = True, **kwargs):
+    def __init__(self, *args, rank_seed: bool = True, order: int = 1, **kwargs):
         super().__init__(*args, **kwargs)
+        assert order in (1, 2), order
         self.rank_seed = rank_seed   # off in the CPU tests only
+        self.order = order
 
     def _start(self, noise):
         assert float(self.guidance) == 1.0, "CFG is fixed at 1.0 (owner, 2026-11-01)"
@@ -38,10 +43,22 @@ class _GMSampler(EulerSamplerJiT):
         out = net(x, t_cur.repeat(x.shape[0]), condition, gm_mode="full")
         return as_mixture(out) if isinstance(out, dict) else out.float()
 
+    def _second_order(self, gm, x, sigma, sigma_to, prev):
+        """order 2: (the mixture to step with, the state for the next call). prev = (raw mixture, x, sigma, h) of the previous call, None at the first call (first order,
+        GMFlow gmflow.py:312-313). h = sigma - sigma_to, the call's step; the last call's h is sigma (to 0), as the code. sigma (1, 1, 1, 1)."""
+        h = sigma - sigma_to
+        state = (gm, x, sigma, h)
+        if prev is None:
+            return gm, state
+        p_gm, p_x, p_sigma, p_h = prev
+        B = x.shape[0]
+        mean_prev = gm_convert_mean(p_gm, p_sigma.expand(B, -1, -1, -1), sigma.expand(B, -1, -1, -1), p_x, x)
+        return gm_second_order(gm, mean_prev, sigma.expand(B, -1, -1, -1), h, p_h), state
+
 
 class GMSDESampler(_GMSampler):
     """GM-SDE, first order: x0_hat ~ q(x0 | x_t), independently per pixel, then the bridge step x' = c1 x + c2 x0_hat + sqrt(c3) xi. The last step (c1 = 0, c2 = 1, c3 = 0)
-    returns the draw. final_mean: the last step uses the mixture mean instead of a draw. No spectral sampling, no second order."""
+    returns the draw. final_mean: the last step uses the mixture mean instead of a draw. No spectral sampling. order 2: GM-SDE 2 (module docstring)."""
     def __init__(self, *args, final_mean: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.final_mean = final_mean
@@ -51,10 +68,13 @@ class GMSDESampler(_GMSampler):
         dev = noise.device.type
         x = noise.float()
         x_trajs, v_trajs = [x], []
+        prev = None
         for i, (t_cur, t_next) in enumerate(zip(steps[:-1], steps[1:])):
             gm = self._call(net, x, t_cur, condition)
             with torch.autocast(device_type=dev, enabled=False):
                 sigma, sigma_to = (1 - t_cur).view(1, 1, 1, 1), (1 - t_next).view(1, 1, 1, 1)
+                if self.order == 2 and not torch.is_tensor(gm):
+                    gm, prev = self._second_order(gm, x, sigma, sigma_to, prev)
                 last = i == len(steps) - 2
                 if torch.is_tensor(gm):   # a point model: K = 1, s_x = 0, so the draw is its x prediction (DDPM with the small variance)
                     x0 = gm
@@ -72,7 +92,8 @@ class GMSDESampler(_GMSampler):
 class GMODESampler(_GMSampler):
     """GM-ODE, first order, with `substeps` analytic sub-steps per call (GMFlow gmflow.py:527-539). Sub-step 0 uses the mixture mean; sub-step j > 0 re-weights the call's
     mixture to the current state (Eq. 10, gm_convert) and uses its mean. Each sub-step is the Euler step x' = x + (sigma' - sigma) (x - x0) / sigma, on a uniform sigma grid of
-    num_steps * substeps points. The last sub-step (sigma' = 0) returns the re-weighted mixture mean."""
+    num_steps * substeps points. The last sub-step (sigma' = 0) returns the re-weighted mixture mean. order 2: GM-ODE 2 (module docstring), the sub-steps on the
+    second-order mixture."""
     def __init__(self, *args, substeps: int = 3, **kwargs):
         super().__init__(*args, **kwargs)
         assert substeps >= 1, substeps
@@ -83,11 +104,14 @@ class GMODESampler(_GMSampler):
         dev = noise.device.type
         x = noise.float()
         x_trajs, v_trajs = [x], []
+        prev = None
         for t_cur, t_next in zip(steps[:-1], steps[1:]):
             gm = self._call(net, x, t_cur, condition)
             gm = as_mixture(gm) if torch.is_tensor(gm) else gm
             with torch.autocast(device_type=dev, enabled=False):
                 sigma_src, sigma_end = (1 - t_cur).view(1, 1, 1, 1), (1 - t_next).view(1, 1, 1, 1)
+                if self.order == 2:
+                    gm, prev = self._second_order(gm, x, sigma_src, sigma_end, prev)
                 sig_src_b = sigma_src.expand(x.shape[0], -1, -1, -1)
                 x_src = x
                 for j in range(self.substeps):

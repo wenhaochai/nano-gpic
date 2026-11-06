@@ -2,7 +2,9 @@
 
 Our t = 1 is data and x_t = t x + (1 - t) eps. With sigma := 1 - t and alpha := t, GMFlow's formulas carry over unchanged.
 A mixture is a dict: means (B, K, C, H, W), the x-means mu_x,k; logweights (B, K, 1, H, W), log-softmax over K; logstd (B, 1, 1, 1, 1), log s_u in
-velocity units, so the image-space std is s_x = sigma s_u. Every function here runs in fp32 with autocast off.
+velocity units, so the image-space std is s_x = sigma s_u. With the per-pixel spread (JiT_T2I gm_spread "pixel") logstd is (B, 1, 1, H, W): one s_u per pixel, shared by
+the C channels and the K components. Every function here takes either shape; every reduction over pixels is noted where it happens. Every function runs in fp32 with
+autocast off.
 """
 import torch
 
@@ -29,7 +31,7 @@ def forward_transition(x_low, sigma_low, sigma_high, noise):
 
 
 def logstd_x(gm, sigma):
-    """log s_x = log s_u + log sigma, (B, 1, 1, 1, 1)."""
+    """log s_x = log s_u + log sigma, (B, 1, 1, 1, 1) or (B, 1, 1, H, W). sigma (B, 1, 1, 1, 1)."""
     return gm["logstd"] + torch.log(sigma.clamp(min=EPS))
 
 
@@ -70,7 +72,8 @@ def gm_draw(gm, sigma):
 
 def gm_convert(gm, sigma_src, sigma_tgt, x_src, x_tgt, eps=1e-6):
     """The analytic sub-step (GMFlow Eq. 10; code gmflow.py:41-70): q(x0 | x_tgt) proportional to p(x_tgt | x0) / p(x_src | x0) q(x0 | x_src), for sigma_tgt < sigma_src.
-    q(x0 | x_src) is gm with s_x = sigma_src s_u. Returns (means, logweights, var) of the new mixture: (B, K, C, H, W), (B, K, 1, H, W), (B, 1, 1, 1, 1)."""
+    q(x0 | x_src) is gm with s_x = sigma_src s_u. Returns (means, logweights, var) of the new mixture: (B, K, C, H, W), (B, K, 1, H, W), and the shape of gm's logstd.
+    Pixel by pixel: nothing here reduces over pixels, so a per-pixel s_x gives each pixel its own Bayes update (tools/gmflow/test_gmflow.py T13)."""
     alpha_src, alpha_tgt = 1 - sigma_src, 1 - sigma_tgt
     ats, ast = alpha_tgt * sigma_src, alpha_src * sigma_tgt
     denom = (ats.square() - ast.square()).clamp(min=eps)
@@ -86,3 +89,61 @@ def gm_convert(gm, sigma_src, sigma_tgt, x_src, x_tgt, eps=1e-6):
 def gm_convert_mean(gm, sigma_src, sigma_tgt, x_src, x_tgt):
     means, logweights, _ = gm_convert(gm, sigma_src, sigma_tgt, x_src, x_tgt)
     return (logweights.exp() * means).sum(1)
+
+
+GM2_CA = 0.005   # c_a of GM-SDE 2 / GM-ODE 2 (GMFlow forward_test gm2_coefs[0]; paper App. A.2)
+
+
+def gm_iso_var(gm, sigma):
+    """The isotropic surrogate's variance of the x-mixture (GMFlow gm_to_iso_gaussian, then .mean over H, W as gm_2nd_order's no-guidance branch does): per pixel,
+    sum_k A_k |mu_k - mean|^2 / C + s_x^2, then the average over the pixels, (B, 1, 1, 1). A per-pixel s_x enters through that average: the surrogate is isotropic over
+    the whole image, s^2 I in D = C H W dimensions, as the paper's eq:gm2. sigma (B, 1, 1, 1)."""
+    w = gm["logweights"].exp()
+    mean = (w * gm["means"]).sum(1, keepdim=True)                                        # (B, 1, C, H, W)
+    var = (w * (gm["means"] - mean).square()).sum(1).mean(1, keepdim=True)               # (B, 1, H, W): over K, then over C
+    var = var + (2 * logstd_x(gm, sigma.unsqueeze(1))).exp().squeeze(1)                 # + s_x^2, (B, 1, 1, 1) or (B, 1, H, W)
+    return mean.squeeze(1), var.mean((-1, -2), keepdim=True)
+
+
+def gm_second_order(gm, mean_prev, sigma, h, prev_h, ca=GM2_CA, parts=False):
+    """GM-SDE 2 / GM-ODE 2 without guidance (paper App. A.2, eq:gm2; GMFlow gmflow.py:251-291, the branch cfg_bias is None). gm: this call's mixture at sigma (B,);
+    mean_prev: the previous call's raw mixture converted to this x_t (Eq. 10, gm_convert_mean); h, prev_h: this and the previous call's step in sigma (floats; the
+    code's h / prev_h and prev_h / num_timesteps). As the code:
+      mean, var = the isotropic surrogate of gm (gm_iso_var: averaged over the pixels); avg_var = var;
+      k = 0.5 h / prev_h; err_power = avg_var c_a; mean_diff = (mean - mean_prev) sqrt(max(0, 1 - err_power / prev_h^2)) k;
+      bias = mean_diff with its power (mean square over C, H, W) capped at avg_var; v' = var max(1e-6, 1 - bias_power / avg_var), bias_power before the cap;
+      gm <- gm N(x; mean + bias, v') / N(x; mean, var).
+    The code forms the Gaussian ratio (precision beta / v', beta = 1 - v' / var) as N(r_mean, r_var) with r_var = var v' / (var - v') and multiplies each component by it,
+    with clamp(min=1e-6) on var - v' and on r_var + s_x^2. Here the same product is written with no division by var - v':
+      mu_k' = (mu_k v' + s_x^2 (bias + beta mean)) / (v' + s_x^2 beta),   s_x'^2 = s_x^2 v' / (v' + s_x^2 beta),
+      log A_k' = log A_k - (beta |mu_k - mean|^2 - 2 bias . (mu_k - mean)) / (2 (v' + s_x^2 beta)) + const over k.
+    It equals the code wherever its two clamps are inactive (test T14); where var - v' < 1e-6 (bias_power < 1e-6 avg_var) the code's clamp pulls every mean towards 0
+    with variance var^2 / 1e-6, and this form keeps the exact ratio (a no-op at bias = 0). An image with var <= 1e-12 (every pixel nearly certain) is returned unchanged:
+    its bias is capped under 1e-6 RMS. (The code there divides by its clamps: with s_x = 0 and var ~ 0 its means collapse to 0.) A per-pixel s_x enters through var (an image average) and, pixel by pixel, through s_x^2 in the product.
+    Returns the new mixture (logstd in velocity units, the shape of gm's) and, with parts, the quantities."""
+    sig_b = sigma.view(-1, 1, 1, 1)
+    mean, var = gm_iso_var(gm, sig_b)                                                    # (B, C, H, W), (B, 1, 1, 1)
+    avg_var = var.mean((-3, -2, -1), keepdim=True)                                       # the code keeps both; equal here
+    k = 0.5 * h / prev_h
+    err_power = avg_var * ca
+    scale = (1 - err_power / (prev_h * prev_h)).clamp(min=0).sqrt() * k
+    mean_diff = (mean - mean_prev) * scale
+    bias_power = mean_diff.square().mean((-3, -2, -1), keepdim=True)
+    bias = mean_diff * (avg_var / bias_power.clamp(min=1e-6)).clamp(max=1).sqrt()
+    rho = (1 - bias_power / avg_var.clamp(min=1e-6)).clamp(min=1e-6)
+    new_var, beta = var * rho, 1 - rho
+    lsx = logstd_x(gm, sig_b.unsqueeze(1))
+    g = (2 * lsx).exp()                                                                   # s_x^2, (B, 1, 1, 1, 1) or (B, 1, 1, H, W)
+    v5, b5, beta5, m5 = new_var.unsqueeze(1), bias.unsqueeze(1), beta.unsqueeze(1), mean.unsqueeze(1)
+    denom = v5 + g * beta5
+    d = gm["means"] - m5
+    means = (gm["means"] * v5 + g * (b5 + beta5 * m5)) / denom
+    logweights = (gm["logweights"] - (beta5 * d.square() - 2 * b5 * d).sum(2, keepdim=True) / (2 * denom)).log_softmax(1)
+    lsx_new = lsx + 0.5 * (torch.log(v5) - torch.log(denom))
+    ok = (var > 1e-12).unsqueeze(1)   # (B, 1, 1, 1, 1); below it the bias is capped under 1e-6 RMS and v' could underflow
+    out = dict(means=torch.where(ok, means, gm["means"]), logweights=torch.where(ok, logweights, gm["logweights"]),
+               logstd=torch.where(ok, lsx_new, lsx) - torch.log(sig_b.unsqueeze(1).clamp(min=EPS)))
+    if parts:
+        return out, dict(k=k, err_power=err_power, scale=scale, mean=mean, mean_diff=mean_diff, bias_power=bias_power, bias=bias, avg_var=avg_var, var=var,
+                         new_var=new_var)
+    return out
