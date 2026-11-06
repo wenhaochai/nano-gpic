@@ -21,6 +21,9 @@ _PACK = os.environ.get("GPIC_MFU_PACK") == "1"     # MFU lever E: packed caption
 # MFU lever C: the region crop's two resize passes run on the GPU, bit for bit Pillow's (pil_exact.py, pil_exact_gpu.py);
 # the workers decode, draw the crop and compute the coefficient tables. Needs the region crop (GPIC_REGION_CROP=1).
 _GPU_RESIZE = os.environ.get("GPIC_MFU_GPU_RESIZE") == "1"
+# tests only (MFU parity runs): the grouping RNG and the sample shuffle seeded from the shard seed (production seeds them from
+# the PID and the clock), so two runs read the same batches and their per-step losses can be compared
+_DET = os.environ.get("GPIC_MFU_DET_DATA") == "1"
 assert not _GPU_RESIZE or os.environ.get("GPIC_REGION_CROP") == "1", "GPIC_MFU_GPU_RESIZE needs GPIC_REGION_CROP=1"
 train_transform = T.Compose([
     T.Lambda(lambda pil_image: _train_crop(pil_image, 256)),
@@ -344,7 +347,8 @@ class GPICWebDataset(IterableDataset):
         at once every 1024 steps."""
         import random
         wi = torch.utils.data.get_worker_info()
-        rng = random.Random(hash((os.environ.get("GPIC_SHARD_SEED", "0"), wi.id if wi else 0, os.getpid())))
+        rng = random.Random(hash((os.environ.get("GPIC_SHARD_SEED", "0"), wi.id if wi else 0, os.getpid()))) if not _DET else \
+            random.Random(int(os.environ.get("GPIC_SHARD_SEED", "0")) * 1009 + (wi.id if wi else 0))
         buf = []
 
         def flush(items):
@@ -491,7 +495,7 @@ class GPICWebDataset(IterableDataset):
                 wds.map(self._add_caption, handler=wds.warn_and_continue),
                 wds.select(self._has_image),
                 wds.map(self._attach_emb) if self.emb_dir else wds.map(self._tokenize, handler=wds.warn_and_continue),
-                wds.shuffle(self.shuffle_buffer),
+                wds.shuffle(self.shuffle_buffer, **({"seed": int(os.environ.get("GPIC_SHARD_SEED", "0"))} if _DET else {})),
                 self._group,                                               # nothing after this drops a sample
                 wds.map(self._finish),                                     # the image work
             )
@@ -506,7 +510,7 @@ class GPICWebDataset(IterableDataset):
             wds.map(self._add_caption, handler=wds.warn_and_continue),
             wds.map(self._apply_transform, handler=wds.warn_and_continue),
             wds.select(_has_required_keys),
-            wds.shuffle(self.shuffle_buffer),
+            wds.shuffle(self.shuffle_buffer, **({"seed": int(os.environ.get("GPIC_SHARD_SEED", "0"))} if _DET else {})),
 
             wds.map(
                 lambda s: (

@@ -1,0 +1,40 @@
+#!/bin/bash
+#SBATCH -J gpic-mfu-v2
+#SBATCH --gres=gpu:8
+#SBATCH -c 96
+#SBATCH --time=00:55:00
+#SBATCH --mem=800G
+#SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
+#SBATCH --comment=fetchable
+#FETCHABLE
+# MFU freeze checks (b) and (c) for the full ladder (genmodel, 2026-11-06), with every lever on (jobs/train_ladder.sh
+# defaults): 1. the ladder's own smoke, jobs/smoke_full.sh (d1536 and d1792, 320 steps each with last.ckpt every 100 steps;
+# then d640 stop at 1000 / resume to 4800 with the shard log, checked by tools/check_shard_resume.py); 2. the full data set
+# (gpic_train_{00000..07999}.tar and its text cache) at d640 for 320 steps; 3. tools/mfu/check_ckpt.py-style checks of the
+# smoke's checkpoints: the ms checkpoint's keys and shapes against an ms checkpoint of 5cd3372 at d640 (w1322's smoke).
+# usage: v2_smoke.sh <code worktree at a clean commit>
+set -o pipefail
+source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
+WT=${1:?code worktree}
+OUT=$WC/runs/gpic-speed/mfu/v2_$(date +%m%d_%H%M)
+mkdir -p $OUT
+git -C $WT rev-parse HEAD > $OUT/commit.txt
+IFS=, read -ra G <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export PIXGEN_SRC=$WT/baselines/PixelGen
+( cd $WT && CUDA_VISIBLE_DEVICES=${G[0]} timeout 300 python tools/mfu/fa3_check.py > $OUT/fa3_check.log 2>&1 ) || { tail -20 $OUT/fa3_check.log; echo "FA3 check failed"; exit 3; }
+bash $WT/jobs/smoke_full.sh $WT all > $OUT/smoke_full.log 2>&1
+echo "[$(date +%T)] smoke_full rc=$?" | tee -a $OUT/summary.txt
+grep -h "DONE\|ok\|FAIL\|fail" $OUT/smoke_full.log | tail -15 | tee -a $OUT/summary.txt
+# 3. checkpoint layout against the frozen code's smoke (5cd3372, full_smoke_1106_1433): ms (evaluation) and last (resume)
+SMK=$(ls -dt $WC/runs/gpic-speed/full_smoke_* | head -1)
+REF=$WC/runs/gpic-speed/full_smoke_1106_1433/resume/exp_ladder_d640
+( cd $WT/baselines/PixelGen && PYTHONPATH=$PWD python $WT/tools/mfu/compare_ckpt_layout.py $REF/ms-step=001600.ckpt $SMK/resume/exp_ladder_d640/ms-step=001600.ckpt \
+  $REF/ms-step=004800.ckpt $SMK/resume/exp_ladder_d640/ms-step=004800.ckpt $REF/last.ckpt $SMK/resume/exp_ladder_d640/last.ckpt ) 2>&1 | tee -a $OUT/summary.txt
+# 2. the full data set
+LADDER_WT=$WT LADDER_RUN_ROOT=$OUT/full LADDER_PARTIAL_OK=1 BENCH_OUT=$OUT/full/bench GPIC_SHARD_SEED=20261106 \
+  bash $WT/jobs/train_ladder.sh d640 640 9 2 6400 --data.train_dataset.init_args.tar_pattern 'gpic_train_{00000..07999}.tar' \
+  --trainer.max_steps 320 --trainer.logger.init_args.name mfu_v2_full --trainer.logger.init_args.id mfu-v2-full-$(date +%s) > $OUT/full.log 2>&1
+echo "[$(date +%T)] full data rc=$?" | tee -a $OUT/summary.txt
+python $WT/tools/mfu/bench_summary.py $OUT/full/bench --skip 50 | tee -a $OUT/summary.txt
+rm -f $OUT/full/exp_ladder_d640/*.ckpt
+echo "DONE $OUT"

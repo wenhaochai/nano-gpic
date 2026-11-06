@@ -63,7 +63,8 @@ class BenchTimer(Callback):
         self.mark = None
         self.stages_on = bool(os.environ.get("BENCH_STAGES"))
         self.ticks, self.all_ticks = [], []
-        self.queue_on = os.environ.get("GPIC_PROF_QUEUE") == "1"   # the loader's buffers in each row (jobs/smoke_ladder_pin2.sh)
+        self.queue_on = os.environ.get("GPIC_PROF_QUEUE") == "1"
+        self.losses = []   # the loader's buffers in each row (jobs/smoke_ladder_pin2.sh)
 
     # ------------------------------------------------------------------ stage markers
     def _stage(self, name):
@@ -155,6 +156,9 @@ class BenchTimer(Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self._stage(None)
         self.ev[1].record()
+        loss = outputs.get("loss") if isinstance(outputs, dict) else outputs
+        if torch.is_tensor(loss):   # this rank's loss, read at the end (no sync per step): MFU parity runs
+            self.losses.append(loss.detach())
         self._tick("end")
         if self.prof is not None:
             self._rf.__exit__(None, None, None)
@@ -211,8 +215,11 @@ class BenchTimer(Callback):
     def on_train_end(self, trainer, pl_module):
         self._stage(None)
         torch.cuda.synchronize()
+        losses = [float(x) for x in self.losses] if len(self.losses) == len(self.rows) else None
         for i, (row, (a, b)) in enumerate(zip(self.rows, self.events)):
             row["gpu_ms"] = a.elapsed_time(b)                            # first to last kernel of this batch
+            if losses is not None:
+                row["loss"] = losses[i]
             if i + 1 < len(self.events):
                 row["step_ms"] = a.elapsed_time(self.events[i + 1][0])   # start-to-start: the steady step time
         os.makedirs(self.out, exist_ok=True)
