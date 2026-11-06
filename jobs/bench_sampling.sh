@@ -9,7 +9,8 @@
 #FETCHABLE
 # Sampling throughput on 8 H100s (docs/gmflow_hn.md, N2; tools/gmflow/bench_sampling.py): images / s of the samplers alone (no FD) at C0/8 of d640: the point model w1147
 # (official Euler at 50, 16, 8, 4 calls) and the K = 8 model w1173 (GM-ODE at 8 and 4 calls, PyTorch sub-steps and the fused Triton kernel). bf16, compiled, after a
-# warm-up pass, at least 60 s per setting on 1024 prompts per GPU. Checks fused = not fused (per call in fp32; end to end to bf16 tolerance); exit 1 if a check fails.
+# warm-up pass, at least 60 s per setting on 1024 prompts per GPU. Checks fused = not fused in fp32 (per call at the first and the last call; end to end at 8 and 4
+# calls on 32 prompts per GPU; max |diff| < 1e-4); exit 1 if a check fails, after the JSON is written. The bf16 end-to-end difference is a report only.
 # Expected: about 20 min. Output: runs/gpic-speed/gmflow_k8_d640/exp_ladder_d640/bench_sampling_<date>.json (next to the K = 8 run) and the log beside it.
 # Code: the frozen worktree gpic-wt/gmflow_run3 (the merge of gmflow-hn into gmflow, 2026-11-06).
 set -o pipefail

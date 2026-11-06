@@ -7,8 +7,10 @@ sampler, masked captions (lite_ladder_sample.yaml), batch 32 per GPU, no CFG.
 Prompts: the first P x world prompts of gpic_test_50k.jsonl, P per rank, each with its own fixed noise; the captions are encoded once before any timing (the text
 encoder is the same for every sampler and is not timed). Per setting: one warm-up pass over the rank's prompts (compiles every caption length), then timed passes until
 the slowest rank has spent at least --min-seconds; images / s = passes x P x world / the slowest rank's time.
-Checks: (1) per call, the fused kernel against the PyTorch sub-steps on a real K = 8 output, fp32; (2) end to end, GM-ODE fused against not fused on the same prompts
-and noise (the bf16 network amplifies fp32 rounding along the path, so the tolerance is loose and the numbers are reported).
+Checks (review_gmflow_hn F4), all on an uncompiled fp32 copy of the K = 8 net with autocast and TF32 off, on each rank's first 32 prompts:
+(1) per call, the fused kernel against the PyTorch sub-steps (gm_ode_substeps_ref) on a real K = 8 output, at the first call (sigma 1 -> 1 - 1/calls) and at the last
+call (t = 1 - 1/calls, sigma 1/calls -> 0, where the clamps act), max |diff| < 1e-4; (2) end to end, GM-ODE fused against not fused at 8 and 4 calls, max |diff| < 1e-4.
+The bf16 end-to-end difference of the timed runs (the bf16 network amplifies fp32 rounding along the path) is in the JSON as a report only; it fails nothing.
 Also: the sub-steps of one call alone (fused and not), in ms, on a real output.
 usage (torchrun, one process per GPU): bench_sampling.py --point <ckpt> --gm <ckpt> --out <json> [--prompts 1024] [--min-seconds 60]
 """
@@ -115,7 +117,7 @@ def main():
             results["settings"].append(row)
             if rank == 0:
                 print(json.dumps(row), flush=True)
-        if name == "gm8":   # the sub-steps alone and the per-call check, on a real output at the first call
+        if name == "gm8":   # the sub-steps alone (timing) and the first-call check, on a real output at the first call
             from src.diffusion.flow_matching.gm_ode_triton import gm_ode_substeps_fused, gm_ode_substeps_ref
             from src.diffusion.flow_matching.gmflow import logstd_x
             noise, y, mask = batches[0]
@@ -137,11 +139,40 @@ def main():
                     for _ in range(20):
                         fn(gm["means"], gm["logweights"], s_x, noise, sig)
                     torch.cuda.synchronize(); ms[label] = (time.perf_counter() - t0) / 20 * 1000
-                chk = dict(calls=calls, substeps=n, max_abs_diff=d.max().item(), mean_abs_diff=d.mean().item(), ms_per_call_pytorch=ms["pytorch"],
-                           ms_per_call_fused=ms["fused"], batch=noise.shape[0])
+                chk = dict(call="first, bf16 net output", calls=calls, substeps=n, max_abs_diff=d.max().item(), mean_abs_diff=d.mean().item(),
+                           ms_per_call_pytorch=ms["pytorch"], ms_per_call_fused=ms["fused"], batch=noise.shape[0])
                 results.setdefault("per_call", []).append(chk)
                 if rank == 0:
                     print(json.dumps(chk), flush=True)
+        if name == "gm8":   # F4: fp32 checks on an uncompiled copy, autocast and TF32 off
+            from src.diffusion.flow_matching.gm_ode_triton import gm_ode_substeps_fused, gm_ode_substeps_ref
+            from src.diffusion.flow_matching.gmflow import logstd_x
+            tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+            torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+            net32 = build_net(*nets[name])
+            noise, y, mask = batches[0]
+            y32 = y.float()
+            g32 = lambda x, t, c, _m=mask, **kw: net32(x, t, c, y_mask=_m, **kw)
+            results["fp32_end_to_end"], B = [], noise.shape[0]
+            with torch.no_grad(), torch.autocast("cuda", enabled=False):
+                for calls in (8, 4):
+                    su, sf = make_sampler("gm_ode", calls, False), make_sampler("gm_ode", calls, True)
+                    xs = su._impl_sampling(g32, noise, y32, None)[0]
+                    xf = sf._impl_sampling(g32, noise, y32, None)[0][-1]
+                    d = (xs[-1] - xf).abs()
+                    results["fp32_end_to_end"].append(dict(calls=calls, substeps=su.substeps, prompts=B, max_abs_diff=d.max().item(), mean_abs_diff=d.mean().item()))
+                    t_last = su.timesteps[-2].item()   # = 1 - 1 / calls
+                    gm = {k: v.float() for k, v in net32(xs[-2], torch.full((B,), t_last, device=dev), y32, y_mask=mask, gm_mode="full").items()}
+                    s0 = torch.tensor(1 - t_last, device=dev)
+                    sig = su._substep_sigmas(s0.view(1, 1, 1, 1), torch.zeros(1, 1, 1, 1, device=dev))
+                    s_x = logstd_x(gm, s0.expand(B).view(B, 1, 1, 1, 1)).exp()
+                    d = (gm_ode_substeps_ref(gm["means"], gm["logweights"], s_x, xs[-2], sig) - gm_ode_substeps_fused(gm["means"], gm["logweights"], s_x, xs[-2], sig)).abs()
+                    results["per_call"].append(dict(call=f"last (t = {t_last:.4f}), fp32 net", calls=calls, substeps=su.substeps, max_abs_diff=d.max().item(),
+                                                    mean_abs_diff=d.mean().item(), batch=B))
+                    if rank == 0:
+                        print(json.dumps(results["fp32_end_to_end"][-1]), json.dumps(results["per_call"][-1]), flush=True)
+            torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
+            del net32
         del net
         torch.cuda.empty_cache()
 
@@ -153,10 +184,14 @@ def main():
         e2e.append(dict(calls=calls, max_abs_diff=d.max().item(), mean_abs_diff=d.mean().item(), uint8_share_diff_gt1=((u8(a_) - u8(b_)).abs() > 1).float().mean().item()))
     gathered = [None] * world
     dist.all_gather_object(gathered, e2e)
-    results["end_to_end"] = gathered
+    results["end_to_end_bf16_report_only"] = gathered
+    mine = dict(per_call=results["per_call"], fp32_end_to_end=results["fp32_end_to_end"])
+    allr = [None] * world
+    dist.all_gather_object(allr, mine)
+    results["per_call"], results["fp32_end_to_end"] = [c for r in allr for c in r["per_call"]], [c for r in allr for c in r["fp32_end_to_end"]]
     pc_ok = all(c["max_abs_diff"] < 1e-4 for c in results["per_call"])
-    e2e_ok = all(r["mean_abs_diff"] < 5e-3 and r["uint8_share_diff_gt1"] < 0.02 for g in gathered for r in g)
-    results["checks"] = dict(per_call_fp32_max_lt_1e-4=pc_ok, end_to_end_mean_lt_5e-3_and_uint8_share_lt_2pct=e2e_ok)
+    e2e_ok = all(c["max_abs_diff"] < 1e-4 for c in results["fp32_end_to_end"])
+    results["checks"] = {"per_call_first_and_last_max_lt_1e-4": pc_ok, "fp32_end_to_end_max_lt_1e-4": e2e_ok}   # string keys: "1e-4" is not a Python name
     if rank == 0:
         os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
         json.dump(results, open(a.out, "w"), indent=1)
