@@ -104,6 +104,8 @@ class GMODESampler(_GMSampler):
         self.fused = fused
         self._grid_w = {}   # (substeps, device) -> the fp32 weights j / n of the fused path's sigma grid
         assert not (self.spread is not None and self.order == 2), "a spread table with order 2 is an untested sampler (review_gmflow_hn F7)"
+        if self.spread is not None:
+            self.spread.check_bound(self.timesteps[:-1])   # the call times t_i this sampler reads s_x at (owner 2026-11-06; gm_spread.py)
 
     def _impl_sampling(self, net, noise, condition, uncondition):
         steps = self._start(noise)
