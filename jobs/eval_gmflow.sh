@@ -15,6 +15,8 @@
 # Output: <run>/eval_<step>_<sampler>_calls<calls>/metrics.json. It never overwrites a finished result; a directory without metrics.json is moved aside.
 # Env: LADDER_RUN_ROOT (run root); EVAL_SIZE, EVAL_D, EVAL_NB, EVAL_NT (run directory exp_ladder_<size>, width and blocks; default d640, 640, 9, 2; jobs/evals_gmflow.sh sets them);
 # EVAL_LIMIT_BATCHES (smoke test only: predict only that many batches per rank, keep the samples, skip the FD).
+# docs/gmflow_hn.md: gm_ode_cal (K = 0 only): GM-ODE on the point model with the spread table EVAL_SPREAD_TABLE (required; tools/gmflow/calibrate_spread.py), output
+# eval_<step>_gm_ode_cal_calls<calls>; EVAL_SUBSTEPS (gm_ode and gm_ode_cal only) overrides the sub-steps per call, and the output directory then gets _n<substeps>.
 set -eo pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 K=$1 STEP=$(printf %06d $2) SAMPLER=$3 CALLS=$4
@@ -27,11 +29,23 @@ case $K in
 esac
 SIZE=${EVAL_SIZE:-d640} WD=${EVAL_D:-640} NB=${EVAL_NB:-9} NT=${EVAL_NT:-2}
 SUBSTEPS=$(( (128 + CALLS - 1) / CALLS )); [ $SUBSTEPS -ge 2 ] || SUBSTEPS=2
+NSUF=""
+if [ -n "${EVAL_SUBSTEPS:-}" ]; then
+  case $SAMPLER in gm_ode|gm_ode_cal) ;; *) echo "EVAL_SUBSTEPS is for gm_ode and gm_ode_cal"; exit 2 ;; esac
+  [[ $EVAL_SUBSTEPS =~ ^[1-9][0-9]*$ ]] || { echo "EVAL_SUBSTEPS must be a positive integer"; exit 2; }
+  SUBSTEPS=$EVAL_SUBSTEPS NSUF=_n$EVAL_SUBSTEPS
+fi
 case $SAMPLER in
   gm_sde) SARGS=(--config configs_h100/gmflow_sde_sample.yaml) ;;
   gm_sde_final_mean) SARGS=(--config configs_h100/gmflow_sde_sample.yaml --model.diffusion_sampler.init_args.final_mean true) ;;
   gm_ode) SARGS=(--config configs_h100/gmflow_ode_sample.yaml --model.diffusion_sampler.init_args.substeps $SUBSTEPS) ;;
   euler_mean|euler) SARGS=(--config configs_h100/gmflow_euler_sample.yaml) ;;
+  gm_ode_cal)
+    [ $K -eq 0 ] || { echo "gm_ode_cal is for a point model (K = 0); use gm_ode"; exit 2; }
+    [ -f "${EVAL_SPREAD_TABLE:-}" ] || { echo "gm_ode_cal needs EVAL_SPREAD_TABLE=<table.json>"; exit 2; }
+    [ -f "$WT/baselines/PixelGen/src/diffusion/flow_matching/gm_spread.py" ] || { echo "$WT has no spread-table code"; exit 2; }
+    SARGS=(--config configs_h100/gmflow_ode_sample.yaml --model.diffusion_sampler.init_args.substeps $SUBSTEPS
+           --model.diffusion_sampler.init_args.spread_table "$EVAL_SPREAD_TABLE") ;;
   *) echo "unknown sampler $SAMPLER"; exit 2 ;;
 esac
 if [ $K -eq 0 ] && { [ $SAMPLER = gm_ode ] || [ $SAMPLER = gm_sde_final_mean ]; }; then echo "$SAMPLER needs a mixture (K > 0)"; exit 2; fi
@@ -39,7 +53,7 @@ if [ $K -gt 0 ] && [ $SAMPLER = euler ]; then echo "use euler_mean for K > 0"; e
 [ -f "$WT/baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py" ] || { echo "$WT holds old code"; exit 2; }
 RUN=${LADDER_RUN_ROOT:-$DEF_ROOT}/exp_ladder_$SIZE
 CKPT=$(ls -t $RUN/ms-*$STEP*.ckpt 2>/dev/null | head -1); [ -n "$CKPT" ] || { echo "no ms checkpoint for step $STEP in $RUN"; exit 2; }
-OUT=$RUN/eval_${STEP}_${SAMPLER}_calls${CALLS}
+OUT=$RUN/eval_${STEP}_${SAMPLER}_calls${CALLS}${NSUF}
 [ ! -f $OUT/metrics.json ] || { echo "$OUT/metrics.json exists; not overwriting"; exit 3; }
 [ ! -d $OUT ] || mv $OUT $OUT.unfinished_$(date +%m%d_%H%M%S)
 cd $WT/baselines/PixelGen
@@ -58,6 +72,7 @@ assert any(n.startswith("ema_denoiser.gm_logstd") for n in sd) == (k > 0), "s-ML
 PY
 mkdir -p $OUT
 echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K sampler=$SAMPLER calls=$CALLS substeps=$SUBSTEPS" | tee $OUT/ckpt.txt
+[ $SAMPLER != gm_ode_cal ] || { echo "spread_table=$EVAL_SPREAD_TABLE" | tee -a $OUT/ckpt.txt; cp "$EVAL_SPREAD_TABLE" $OUT/spread_table.json; }
 LIMIT=(); [ -z "${EVAL_LIMIT_BATCHES:-}" ] || LIMIT=(--trainer.limit_predict_batches $EVAL_LIMIT_BATCHES)
 t0=$(date +%s)
 WANDB_MODE=disabled python main.py predict --config configs_h100/lite_ladder_sample.yaml "${SARGS[@]}" --trainer.devices 8 \

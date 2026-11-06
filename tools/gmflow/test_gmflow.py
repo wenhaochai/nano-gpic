@@ -636,6 +636,74 @@ def T26():
     print("  sampler fused = not fused (K = 8 mixture; point model with a table)")
 
 
+
+@test
+def T27():
+    """G2/H3: eval_gmflow.sh names and arguments (gm_ode_cal, EVAL_SUBSTEPS) and evals_gmflow.sh task parsing (3 and 4 fields, --table), on stubbed copies (no env.sh, no GPU)."""
+    import re as _re
+    import tempfile
+    tmp = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+    # eval_gmflow.sh up to the output name, then print what it chose
+    src = open(os.path.join(REPO, "jobs/eval_gmflow.sh")).read()
+    src = src.replace("source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh", f"WC={tmp}")
+    head, sep, _ = src.partition("[ ! -f $OUT/metrics.json ]")
+    assert sep, "eval_gmflow.sh changed shape"
+    stub = os.path.join(tmp, "eval.sh")
+    open(stub, "w").write(head + 'echo "OUT=$(basename $OUT) SUBSTEPS=$SUBSTEPS SARGS=${SARGS[*]}"\n')
+    run_dir = os.path.join(tmp, "runs/gpic-speed/point_nodrop_d640/exp_ladder_d640")
+    os.makedirs(run_dir)
+    open(os.path.join(run_dir, "ms-step=066816.ckpt"), "w").close()
+    table = os.path.join(tmp, "table.json"); open(table, "w").write("{}")
+    env0 = {k: v for k, v in os.environ.items() if not k.startswith("EVAL_")}
+    env0["GMFLOW_WT"] = REPO
+    def ev(args, **extra):
+        r = subprocess.run(["bash", stub, *map(str, args)], env=dict(env0, **extra), capture_output=True, text=True)
+        return r.returncode, r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr
+    rc, out = ev([0, 66816, "euler", 8])
+    assert rc == 0 and out.startswith("OUT=eval_066816_euler_calls8 SUBSTEPS=16 "), out
+    rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table)
+    assert rc == 0 and "OUT=eval_066816_gm_ode_cal_calls8 SUBSTEPS=16 " in out and f"spread_table {table}" in out and "substeps 16" in out, out
+    rc, out = ev([0, 66816, "gm_ode_cal", 8], EVAL_SPREAD_TABLE=table, EVAL_SUBSTEPS="4")
+    assert rc == 0 and "OUT=eval_066816_gm_ode_cal_calls8_n4 SUBSTEPS=4 " in out and "substeps 4" in out, out
+    rc, out = ev([0, 66816, "gm_ode_cal", 8])
+    assert rc == 2 and "EVAL_SPREAD_TABLE" in out, out
+    rc, out = ev([0, 66816, "euler", 8], EVAL_SUBSTEPS="4")
+    assert rc == 2 and "EVAL_SUBSTEPS is for" in out, out
+    k8 = os.path.join(tmp, "runs/gpic-speed/gmflow_k8_d640/exp_ladder_d640"); os.makedirs(k8)
+    open(os.path.join(k8, "ms-step=062336.ckpt"), "w").close()
+    rc, out = ev([8, 62336, "gm_ode", 4])
+    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls4 SUBSTEPS=32 "), out
+    rc, out = ev([8, 62336, "gm_ode", 4], EVAL_SUBSTEPS="8")
+    assert rc == 0 and out.startswith("OUT=eval_062336_gm_ode_calls4_n8 SUBSTEPS=8 "), out
+    rc, out = ev([8, 62336, "gm_ode_cal", 4], EVAL_SPREAD_TABLE=table)
+    assert rc == 2 and "point model" in out, out
+    print("  eval_gmflow.sh: default names unchanged; gm_ode_cal needs the table and K = 0; EVAL_SUBSTEPS adds _n<n> and only for GM-ODE")
+    # evals_gmflow.sh with a stub worktree whose eval_gmflow.sh prints its arguments
+    wt = os.path.join(tmp, "wt")
+    os.makedirs(os.path.join(wt, "baselines/PixelGen/src/diffusion/flow_matching")); os.makedirs(os.path.join(wt, "jobs"))
+    open(os.path.join(wt, "baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py"), "w").close()
+    open(os.path.join(wt, "jobs/eval_gmflow.sh"), "w").write('echo "ARGS=$* N=${EVAL_SUBSTEPS:-} T=${EVAL_SPREAD_TABLE:-}"\n')
+    subprocess.run("git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x", shell=True, cwd=wt, check=True)
+    src = open(os.path.join(REPO, "jobs/evals_gmflow.sh")).read().replace("source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh", f"WC={tmp}")
+    stub2 = os.path.join(tmp, "evals.sh"); open(stub2, "w").write(src)
+    root = os.path.join(tmp, "root")
+    def evs(args):
+        r = subprocess.run(["bash", stub2, *map(str, args)], env=dict(env0, EVALS_WT=wt), capture_output=True, text=True)
+        logs = {os.path.basename(f): open(f).read().strip() for f in sorted(__import__("glob").glob(os.path.join(root, "eval_*.log")))}
+        return r.returncode, r.stdout, logs
+    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "66816:euler:8", "66816:gm_ode_cal:8:4"])
+    assert rc == 0, out
+    assert logs["eval_66816_euler_8.log"] == "ARGS=0 66816 euler 8 N= T=", logs
+    assert logs["eval_66816_gm_ode_cal_8_n4.log"] == "ARGS=0 66816 gm_ode_cal 8 N=4 T=", logs
+    import shutil; shutil.rmtree(root)
+    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "--table", table, "66816:gm_ode_cal:8"])
+    assert rc == 0 and logs["eval_66816_gm_ode_cal_8.log"] == f"ARGS=0 66816 gm_ode_cal 8 N= T={table}", logs
+    os.makedirs(os.path.join(root, "exp_ladder_d640/eval_066816_gm_ode_cal_calls8_n4")); open(os.path.join(root, "exp_ladder_d640/eval_066816_gm_ode_cal_calls8_n4/metrics.json"), "w").close()
+    rc, out, logs = evs([0, "d640", 640, 9, 2, root, "66816:gm_ode_cal:8:4"])
+    assert rc == 0 and "done before" in out, out
+    print("  evals_gmflow.sh: 3-field tasks unchanged; a 4th field sets EVAL_SUBSTEPS and the _n<n> name; --table sets EVAL_SPREAD_TABLE; finished _n tasks skipped")
+
+
 if __name__ == "__main__":
     names = sys.argv[1:] or list(RESULTS)
     failed = []
