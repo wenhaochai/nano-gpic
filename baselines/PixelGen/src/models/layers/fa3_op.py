@@ -31,8 +31,16 @@ def _lib():
     return _FA3
 
 
+_CU = {}
+
+
 def _cu(B, S, device):
-    return torch.arange(0, (B + 1) * S, S, dtype=torch.int32, device=device)
+    """Uniform offsets 0, S, 2S, ..., BS (int32), cached: the ops run on every block of every step."""
+    key = (B, S, device)
+    t = _CU.get(key)
+    if t is None:
+        t = _CU[key] = torch.arange(0, (B + 1) * S, S, dtype=torch.int32, device=device)
+    return t
 
 
 @torch.library.custom_op("gpic::fa3_fwd", mutates_args=(), device_types="cuda")
