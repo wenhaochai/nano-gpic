@@ -23,7 +23,7 @@ MUTANTS = {
     "k_without_half": (F + "gmflow.py", "    k = 0.5 * h / prev_h\n", "    k = h / prev_h\n"),
     "no_first_order_fallback": (F + "sampling_gmflow.py", "        if prev is None:\n            return gm, state\n", "        if prev is None:\n            prev = state\n"),
     # docs/gmflow_hn.md
-    "table_wrong_direction": (F + "gm_spread.py", "(s0 + (s1 - s0) * (q - t0) / (t1 - t0))", "(s0 + (s1 - s0) * (t1 - q) / (t1 - t0))"),
+    "table_wrong_direction": (F + "gm_spread.py", "s0 + (s1 - s0) * (q - t0) / (t1 - t0)", "s0 + (s1 - s0) * (t1 - q) / (t1 - t0)"),
     "s_x_squared_twice_kernel": (F + "gm_ode_triton.py", "        v = sx * sx\n", "        v = (sx * sx) * (sx * sx)\n"),
     "s_x_squared_twice_spread": (F + "gm_spread.py", "logstd = torch.log(s_x) - ", "logstd = torch.log(s_x * s_x) - "),
     "kernel_substep_time_off_by_one": (F + "gm_ode_triton.py", "s = tl.load(sig_ptr + j).to(tl.float32)", "s = tl.load(sig_ptr + j - 1).to(tl.float32)"),
