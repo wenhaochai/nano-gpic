@@ -40,11 +40,16 @@ IMAGE_SUFFIXES = ("jpg", "jpeg", "png", "webp")   # webdataset lowers the suffix
 _DECODE_PIL = wds.imagehandler("pil")
 
 def _rank_world():
-    """(rank, world size): torch.distributed when it is up (also in a forked data worker), else the launcher's env."""
+    """(rank, world size): torch.distributed when it is up (also in a forked data worker), else the launcher's env.
+    Lightning's launcher sets WORLD_SIZE but not RANK, so a world of several processes without torch.distributed and
+    without RANK has no rank to give: every process would take rank 0 (review of ladder-full, M1), so that raises."""
     dist = torch.distributed
     if dist.is_available() and dist.is_initialized():
         return dist.get_rank(), dist.get_world_size()
-    return int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+    world = int(os.environ.get("WORLD_SIZE", 1))
+    if world > 1 and "RANK" not in os.environ:
+        raise RuntimeError(f"WORLD_SIZE={world} but neither torch.distributed nor RANK gives this process its rank")
+    return int(os.environ.get("RANK", 0)), world
 
 
 class EpochShuffledShards(IterableDataset):
@@ -57,10 +62,10 @@ class EpochShuffledShards(IterableDataset):
     Full ladder (docs/ladder_plan.md section 12): with log_dir, every data worker appends "<unix time> <pass> <url>" to
     log_dir/shards_started_rank<r>.txt when it starts a shard (GPICWebDataset._log_started), and a resumed launch skips the
     shards its rank started in the pass the run stopped in, so a run that is stopped and resumed trains no sample twice
-    in a pass. jobs/train_ladder.sh keeps the seed of the run's first launch, so every launch draws the same
-    permutations, and keeps only the log lines up to the resumed checkpoint's time (a shard started later was read only
-    for steps that the resume throws away, so it is read again). The log is read here, in each rank's main process
-    before the workers start, so all workers of a rank split the same remaining list."""
+    in a pass. jobs/train_ladder.sh keeps one seed per run (shard_seed.txt), so every launch draws the same permutations,
+    and keeps only the log lines up to the dump time stored in the resumed checkpoint (src/callbacks/shard_clock.py; a
+    shard started later was read only for steps that the resume throws away, so it is read again). The log is read here,
+    in each rank's main process before the workers start, so all workers of a rank split the same remaining list."""
 
     def __init__(self, urls, seed, log_dir=None):
         super().__init__()
@@ -88,6 +93,9 @@ class EpochShuffledShards(IterableDataset):
                 rows = [line.split() for line in f if line.strip()]
         except FileNotFoundError:
             return 0, set()
+        if rows and len(rows[-1]) != 3:   # a worker killed inside its one write can leave a torn last line (review M8)
+            print(f"[shards] rank {self.rank}: drops a torn last line of {self.log_path}: {' '.join(rows[-1])[:120]}", flush=True)
+            rows = rows[:-1]
         if not rows:
             return 0, set()
         assert all(len(r) == 3 for r in rows), f"{self.log_path}: a line is not '<time> <pass> <url>'"

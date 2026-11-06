@@ -9,6 +9,10 @@ without data. Run on a vis node:
 4. every shard of a pass started before the stop: the resume starts in the next pass, with its started shards skipped
 5. a log from another seed stops the resume with an assertion
 6. only the training set logs: GPICWebDataset._shard_stages has the log stage for is_val False, not for is_val True
+7. a world of 8 without torch.distributed and without RANK raises (review M1)
+8. a torn last log line is dropped and the complete lines still count (review M8)
+9. src/callbacks/shard_clock.py stores the dump time, seed and step in a checkpoint and tools/ckpt_shard_clock.py reads
+   them back; a checkpoint without them gives its floored mtime (review S1)
 """
 import os
 import sys
@@ -151,6 +155,56 @@ def main():
             for k, v in old.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
         check("6. training set only", good, "the training set has the log stage, the validation set has none")
+
+    # 7. no rank to give (review M1): WORLD_SIZE 8, no torch.distributed, no RANK
+    old = {k: os.environ.get(k) for k in ("RANK", "WORLD_SIZE")}
+    os.environ.pop("RANK", None)
+    os.environ["WORLD_SIZE"] = "8"
+    try:
+        EpochShuffledShards(URLS, SEED)
+        raised = False
+    except RuntimeError:
+        raised = True
+    finally:
+        for k, v in old.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    check("7. no rank", raised, "a world of 8 without torch.distributed and without RANK raises instead of taking rank 0")
+
+    # 8. a torn last line (review M8): dropped, the complete lines still count
+    with tempfile.TemporaryDirectory() as d:
+        r = 2
+        mine0 = perm[0][r::WORLD]
+        with open(os.path.join(d, f"shards_started_rank{r}.txt"), "w") as f:
+            f.writelines(f"{100 + i}.000 0 {u}\n" for i, u in enumerate(mine0[:3]))
+            f.write("104.000 0")   # killed inside the write
+        c = as_rank(r, lambda: EpochShuffledShards(URLS, SEED, d))
+        check("8. torn last line", (c.passes, c.skip) == (0, set(mine0[:3])), "the torn line is dropped, the 3 complete lines are skipped")
+
+    # 9. the clock in a checkpoint (src/callbacks/shard_clock.py, tools/ckpt_shard_clock.py), and the mtime fallback
+    import subprocess
+    import time
+    import torch
+    from src.callbacks.shard_clock import ShardClock, KEY
+
+    class _T:
+        global_step = 600
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["GPIC_SHARD_SEED"] = str(SEED)
+        try:
+            ck = {"state_dict": {"w": torch.zeros(4)}}
+            t0 = time.time()
+            ShardClock().on_save_checkpoint(_T(), None, ck)
+            torch.save(ck, os.path.join(d, "last.ckpt"))
+            torch.save({"state_dict": {"w": torch.zeros(4)}}, os.path.join(d, "old.ckpt"))
+            os.utime(os.path.join(d, "old.ckpt"), (1700000000.9, 1700000000.9))
+        finally:
+            os.environ.pop("GPIC_SHARD_SEED", None)
+        tool = os.path.join(ROOT, "tools", "ckpt_shard_clock.py")
+        out = subprocess.run([sys.executable, tool, os.path.join(d, "last.ckpt")], capture_output=True, text=True).stdout.split()
+        old_out = subprocess.run([sys.executable, tool, os.path.join(d, "old.ckpt")], capture_output=True, text=True).stdout.split()
+        good = (len(out) == 3 and t0 <= float(out[0]) <= time.time() and out[1] == str(SEED) and out[2] == "600"
+                and old_out == ["1700000000", "-", "-"] and set(ck[KEY]) == {"time", "seed", "step"})
+        check("9. checkpoint clock", good, f"stored dump time, seed and step read back {out}; a checkpoint without it gives its floored mtime {old_out}")
 
     print("ALL OK" if ok else "SOME CHECKS FAILED", flush=True)
     sys.exit(0 if ok else 1)

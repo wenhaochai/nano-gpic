@@ -152,7 +152,10 @@
 1. 问题：旧代码每次启动都用当前时间做 shard 种子，所以每次续跑都换一个顺序。在 Lite 上每条 run 都要跑很多轮，这没有影响。在全量上，大尺寸只跑 1–2 轮。例如 d1792 到 8C0 只读 0.73 轮，如果分 8 次启动，约 27% 的读取是重复，约 20% 应该读到的图一次也没读到。
 2. 新代码：每条 run 用第一次启动的种子（`shard_seed.txt`），所以每次启动的每一轮都是同一个排列。每个数据 worker 开始读一个 shard 时，在 `shards_started_rank<r>.txt` 里记一行。续跑时，`train_ladder.sh` 只留下不晚于所续检查点时间的行，每个 rank 跳过这一轮里已经开始过的 shard（`EpochShuffledShards`）。按 rank 切分也移进了这个类，所以每个 rank 先去掉自己开始过的 shard，再分给自己的 worker。
 3. 结果：一轮里没有一个样本被训练两次。代价是每次续跑时，每个 worker 正在读的那个 shard 的后半部分要等到下一轮再读。每个 rank 有 32 个 worker，所以一次续跑约少读 128 个 shard（全量的 1.6%）。如果正在读的 shard 从头再读，就会有同样多的样本被训练两次。
-4. 测试：`tools/test_shard_resume.py`（CPU，6 项），`tools/test_ladder.py` 第 6、7 项（第 7 项在 Lite 代码上本来就失败，因为它的样本没有 text_len）。GPU 冒烟测试 `jobs/smoke_full.sh`（w1313）：d1536 和 d1792 的步长和显存；d640 在 64 个 shard 上停一次再续跑，用 `tools/check_shard_resume.py` 检查。独立审查：kaggle worker。
+4. 截断时间放在检查点里（审查 S1）：`src/callbacks/shard_clock.py` 在每个检查点里存 dump 的时间、shard 种子和步数，`train_ladder.sh` 用 `tools/ckpt_shard_clock.py` 读回来，按这个时间截断日志。文件的 mtime 会因复制而变；最大的两个尺寸一次保存要 36.6–57.8 s，这段时间里开始的 shard 检查点并没有训练过。没有时钟的旧检查点仍按 mtime 截断。种子不一致就停；检查点旁边没有 shard 日志也停。
+5. 所有宽度用同一个 shard 种子（20261106，`train_full.sh` 在第一次启动前写入，审查 M7），所以同一预算下各宽度读的是同一个排列，数据顺序不增加宽度之间的差异。
+6. 测试：`tools/test_shard_resume.py`（CPU，9 项），`tools/test_ladder.py` 第 6、7 项（第 7 项在 Lite 代码上本来就失败，因为它的样本没有 text_len）。GPU 冒烟测试 `jobs/smoke_full.sh`：w1313 测了 d1536 和 d1792 的步长和显存，以及 d640 在 64 个 shard 上停一次再续跑；按审查 S2，第二次只测续跑，检查点在第 600 步，第 1000 步停，所以约第 790 步开始的 shard 必须被丢掉再读，用 `tools/check_shard_resume.py` 检查。
+7. 独立审查（`docs/review_full_ladder_2026-11-06.md`，kaggle worker）：当前代码没有阻断问题；它确认了“记开始”的设计（记“读完”会让每次续跑把约 0.8% 的数据训练两次）。已修：S1（上面第 4 条）、S2（冒烟）、M1（没有 RANK 时报错）、M3（环境里的种子必须和文件一致）、M4（worktree 不存在就停）、M7（同一个种子）、M8（被截断的最后一行跳过）。不修：M2（每次续跑少读正在读的 shard 的后半部分，见第 3 条）、M5（d1536/d1792 的保存占墙钟时间 3.9% 和 6.7%，交给 MFU 会话做异步保存）、M6（缓存检查假设每个 json 都有 caption；抽查 3 个新 shard 没有例外，缓存作业失败时会报错，到时再修）。
 
 ### 12.5 判定
 

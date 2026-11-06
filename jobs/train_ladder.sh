@@ -36,27 +36,40 @@ python $WT/tools/gpu_health.py > $RUN/gpu_health_$(date +%s).txt 2>&1 || { tail 
 CKPT_ARGS=()
 LASTCK=$(ls -t $RUN/last*.ckpt 2>/dev/null | head -1)
 if [ -n "$LASTCK" ]; then CKPT_ARGS=(--ckpt_path "$LASTCK"); echo "resuming from $LASTCK"; fi
-# Full ladder (docs/ladder_plan.md section 12): the run keeps the shard seed of its first launch (shard_seed.txt), so every
-# launch draws the same permutation in each pass, and the data workers log each shard they start
-# (shards_started_rank<r>.txt; EpochShuffledShards in src/data/dataset/gpic_dataset.py), so a resumed launch skips the shards
-# started before its checkpoint and trains no sample twice in a pass. Only the lines up to the resumed checkpoint's time
-# stay: a shard started later was read only for steps that this launch trains again, so it is read again. A fresh start
-# (no checkpoint) keeps no line. A test may fix GPIC_SHARD_SEED.
-if [ -z "${GPIC_SHARD_SEED:-}" ]; then
-  [ -s $RUN/shard_seed.txt ] || date +%s > $RUN/shard_seed.txt
-  GPIC_SHARD_SEED=$(cat $RUN/shard_seed.txt)
+# Full ladder (docs/ladder_plan.md section 12.4): the run keeps one shard seed (shard_seed.txt: jobs/train_full.sh writes the
+# ladder's common seed before the first launch, otherwise the first launch draws one), so every launch draws the same
+# permutation in each pass, and the data workers log each shard they start (shards_started_rank<r>.txt; EpochShuffledShards in
+# src/data/dataset/gpic_dataset.py), so a resumed launch skips the shards started before its checkpoint and trains no sample
+# twice in a pass. The cut is the checkpoint's own dump time (src/callbacks/shard_clock.py, read by tools/ckpt_shard_clock.py;
+# the floored mtime only for a checkpoint saved without the clock): a shard started later was read only for steps that this
+# launch trains again, so it is read again. A fresh start keeps no line. GPIC_SHARD_SEED from the environment (tests only)
+# must match the file. A checkpoint copied without its seed file gets the checkpoint's seed back; one copied without its
+# shard log is refused.
+SEEDF=$RUN/shard_seed.txt
+if [ -n "${GPIC_SHARD_SEED:-}" ]; then
+  [ -s $SEEDF ] || echo "$GPIC_SHARD_SEED" > $SEEDF
+  [ "$(cat $SEEDF)" = "$GPIC_SHARD_SEED" ] || { echo "GPIC_SHARD_SEED $GPIC_SHARD_SEED differs from $SEEDF ($(cat $SEEDF))"; exit 2; }
 fi
-KEEP_T=0
-if [ -n "$LASTCK" ]; then KEEP_T=$(stat -L -c %Y "$LASTCK") || { echo "no mtime for $LASTCK"; exit 2; }; fi
+KEEP_T=0 CK_SEED=- CK_STEP=0
+if [ -n "$LASTCK" ]; then
+  read -r KEEP_T CK_SEED CK_STEP < <(python $WT/tools/ckpt_shard_clock.py "$LASTCK") && [ -n "$KEEP_T" ] || { echo "cannot read the shard clock of $LASTCK"; exit 2; }
+  if [ "$CK_SEED" != - ]; then
+    [ -s $SEEDF ] || echo "$CK_SEED" > $SEEDF
+    [ "$(cat $SEEDF)" = "$CK_SEED" ] || { echo "$SEEDF ($(cat $SEEDF)) differs from the seed in $LASTCK ($CK_SEED)"; exit 2; }
+  fi
+  ls $RUN/shards_started_rank*.txt > /dev/null 2>&1 || { echo "no shard log beside $LASTCK: copy shards_started_rank*.txt with last.ckpt, or the pass reads every shard again"; exit 2; }
+fi
+[ -s $SEEDF ] || date +%s > $SEEDF
+GPIC_SHARD_SEED=$(cat $SEEDF)
 for f in $RUN/shards_started_rank*.txt; do
   [ -f "$f" ] || continue
   awk -v T=$KEEP_T '$1 <= T' "$f" > "$f.tmp" && mv "$f.tmp" "$f" || { echo "cannot filter $f"; exit 2; }
 done
-echo "$(date -u +%FT%TZ) shard seed $GPIC_SHARD_SEED, shard log kept up to $KEEP_T: $(cat $RUN/shards_started_rank*.txt 2>/dev/null | wc -l) lines" >> $RUN/launches.txt
+echo "$(date -u +%FT%TZ) shard seed $GPIC_SHARD_SEED, shard log kept up to $KEEP_T (checkpoint step $CK_STEP): $(cat $RUN/shards_started_rank*.txt 2>/dev/null | wc -l) lines" >> $RUN/launches.txt
 BENCH_CB=""
 if [ -n "${BENCH_OUT:-}" ]; then BENCH_CB=',{"class_path":"src.callbacks.bench.BenchTimer"}'; fi
 # the ms hook first: a kill between the two saves must not leave last.ckpt ahead of a missing ms file (review N1)
-CB='[{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"ms-{step:06d}","monitor":null,"save_last":false,"save_top_k":-1,"every_n_train_steps":'$MS'}},{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"resume-{step:06d}","monitor":null,"save_last":true,"save_top_k":0,"every_n_train_steps":'$LAST'}},{"class_path":"src.callbacks.compile_warmup.CompileWarmup"},{"class_path":"src.callbacks.host_tuning.HostTuning"}'$BENCH_CB']'
+CB='[{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"ms-{step:06d}","monitor":null,"save_last":false,"save_top_k":-1,"every_n_train_steps":'$MS'}},{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"resume-{step:06d}","monitor":null,"save_last":true,"save_top_k":0,"every_n_train_steps":'$LAST'}},{"class_path":"src.callbacks.compile_warmup.CompileWarmup"},{"class_path":"src.callbacks.host_tuning.HostTuning"},{"class_path":"src.callbacks.shard_clock.ShardClock"}'$BENCH_CB']'
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
 export GPIC_SHARD_SEED GPIC_SHARD_LOG_DIR=$RUN   # one shard order per run and pass, shared by all ranks (above)
