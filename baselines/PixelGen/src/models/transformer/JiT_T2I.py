@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -9,6 +11,20 @@ from src.models.layers.time_embed import TimestepEmbedder as TimestepEmbedder
 from src.models.layers.patch_embed import Embed as Embed
 from src.models.layers.swiglu import SwiGLU as FeedForward
 from src.models.layers.rmsnorm import RMSNorm as Norm
+
+# MFU lever A (docs/mfu.md): GPIC_MFU_ATTN=fa3 runs the masked attention with FlashAttention-3 and per-sample key counts
+# (src/models/layers/fa3_op.py) instead of SDPA with a boolean mask; the same attention, in FA's [B, S, H, D] layout.
+_ATTN = os.environ.get("GPIC_MFU_ATTN", "sdpa")
+if _ATTN == "fa3":
+    from src.models.layers.fa3_op import fa3_attention
+
+
+def _rope_bshd(x, cos, sin):
+    """apply_rotary_emb_real for x [B, S, H, Hc]; cos, sin [S, Hc/2] float32."""
+    cos, sin = cos[None, :, None], sin[None, :, None]
+    xf = x.float().reshape(*x.shape[:-1], -1, 2)
+    x0, x1 = xf[..., 0], xf[..., 1]
+    return torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1).flatten(3).type_as(x)
 
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
@@ -76,6 +92,14 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, y, pos, mask=None) -> torch.Tensor:
         B, N, C = x.shape
+        if mask is not None and mask.dtype == torch.int32:   # lever A: mask = valid keys per sample (N + caption length)
+            H, Hc = self.num_heads, C // self.num_heads
+            q, kx, vx = self.qkv_x(x).view(B, N, 3, H, Hc).unbind(2)
+            q, kx = _rope_bshd(self.q_norm(q), pos[0], pos[1]), _rope_bshd(self.k_norm(kx), pos[0], pos[1])
+            ky, vy = self.kv_y(y).view(B, -1, 2, H, Hc).unbind(2)
+            k = torch.cat([kx, self.k_norm(ky)], dim=1)
+            v = torch.cat([vx, vy], dim=1)
+            return self.proj_drop(self.proj(fa3_attention(q, k, v, mask).reshape(B, N, C)))
         qkv_x = self.qkv_x(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, kx, vx = qkv_x[0], qkv_x[1], qkv_x[2]
         q = self.q_norm(q.contiguous())
@@ -140,6 +164,9 @@ class TextRefineAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         B, N, C = x.shape
+        if mask is not None and mask.dtype == torch.int32:   # lever A: mask = caption length per sample
+            q, k, v = self.qkv(x).view(B, N, 3, self.num_heads, C // self.num_heads).unbind(2)
+            return self.proj_drop(self.proj(fa3_attention(self.q_norm(q), self.k_norm(k), v, mask).reshape(B, N, C)))
         qkv_x = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv_x[0], qkv_x[1], qkv_x[2]
         q = self.q_norm(q)
@@ -357,7 +384,10 @@ class JiT_T2I(nn.Module):
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
         ypos = self.y_pos_embedding if y_mask is None else self.y_pos_embedding[:, :y.shape[1]]
         text_mask = full_mask = None
-        if y_mask is not None:   # SDPA boolean masks, True = attend
+        if y_mask is not None and _ATTN == "fa3":   # lever A: valid keys per sample; captions are left-aligned (padding after)
+            text_mask = y_mask.sum(1, dtype=torch.int32)
+            full_mask = text_mask + x.shape[1]
+        elif y_mask is not None:   # SDPA boolean masks, True = attend
             text_mask = y_mask[:, None, None, :]
             full_mask = torch.cat([torch.ones(B, 1, 1, x.shape[1], dtype=torch.bool, device=x.device), text_mask], dim=-1)
         t = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)

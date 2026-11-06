@@ -120,6 +120,15 @@ def main():
         return xs[i % pool_n], y, mask
 
     ctx = (lambda: torch.autocast("cuda", dtype=torch.bfloat16)) if not a.fp32 else (lambda: torch.autocast("cuda", enabled=False))
+    if os.environ.get("GPIC_MFU_SDPA_BACKEND"):   # e.g. MATH: a parity floor at bf16 inputs with fp32 attention math
+        import contextlib
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        be, base_ctx = getattr(SDPBackend, os.environ["GPIC_MFU_SDPA_BACKEND"]), ctx
+
+        @contextlib.contextmanager
+        def ctx():
+            with base_ctx(), sdpa_kernel(be):
+                yield
 
     def train_step(x, y, mask, rec=None):
         with ctx():
