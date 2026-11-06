@@ -90,6 +90,34 @@ class GMSDESampler(_GMSampler):
         return x_trajs, v_trajs
 
 
+class GMDrawSampler(_GMSampler):
+    """The owner's sampler (2026-11-06: 「每一步都是输出一个高斯混合，然后按照概率采样其中的一个速度」; docs/gmflow.md section 14): at every call one x0 per pixel
+    drawn from the mixture as GM-SDE draws it (gm_draw: a component by its weights, then + s_x xi), and the straight step along the draw's velocity,
+    x' = x + (sigma - sigma') (x0 - x) / sigma, with no fresh noise (GM-SDE adds sqrt(c3) xi of the bridge). The last step (sigma' = 0) returns the draw.
+    With the exact posterior every state keeps the exact marginal: x' = (1 - sigma') x0 + sigma' eps' with (x0, eps') a posterior draw. The mixture is per pixel,
+    so the pixels draw independently of each other. On a point model (K = 1, s = 0) the draw is the network's x, so this is the exact one step. First order only."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.order == 1, "GMDrawSampler is first order only"
+
+    def _impl_sampling(self, net, noise, condition, uncondition):
+        steps = self._start(noise)
+        dev = noise.device.type
+        x = noise.float()
+        x_trajs, v_trajs = [x], []
+        for t_cur, t_next in zip(steps[:-1], steps[1:]):
+            gm = self._call(net, x, t_cur, condition)
+            with torch.autocast(device_type=dev, enabled=False):
+                sigma, sigma_to = (1 - t_cur).view(1, 1, 1, 1), (1 - t_next).view(1, 1, 1, 1)
+                x0 = gm if torch.is_tensor(gm) else gm_draw(gm, sigma.expand(x.shape[0], -1, -1, -1))
+                v = (x0 - x) / sigma
+                x = x0 if float(sigma_to) == 0.0 else x + (sigma - sigma_to) * v
+            v_trajs.append(v)
+            x_trajs.append(x)
+        v_trajs.append(torch.zeros_like(x))
+        return x_trajs, v_trajs
+
+
 class GMODESampler(_GMSampler):
     """GM-ODE, first order, with `substeps` analytic sub-steps per call (GMFlow gmflow.py:527-539). Sub-step 0 uses the mixture mean; sub-step j > 0 re-weights the call's
     mixture to the current state (Eq. 10, gm_convert) and uses its mean. Each sub-step is the Euler step x' = x + (sigma' - sigma) (x - x0) / sigma, on a uniform sigma grid of

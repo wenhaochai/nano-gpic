@@ -17,7 +17,7 @@ from torch.utils.flop_counter import FlopCounterMode
 from src.diffusion.base.guidance import simple_guidance_fn
 from src.diffusion.flow_matching import gmflow as G
 from src.diffusion.flow_matching.sampling import EulerSamplerJiT
-from src.diffusion.flow_matching.sampling_gmflow import GMODESampler, GMSDESampler
+from src.diffusion.flow_matching.sampling_gmflow import GMDrawSampler, GMODESampler, GMSDESampler
 from src.diffusion.flow_matching.sampling_implicit import ImplicitSampler
 from src.diffusion.flow_matching.scheduling import LinearScheduler
 from src.diffusion.flow_matching.training_gmflow import GMFlowTrainer
@@ -1420,6 +1420,50 @@ def T30():
         assert rc == 2 and "--lam must be" in out, (bad, out)
     print("  train_gmflow.sh: the old call is unchanged (lam.txt 0.5); --wt gmflow_run3 [--spread pixel] --lam 1 passes init_args.lam 1 and records lam.txt;"
           " another lam refused on restart; a run of before the option (checkpoint, no lam.txt) is 0.5; 0, 1.5, 0.50, abc refused")
+
+
+@test
+def T31():
+    """GMDrawSampler (docs/gmflow.md section 14): with the exact posterior it reproduces the 2-point data at 1, 4 and 50 calls (every pixel on a data point, P[0] at 0.3)
+    and every state has the exact marginal; it is the draw of gm_draw plus the straight step, with no fresh noise, step by step; on a point model it is the exact one step."""
+    torch.manual_seed(0)
+    noise = torch.randn(64, 3, 32, 32)
+    for n in (1, 4, 50):
+        xs, _ = sampler(GMDrawSampler, n, rank_seed=False)._impl_sampling(exact_net, noise, None, None)
+        near, f0, dmax = toy_stats(xs[-1])
+        steps = sampler(GMDrawSampler, n).timesteps
+        merr = max([marginal_err(xs[i], steps[i].item()) for i in range(1, n)] or [0.0])
+        print(f"  draw sampler {n} calls: on a data point {near:.4f} (max distance {dmax:.1e}), share of P[0] {f0:.4f}, largest marginal error {merr:.4f}")
+        assert near == 1.0 and abs(f0 - 0.3) < 0.01 and merr < 0.03, (n, near, f0, merr)
+    # step by step: the same RNG stream as gm_draw, the straight step x + (sigma - sigma') (x0 - x) / sigma, the last step the draw itself
+    torch.manual_seed(7)
+    xs, _ = sampler(GMDrawSampler, 4, rank_seed=False)._impl_sampling(exact_net, noise[:4], None, None)
+    torch.manual_seed(7)
+    x = noise[:4]
+    steps = sampler(GMDrawSampler, 4).timesteps
+    for i in range(4):
+        gm = exact_net(x, steps[i].repeat(4), None, gm_mode="full")
+        s, s2 = (1 - steps[i]).view(1, 1, 1, 1), (1 - steps[i + 1]).view(1, 1, 1, 1)
+        x0 = G.gm_draw(gm, s.expand(4, -1, -1, -1))
+        x = x0 if i == 3 else x + (s - s2) * (x0 - x) / s
+    assert torch.allclose(xs[-1], x, atol=1e-6), (xs[-1] - x).abs().max()
+    print("  step by step: gm_draw, then the straight step, no fresh noise; the last step returns the draw")
+    # a point model (K = 1, s = 0): the draw is the network's x, so every step is the exact one step
+    hat = lambda x, t, c, gm_mode=None: G.gm_mean(exact_posterior(x, t))
+    xs, _ = sampler(GMDrawSampler, 4, rank_seed=False)._impl_sampling(hat, noise[:4], None, None)
+    x = noise[:4]
+    for i in range(4):
+        h = hat(x, steps[i].repeat(4), None)
+        s, s2 = 1 - steps[i], 1 - steps[i + 1]
+        x = h if i == 3 else x + (s - s2) * (h - x) / s
+    assert torch.allclose(xs[-1], x, atol=1e-6), (xs[-1] - x).abs().max()
+    print("  point model: the exact one step at every call")
+    try:
+        sampler(GMDrawSampler, 4, order=2)
+        raise RuntimeError("order 2 accepted")
+    except AssertionError as e:
+        assert "first order only" in str(e), e
+    print("  order 2 refused")
 
 
 if __name__ == "__main__":

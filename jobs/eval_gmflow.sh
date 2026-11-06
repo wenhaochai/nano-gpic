@@ -9,8 +9,9 @@
 #FETCHABLE
 # GPIC evaluation of one GMFlow checkpoint (docs/gmflow.md) with one sampler at one number of network calls: 50K test captions, the official noise (EVAL_NOISE below), EMA net, no CFG, FD-DINOv2 / PRDC / MMD
 # (the protocol of jobs/eval_energy.sh). K = 0 evaluates the point model w1147 (runs/gpic-speed/point_nodrop_d640) with the same samplers.
-# usage: eval_gmflow.sh <K: 0 or the run's K> <step> <sampler: gm_sde | gm_sde_final_mean | gm_ode | gm_sde2 | gm_ode2 | gm_ode_cal | euler_mean | euler> <calls>
+# usage: eval_gmflow.sh <K: 0 or the run's K> <step> <sampler: gm_sde | gm_sde_final_mean | gm_draw | gm_ode | gm_sde2 | gm_ode2 | gm_ode_cal | euler_mean | euler> <calls>
 #   gm_sde: GM-SDE, first order, the last step returns a draw (for K = 0: DDPM with the small variance). gm_sde_final_mean: the last step returns the mixture mean.
+#   gm_draw: the owner's sampler (docs/gmflow.md section 14): one draw per pixel from the mixture at every call, the straight step along its velocity, no fresh noise (for K = 0: the exact one step).
 #   gm_ode: GM-ODE, first order, ceil(128 / calls) analytic sub-steps per call (3 at 50, 16 at 8). euler_mean / euler: the official Euler on the mixture mean (for K = 0: the official Euler).
 #   gm_sde2 / gm_ode2: GM-SDE 2 / GM-ODE 2 (order 2, docs/gmflow.md section 7); gm_ode2 keeps ceil(128 / calls) sub-steps, at least 2. K > 0 only.
 # Output: <run>/eval_<step>_<sampler>_calls<calls>[_n<substeps>][_official]/metrics.json (eval_dir below). It never overwrites a finished result; a directory without metrics.json is moved aside.
@@ -61,6 +62,7 @@ TABLE=""
 case $SAMPLER in
   gm_sde) SARGS=(--config configs_h100/gmflow_sde_sample.yaml) ;;
   gm_sde_final_mean) SARGS=(--config configs_h100/gmflow_sde_sample.yaml --model.diffusion_sampler.init_args.final_mean true) ;;
+  gm_draw) SARGS=(--config configs_h100/gmflow_draw_sample.yaml) ;;
   gm_ode) SARGS=(--config configs_h100/gmflow_ode_sample.yaml --model.diffusion_sampler.init_args.substeps $SUBSTEPS) ;;
   gm_sde2) SARGS=(--config configs_h100/gmflow_sde_sample.yaml --model.diffusion_sampler.init_args.order 2) ;;
   gm_ode2) SARGS=(--config configs_h100/gmflow_ode_sample.yaml --model.diffusion_sampler.init_args.substeps $SUBSTEPS --model.diffusion_sampler.init_args.order 2) ;;
