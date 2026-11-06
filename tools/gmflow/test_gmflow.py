@@ -214,7 +214,7 @@ def exact_net(x, t, c, gm_mode="mean"):
 def toy_stats(x):
     """Share of pixels within 0.05 of a data point, and the share at P[0]."""
     v = x.permute(0, 2, 3, 1).reshape(-1, 3)
-    d = torch.cdist(v, P)
+    d = torch.cdist(v, P, compute_mode="donot_use_mm_for_euclid_dist")   # the mm path returns 3e-4 for a distance of 6e-8 on AMD (vis2; review_gmflow2 H3)
     near = d.min(1).values < 0.05
     return near.float().mean().item(), (d.argmin(1) == 0).float().mean().item(), d.min(1).values.max().item()
 
@@ -588,7 +588,7 @@ def landing(x, s0):
     B, C, H, W = x.shape
     v = x.permute(0, 2, 3, 1).reshape(-1, C)
     sv = s0.view(1, 1, W).expand(B, H, W).reshape(-1)
-    d = torch.cdist(v, P)
+    d = torch.cdist(v, P, compute_mode="donot_use_mm_for_euclid_dist")   # the mm path returns 3e-4 for a distance of 6e-8 on AMD (vis2; review_gmflow2 H3)
     near = d.argmin(1)
     out = {"f0": abs((near == 0).float().mean().item() - 0.3)}
     for g in sorted(set(sv.tolist())):
