@@ -35,6 +35,14 @@ def plan(all_lens, me, world, B):
     return send, in_s, out_s, recv
 
 
+BUCKET = 128
+
+
+def bucket(S):
+    """The packed caption rows: the real token count rounded up to a multiple of BUCKET (JiT_T2I.py, y_pack)."""
+    return max(BUCKET, -(-S // BUCKET) * BUCKET)
+
+
 def _excl_cumsum(x):
     return torch.cumsum(x, 0) - x
 
@@ -117,12 +125,18 @@ class Rebalancer:
             tperm = torch.repeat_interleave(starts - _excl_cumsum(new_lens), new_lens, output_size=S_new) + ar
             y = yr.index_select(0, tperm)
         Tp = p["Tp"]
+        S_pad = bucket(S_new)
         cu = torch.zeros(B + 1, dtype=torch.int32, device=dev)
         cu[1:] = torch.cumsum(new_lens, 0).int()
         tok_b = torch.repeat_interleave(torch.arange(B, device=dev), new_lens, output_size=S_new)
         pos = torch.arange(S_new, device=dev) - cu[:-1].long().index_select(0, tok_b)
+        nd = S_pad - S_new   # dummy rows: no sample (tok_b = B), position 0, the scratch row of the padded layout
+        tok_b = torch.cat([tok_b, tok_b.new_full((nd,), B)])
+        pos = torch.cat([pos, pos.new_zeros(nd)])
+        pidx = torch.where(tok_b < B, tok_b * Tp + pos, B * Tp)
+        y = torch.cat([y, y.new_zeros(nd, y.shape[1])])
         kmask = torch.arange(Tp, device=dev)[None] < new_lens[:, None]   # its shape carries Tp (a dynamic size, not an int)
         onehot = tok_b[:, None] == torch.arange(B, device=dev)[None]
-        pack = {"lens": new_lens.int(), "cu": cu, "tok_b": tok_b, "pos": pos, "pidx": tok_b * Tp + pos, "kmask": kmask,
-                "onehot": onehot, "max_T": self.max_T}
+        pack = {"lens": new_lens.int(), "cu": cu, "tok_b": tok_b, "pos": pos, "pidx": pidx, "kmask": kmask,
+                "onehot": onehot, "real": tok_b < B, "max_T": self.max_T}
         return x, y, pack

@@ -50,15 +50,26 @@ class Step(nn.Module):
 
 
 def make_pack(lens, Tp, dev, max_T=320):
-    """y_pack (src/models/transformer/JiT_T2I.py, lever E) for caption lengths lens, padded key length Tp."""
+    """y_pack (src/models/transformer/JiT_T2I.py, lever E) for caption lengths lens, padded key length Tp; the rows are the
+    real token count rounded up to a multiple of 128 (src/utils/rebalance.py bucket), the dummy rows after the real ones."""
+    from src.utils.rebalance import bucket
+    B, S = len(lens), sum(lens)
     lt = torch.tensor(lens, dtype=torch.int32)
-    cu = torch.zeros(len(lens) + 1, dtype=torch.int32)
+    cu = torch.zeros(B + 1, dtype=torch.int32)
     cu[1:] = torch.cumsum(lt, 0)
-    tok_b = torch.repeat_interleave(torch.arange(len(lens)), lt.long())
-    pos = torch.cat([torch.arange(n) for n in lens])
-    return {"lens": lt.to(dev), "cu": cu.to(dev), "tok_b": tok_b.to(dev), "pos": pos.to(dev),
-            "pidx": (tok_b * Tp + pos).to(dev), "kmask": (torch.arange(Tp)[None] < lt[:, None]).to(dev),
-            "onehot": (tok_b[:, None] == torch.arange(len(lens))[None]).to(dev), "max_T": max_T}
+    nd = bucket(S) - S
+    tok_b = torch.cat([torch.repeat_interleave(torch.arange(B), lt.long()), torch.full((nd,), B)])
+    pos = torch.cat([torch.arange(n) for n in lens] + [torch.zeros(nd, dtype=torch.long)])
+    pidx = torch.where(tok_b < B, tok_b * Tp + pos, B * Tp)
+    return {"lens": lt.to(dev), "cu": cu.to(dev), "tok_b": tok_b.to(dev), "pos": pos.to(dev), "pidx": pidx.to(dev),
+            "kmask": (torch.arange(Tp)[None] < lt[:, None]).to(dev), "onehot": (tok_b[:, None] == torch.arange(B)[None]).to(dev),
+            "real": (tok_b < B).to(dev), "max_T": max_T}
+
+
+def pack_rows(y, pk):
+    """The packed caption embeddings padded with zero rows to the bucketed count of y_pack."""
+    nd = pk["pidx"].shape[0] - y.shape[0]
+    return torch.cat([y, y.new_zeros(nd, y.shape[1])]) if nd else y
 
 
 def rebalance_plan(all_lens, me, world, B):
@@ -212,8 +223,9 @@ def main():
         """Built before the timed loop: a pageable host-to-device copy inside it would stall the host on the GPU."""
         lens = make_lengths(T, a.batch, rng)
         if a.packed or a.rebalance:
-            y = torch.cat([emb[b, :n] for b, n in enumerate(lens)])
-            return xs[i % pool_n], y, {"y_pack": make_pack(lens, T, dev)}, lens
+            y = torch.cat([emb[b, :n] for b, n in enumerate(lens)])   # real rows only: the exchange pads after moving them
+            pk = make_pack(lens, T, dev)
+            return xs[i % pool_n], (y if a.rebalance else pack_rows(y, pk)), {"y_pack": pk}, lens
         mask = torch.arange(T, device=dev)[None] < torch.tensor(lens, device=dev)[:, None]
         y = emb[:, :T] * mask[..., None]
         return xs[i % pool_n], y, {"y_mask": mask}, lens
@@ -237,7 +249,7 @@ def main():
             x = xr.index_select(0, inv)
             yr = y.new_empty(sum(tout), y.shape[1])
             dist.all_to_all_single(yr, y.index_select(0, tsend), tout, tin)
-            y = yr.index_select(0, tperm)
+            y = pack_rows(yr.index_select(0, tperm), meta["y_pack"])
         with ctx():
             loss = model(x, y, meta)
         loss.backward()

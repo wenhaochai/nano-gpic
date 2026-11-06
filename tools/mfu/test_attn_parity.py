@@ -47,8 +47,9 @@ def main():
 
     if a.lever == "packed":   # lever E: the captions back to back, as the data path will deliver them
         sys.path.insert(0, os.path.dirname(__file__))
-        from step_bench import make_pack
-        y_p, pk = y[mask], make_pack(lens.tolist(), T, dev)
+        from step_bench import make_pack, pack_rows
+        pk = make_pack(lens.tolist(), T, dev)
+        y_p = pack_rows(y[mask], pk)
 
     def run(path, autocast, fn=None):
         M._ATTN = "fa3" if path == "packed" else path

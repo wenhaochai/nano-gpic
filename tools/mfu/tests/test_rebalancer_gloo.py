@@ -39,14 +39,19 @@ def worker(rank, steps, q):
         ok = pos == list(range(B))                                         # each sample at its own position
         lens2 = pk["lens"].tolist()
         exp = torch.cat([sample_rows(src[i], i, lens2[i]) for i in range(B)])
-        ok &= torch.equal(y2, exp)                                         # tokens intact, in position order
+        from src.utils.rebalance import bucket
+        S2 = exp.shape[0]
+        ok &= y2.shape[0] == bucket(S2) and torch.equal(y2[:S2], exp) and bool((y2[S2:] == 0).all())   # tokens intact, in position order; zero dummy rows
         ok &= p["types"] == [f"t{src[i]}_{i}" for i in range(B)]
         cu = pk["cu"].tolist()
-        ok &= cu[0] == 0 and cu[-1] == y2.shape[0] and all(cu[i + 1] - cu[i] == lens2[i] for i in range(B))
-        ok &= torch.equal(pk["tok_b"], torch.repeat_interleave(torch.arange(B), torch.tensor(lens2)))
-        ok &= torch.equal(pk["pos"], torch.cat([torch.arange(n) for n in lens2]))
+        ok &= cu[0] == 0 and cu[-1] == S2 and all(cu[i + 1] - cu[i] == lens2[i] for i in range(B))
+        nd = bucket(S2) - S2
+        ok &= torch.equal(pk["tok_b"], torch.cat([torch.repeat_interleave(torch.arange(B), torch.tensor(lens2)), torch.full((nd,), B)]))
+        ok &= torch.equal(pk["pos"], torch.cat([torch.arange(n) for n in lens2] + [torch.zeros(nd, dtype=torch.long)]))
         Tp = pk["kmask"].shape[1]
-        ok &= torch.equal(pk["pidx"], pk["tok_b"] * Tp + pk["pos"]) and Tp >= max(lens2) and Tp % 8 == 0 and torch.equal(pk["kmask"], torch.arange(Tp)[None] < pk["lens"][:, None].long())
+        ok &= torch.equal(pk["pidx"], torch.where(pk["tok_b"] < B, pk["tok_b"] * Tp + pk["pos"], B * Tp)) and Tp >= max(lens2) and Tp % 8 == 0
+        ok &= torch.equal(pk["kmask"], torch.arange(Tp)[None] < pk["lens"][:, None].long())
+        ok &= torch.equal(pk["onehot"].sum(1), (pk["tok_b"] < B).long()) and torch.equal(pk["real"], pk["tok_b"] < B)
         # the step's samples, over all ranks, are the original ones
         got = [None] * W
         dist.all_gather_object(got, [(s, i, lens2[i]) for i, s in enumerate(src)])

@@ -25,10 +25,14 @@ if _ATTN == "fa3":
 # y [S, 2048], S = the sum of the caption lengths: the text blocks and the caption key projections run on the S real tokens
 # only (no padded rows), the text blocks' attention is FA3 varlen, and the image blocks' keys keep the padded layout
 # [B, N + Tp] with per-sample key counts. The same math as the masked path (padded tokens never reach a real token there).
-# y_pack: lens [B] int32, cu [B + 1] int32 (offsets), tok_b [S] int64 (sample of each token), pos [S] int64 (position in
-# its caption), pidx [S] int64 (b * Tp + pos: the token's row in a padded [B * Tp] layout), kmask [B, Tp] bool (the valid
-# positions; Tp >= the longest caption comes from its shape), onehot [S, B] bool (token s belongs to sample b), max_T
-# (int, the bound for the varlen kernels: txt_max_length).
+# y_pack: lens [B] int32, cu [B + 1] int32 (offsets of the real tokens), pidx [S] int64 (b * Tp + pos: the token's row in
+# a padded [B * Tp] layout; B * Tp, a scratch row, for a dummy row), kmask [B, Tp] bool (the valid positions; Tp >= the
+# longest caption comes from its shape), onehot [S, B] bool (token s belongs to sample b; no sample for a dummy row), real
+# [S] bool, pos [S] int64 (position in its caption, 0 for a dummy), max_T (int, the bound for the varlen kernels:
+# txt_max_length). S, the rows of y, is the real token count rounded up to a multiple of 128 with zero dummy rows after
+# the real ones: an exact count gives the caption GEMMs a new M nearly every step, and cuBLASLt then runs its heuristics
+# before each launch (1-4 ms of host time each; packed d640 37 vs 17.5 ms padded, w1382). A dummy row reaches no real
+# token: its modulation is 0, its keys land in the scratch row, its attention output is 0, so its gradient is 0.
 
 
 def _rope_bshd(x, cos, sin):
@@ -109,7 +113,8 @@ class Attention(nn.Module):
             q, kx, vx = self.qkv_x(x).view(B, N, 3, H, Hc).unbind(2)
             q, kx = _rope_bshd(self.q_norm(q), pos[0], pos[1]), _rope_bshd(self.k_norm(kx), pos[0], pos[1])
             ky, vy = self.kv_y(y).view(-1, 2, H, Hc).unbind(1)
-            pad = lambda t: t.new_zeros(B * Tp, H, Hc).index_copy(0, mask["pidx"], t).view(B, Tp, H, Hc)
+            # one scratch row (B * Tp) takes the dummy rows of the bucketed token count; it is cut off before the attention
+            pad = lambda t: t.new_zeros(B * Tp + 1, H, Hc).index_copy(0, mask["pidx"], t)[:B * Tp].view(B, Tp, H, Hc)
             k = torch.cat([kx, pad(self.k_norm(ky))], dim=1)
             v = torch.cat([vx, pad(vy)], dim=1)
             return self.proj_drop(self.proj(fa3_attention(q, k, v, mask["lens"] + N).reshape(B, N, C)))
@@ -189,13 +194,13 @@ class TextRefineAttention(nn.Module):
             H, Hc = self.num_heads, C // self.num_heads
             q, k, v = self.qkv(x).view(S, 3, H, Hc).unbind(1)
             q, k = self.q_norm(q), self.k_norm(k)
-            if _TEXT_ATTN == "fa3":
-                o = fa3_varlen(q, k, v, mask["cu"], mask["cu"], mask["max_T"], mask["max_T"])
+            if _TEXT_ATTN == "fa3":   # the kernel leaves the dummy rows after cu[-1] unwritten: zero them
+                o = fa3_varlen(q, k, v, mask["cu"], mask["cu"], mask["max_T"], mask["max_T"]) * mask["real"][:, None, None]
             else:   # SDPA on the padded layout (faster than FA3 at T ~ 50, w1321); padded queries are dropped again
                 B, Tp = mask["kmask"].shape
-                pad = lambda t: t.new_zeros(B * Tp, H, Hc).index_copy(0, mask["pidx"], t).view(B, Tp, H, Hc).transpose(1, 2)
+                pad = lambda t: t.new_zeros(B * Tp + 1, H, Hc).index_copy(0, mask["pidx"], t)[:B * Tp].view(B, Tp, H, Hc).transpose(1, 2)
                 o = attention(pad(q), pad(k), pad(v), attn_mask=mask["kmask"][:, None, None, :]).transpose(1, 2).reshape(B * Tp, H, Hc)
-                o = o.index_select(0, mask["pidx"])
+                o = torch.cat([o, o.new_zeros(1, H, Hc)]).index_select(0, mask["pidx"])   # dummy rows read the zero row
             return self.proj_drop(self.proj(o.reshape(S, C)))
         B, N, C = x.shape
         if mask is not None and mask.dtype == torch.int32 and _TEXT_ATTN == "fa3":   # lever A: caption length per sample
