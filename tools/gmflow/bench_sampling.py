@@ -54,9 +54,9 @@ def main():
     ap.add_argument("--point", required=True); ap.add_argument("--gm", required=True); ap.add_argument("--out", required=True)
     ap.add_argument("--prompts", type=int, default=1024); ap.add_argument("--batch", type=int, default=32); ap.add_argument("--min-seconds", type=float, default=60)
     a = ap.parse_args()
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))   # before the process group (review_gmflow_hn F11)
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
-    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     dev = torch.device("cuda")
     lines = open(TEST_JSONL).readlines()[rank * a.prompts:(rank + 1) * a.prompts]
     caps = [json.loads(l)["caption"] for l in lines]

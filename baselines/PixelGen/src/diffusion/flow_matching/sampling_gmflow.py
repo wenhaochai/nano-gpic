@@ -102,6 +102,7 @@ class GMODESampler(_GMSampler):
         # docs/gmflow_hn.md: spread_table (a point model only) = a JSON of s_x(t) (tools/gmflow/calibrate_spread.py); fused = the Triton kernel for the sub-steps (gm_ode_triton.py)
         self.spread = None if spread_table is None else __import__("src.diffusion.flow_matching.gm_spread", fromlist=["SpreadTable"]).SpreadTable(spread_table)
         self.fused = fused
+        self._grid_w = {}   # (substeps, device) -> the fp32 weights j / n of the fused path's sigma grid
         assert not (self.spread is not None and self.order == 2), "a spread table with order 2 is an untested sampler (review_gmflow_hn F7)"
 
     def _impl_sampling(self, net, noise, condition, uncondition):
@@ -139,11 +140,20 @@ class GMODESampler(_GMSampler):
         from src.diffusion.flow_matching.gm_spread import point_mixture
         return point_mixture(x_hat, self.spread(t_cur.float().reshape(1)), 1 - t_cur.float())
 
+    def _substep_sigmas(self, sigma_src, sigma_end):
+        """The loop's sigma grid s_j = sigma_src + (sigma_end - sigma_src) * (j / n), j = 0..n, as one (n + 1,) tensor in three device ops (review_gmflow_hn F11).
+        Bitwise equal to the loop's values: j / n is rounded from the same double to fp32 on the host, and the multiply and the add are the same fp32 ops
+        (tools/gmflow/test_gmflow.py T25)."""
+        n, dev = self.substeps, sigma_src.device
+        w = self._grid_w.get((n, dev))
+        if w is None:
+            w = self._grid_w[(n, dev)] = torch.tensor([j / n for j in range(n + 1)], dtype=torch.float32).to(dev)
+        return (sigma_src.reshape(1) + (sigma_end - sigma_src).reshape(1) * w)
+
     def _fused_substeps(self, gm, sigma_src, sigma_end, sig_src_b, x):
         """All sub-steps of one call in one Triton launch (gm_ode_triton.py), on the sigma grid of the loop below."""
         from src.diffusion.flow_matching.gm_ode_triton import gm_ode_substeps_fused
         from src.diffusion.flow_matching.gmflow import logstd_x
-        n = self.substeps
-        sigmas = torch.stack([(sigma_src + (sigma_end - sigma_src) * (j / n)).reshape(()) for j in range(n + 1)])
+        sigmas = self._substep_sigmas(sigma_src, sigma_end)
         s_x = logstd_x(gm, sig_src_b.unsqueeze(1)).exp()
         return gm_ode_substeps_fused(gm["means"], gm["logweights"], s_x, x, sigmas)

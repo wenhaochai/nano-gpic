@@ -1054,9 +1054,19 @@ def T25():
             for i in range(calls):
                 s0, s1 = 1 - steps[i], 1 - steps[i + 1]
                 sig = torch.stack([s0 + (s1 - s0) * (j / n) for j in range(n + 1)])
+                smp = sampler(GMODESampler, calls, substeps=n, rank_seed=False)
+                assert torch.equal(smp._substep_sigmas(s0.view(1, 1, 1, 1), s1.view(1, 1, 1, 1)), sig), (i, "the fused path's sigma grid differs from the loop's")
                 ref = gm_ode_substeps_ref(means, lw, s_x, xs[i], sig)
                 assert torch.allclose(ref, xs[i + 1], atol=2e-5, rtol=1e-5), (per_pixel, K, i, (ref - xs[i + 1]).abs().max())
-    print("  reference = the sampler's loop (K 1, 3, 8; s_x per image and per pixel; 3 calls x 7 sub-steps)")
+    for n in (3, 7, 16, 32, 64):   # the fused path's one-op grid against the loop's formula on the eval grids, bitwise
+        for calls in (50, 8, 4, 2):
+            steps = torch.linspace(0, 1, calls + 1)
+            smp = sampler(GMODESampler, calls, substeps=n, rank_seed=False)
+            for i in range(calls):
+                s0, s1 = (1 - steps[i]).view(1, 1, 1, 1), (1 - steps[i + 1]).view(1, 1, 1, 1)
+                loop = torch.stack([(s0 + (s1 - s0) * (j / n)).reshape(()) for j in range(n + 1)])
+                assert torch.equal(smp._substep_sigmas(s0, s1), loop), (n, calls, i)
+    print("  reference = the sampler's loop (K 1, 3, 8; s_x per image and per pixel; 3 calls x 7 sub-steps); the fused grid = the loop's grid bitwise")
 
 
 @test
