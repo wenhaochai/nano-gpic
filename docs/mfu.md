@@ -113,7 +113,18 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   gloo all_gather of lengths and caption types, device exchange by two all_to_all); collate packing; packed warm-up.
 - Tests: exchange logic (tools/mfu/tests/test_rebalance_plan.py, 300 trials; test_rebalancer_gloo.py, 8 gloo ranks x 40
   steps): every sample once, at its position, tokens intact; after the plan the busiest rank holds 1.03x the mean caption
-  tokens (worst 1.085). GPU: probe4 (w1323), production path probe5 (w1324, w1325), pending.
+  tokens (worst 1.085).
+- Result (w1323, partial; stopped by me at the DDP phase): whole-model parity of the packed path passes in 4
+  configurations (error ratio to SDPA 0.98-1.02). Speed is worse, not better: one GPU, FA3 in both, mean step padded ->
+  packed: d640 17.48 -> 36.95 ms, d1024 38.42 -> 42.45, d1280 64.20 -> 69.78, d1792 140.88 -> 143.90; 8 GPUs at d640
+  26.14 -> 51.17. The packed steps take 35-45 ms with a few at 16 ms, at every caption length.
+- Diagnosis so far: not recompilation (only two graphs, static then dynamic; a CPU test shows that Dynamo makes a changing
+  int in a dict dynamic as well, so the shape-carried Tp of commit 18d8a69 is harmless but not the fix). The excess falls
+  with width (+19.5 ms d640, +3-6 ms d1280-d1792), as a host sync per step would at a host-bound width. Candidate: the
+  backward of the per-token modulation gather (index_add, bf16 atomics, through Inductor's proxy executor); commit b7ef645
+  replaces the gather by a product with the one-hot token-to-sample matrix (the same forward values, an fp32-accumulated
+  backward). probe9 (w1382): profiles of padded and packed at d640, the Python wrapper, eager, FA3 text attention.
+- Decision for now: off by default in jobs/train_ladder.sh (genmodel, 2026-11-06), until fixed and measured.
 
 ### D. uint8 crops (`GPIC_MFU_UINT8=1`)
 - The workers keep the crop as uint8 HWC; the training step maps it with a 256-entry table that train_transform's own

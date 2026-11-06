@@ -25,9 +25,10 @@ def global_loss(arm):
 def cmp(a, b):
     steps = sorted(set(a) & set(b))
     rel = [abs(a[s] - b[s]) / abs(b[s]) for s in steps]
+    ab = [abs(a[s] - b[s]) for s in steps]
     tail = steps[-500:]
     return {"n": len(steps), "first100": st.mean(rel[:100]), "last200": st.mean(rel[-200:]), "max": max(rel),
-            "mean_a": st.mean(a[s] for s in tail), "mean_b": st.mean(b[s] for s in tail)}
+            "abs_last200": st.mean(ab[-200:]), "mean_a": st.mean(a[s] for s in tail), "mean_b": st.mean(b[s] for s in tail)}
 
 
 def main():
@@ -35,7 +36,8 @@ def main():
     R, nr = global_loss(ref)
     floor = cmp(global_loss(ref2)[0], R)
     print(f"reference {os.path.basename(ref)} ({nr} ranks, {len(R)} steps); floor {os.path.basename(ref2)}: "
-          f"rel diff first100 {floor['first100']:.2e} last200 {floor['last200']:.2e} max {floor['max']:.2e}; "
+          f"rel diff first100 {floor['first100']:.2e} last200 {floor['last200']:.2e} max {floor['max']:.2e}, "
+          f"mean |loss diff| last200 {floor['abs_last200']:.2e}; "
           f"mean loss last 500: {floor['mean_a']:.6f} vs {floor['mean_b']:.6f}")
     ok = True
     for c in cands:
@@ -44,7 +46,8 @@ def main():
                 and abs(r["mean_a"] - r["mean_b"]) <= 3 * max(abs(floor["mean_a"] - floor["mean_b"]), 1e-6 * r["mean_b"]))
         ok &= good
         print(f"{os.path.basename(c):24s} {r['n']} steps: rel diff first100 {r['first100']:.2e} last200 {r['last200']:.2e} "
-              f"max {r['max']:.2e}; mean loss last 500 {r['mean_a']:.6f} vs {r['mean_b']:.6f}: {'PASS' if good else 'FAIL'}")
+              f"max {r['max']:.2e}, mean |loss diff| last200 {r['abs_last200']:.2e}; mean loss last 500 {r['mean_a']:.6f} vs "
+              f"{r['mean_b']:.6f}: {'PASS' if good else 'FAIL'}")
     print("PARITY " + ("PASS" if ok else "FAIL"))
     sys.exit(0 if ok else 1)
 
