@@ -5,13 +5,18 @@ Lightning saves on rank 0 (torch.save into memory, then a write to GPFS) while e
 copies the checkpoint's tensors into a shared-memory buffer (page-locked when CUDA allows it, so the device-to-host copy
 runs at full speed) and hands the structure to a writer process, which rebuilds each tensor, torch.saves the dict to a
 temporary file and renames it into place (atomic, as before). Two buffers, so the ms checkpoint and last.ckpt of the same
-step can both be in flight; a third save waits for a buffer, and teardown waits for every write. The file's mtime is set
+step can both be in flight; a third save waits for a buffer, and teardown waits for every write. Lightning 2.6.6 calls
+teardown from DDP's strategy but not from ModelParallelStrategy (lever B), whose teardown skips checkpoint_io.teardown, so
+the writes are also awaited at interpreter exit (atexit runs before multiprocessing ends its daemon children; without it,
+the final checkpoints of an FSDP2 run were lost whenever their write outlasted the exit). The file's mtime is set
 to the snapshot time, because jobs/train_ladder.sh keeps the shard-log lines up to a resumed checkpoint's mtime. The file
 is what torch.save writes from the same dict: the values are copies, no math changes.
 Use: trainer.plugins += [src.plugins.async_ckpt_io.AsyncShmCheckpointIO] (GPIC_MFU_ASYNC_CKPT=1 in jobs/mfu/arm.sh).
 """
+import atexit
 import os
 import queue
+import sys
 import time
 
 import torch
@@ -35,6 +40,9 @@ def _writer(jobs, acks):
             return
         k, buf, snap, path, t_snap = job
         try:
+            delay = float(os.environ.get("GPIC_ASYNC_CKPT_TEST_DELAY", "0"))   # tests only: a slow file system
+            if delay:
+                time.sleep(delay)
             def rebuild(r):
                 n = int(torch.Size(r.shape).numel()) * torch.empty((), dtype=r.dtype).element_size()
                 return buf[r.off:r.off + n].view(r.dtype).view(r.shape).clone()
@@ -61,8 +69,13 @@ class AsyncShmCheckpointIO(TorchCheckpointIO):
     def _reap(self, block):
         while any(b[1] is not None for b in self._bufs):
             try:
-                k, path, err = self._acks.get(block=block)
+                k, path, err = self._acks.get(block=block, timeout=10 if block else None)
             except queue.Empty:
+                if block and not self._proc.is_alive():   # never wait forever on a writer that died (e.g. killed for memory)
+                    raise RuntimeError(f"async checkpoint writer exited ({self._proc.exitcode}) with writes pending: "
+                                       f"{[b[1] for b in self._bufs if b[1] is not None]}")
+                if block:
+                    continue
                 return
             self._bufs[k][1] = None
             if err is not None:
@@ -112,6 +125,9 @@ class AsyncShmCheckpointIO(TorchCheckpointIO):
             self._jobs, self._acks = ctx.Queue(), ctx.Queue()
             self._proc = ctx.Process(target=_writer, args=(self._jobs, self._acks), daemon=True)
             self._proc.start()
+            if not getattr(self, "_atexit", False):
+                atexit.register(self._teardown_at_exit)
+                self._atexit = True
         tensors = []
         apply_to_collection(checkpoint, torch.Tensor, lambda t: tensors.append(t))
         align = lambda n: (n + 255) // 256 * 256
@@ -129,6 +145,13 @@ class AsyncShmCheckpointIO(TorchCheckpointIO):
             torch.cuda.synchronize()   # the copies are complete before training changes the tensors
         self._bufs[k][1] = str(path)
         self._jobs.put((k, buf, snap, str(path), t_snap))
+
+    def _teardown_at_exit(self):
+        try:
+            self.teardown()
+        except Exception as e:   # a lost final checkpoint must not end the job with exit 0
+            print(f"AsyncShmCheckpointIO at exit: {e!r}", file=sys.stderr, flush=True)
+            os._exit(97)
 
     def teardown(self):
         if self._proc is not None:

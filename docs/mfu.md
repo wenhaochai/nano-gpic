@@ -190,6 +190,14 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
 - Test: tools/mfu/tests/test_async_ckpt.py (CPU): three saves, tensors changed right after each save call; every file
   loads to exactly the saved state; mtime = snapshot time; no temporary file left. GPU timing: pending.
 
+- Bug found 2026-11-06 (before any ladder run used it): Lightning 2.6.6's ModelParallelStrategy.teardown does not call
+  checkpoint_io.teardown (DDP's does), so under lever B nothing waited for the final writes, and Python ends the daemon
+  writer at exit: a final ms checkpoint or last.ckpt whose write outlasted the exit was lost (d640 won the race in w1399;
+  d1792's 13.6 + 27 GB writes would not). Fix: the plugin also waits at interpreter exit (atexit, before multiprocessing
+  ends its daemon children), never waits forever on a dead writer (exit 97 instead of a silent exit 0).
+  tools/mfu/tests/test_async_ckpt_exit.py: old code (no exit wait): file missing, the race reproduced; new: file complete
+  and equal, exit 0; writer killed with the write pending: exit 97 after the 10 s check, no hang.
+
 ### C. Data path at the small widths (planned)
 - d640 is bound by the node's CPUs (7.3 ms of worker CPU per image on vis1: decode 2.79, crop and resize 2.25, ToTensor
   0.35, Normalize 0.21, collate 0.25). Same-math candidates: uint8 batches normalized on the GPU (the same float32 ops);
