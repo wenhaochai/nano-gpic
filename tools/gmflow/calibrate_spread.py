@@ -9,7 +9,7 @@ seeded by the image's index, so the result does not depend on the sharding. t: 6
 Run: one process per GPU on disjoint images (image i goes to shard i % shards), each writes its sums; then --merge averages over all images:
   calibrate_spread.py run <ckpt> <out dir> --shard i --shards 8 [--images 4096]
   calibrate_spread.py merge <out dir> <table.json>
-The table: {"t": [...], "s_x": [...], "mse_x": [...], "se_mse_x": [...], "n_images": N, "ckpt": path, "data": ..., "seed": ...}. GMODESampler(spread_table=...) reads it.
+The table: {"t": [...], "s_x": [...], "mse_x": [...], "se_mse_x": [...], "s_x_trivial": [...], "n_images": N, "ckpt": path, "data": ..., "seed": ...}. GMODESampler(spread_table=...) reads it.
 """
 import argparse
 import glob
@@ -98,6 +98,8 @@ def cmd_run(a):
     net = build_net(a.ckpt, a.d, a.nb, a.nt, dev)
     from src.models.conditioner.qwen3_text_encoder import Qwen3TextEncoder
     te = Qwen3TextEncoder(weight_path="Qwen/Qwen3-1.7B", embed_dim=2048, max_length=320, text_mode="masked", pad_multiple=8, attn_implementation="sdpa").to(dev).eval()
+    if dev.type == "cpu":   # CPU tests: the encoder copies its token ids to CUDA (qwen3_text_encoder.py _to_cuda)
+        te._to_cuda = lambda t: t
     images = torch.stack([data[i][1] for i in mine]).to(dev)
     caps = [data[i][2] for i in mine]
     cache = {}
@@ -109,7 +111,7 @@ def cmd_run(a):
             with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"):   # as under Lightning's bf16-mixed
                 y, _ = te([caps[r] for r in rows], meta)
             cache.clear()
-            cache[key] = (y, meta["y_mask"])
+            cache[key] = (y if dev.type == "cuda" else y.float(), meta["y_mask"])   # CPU tests run without autocast, so fp32 throughout
         y, mask = cache[key]
         with torch.autocast(device_type=dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"):
             return net(x_t, t, y, y_mask=mask)
@@ -132,7 +134,10 @@ def merge(shard_dicts):
     s2 = np.sum([d["sum_sq"] for d in shard_dicts], 0)
     mse = s1 / n
     se = np.sqrt(np.maximum(s2 / n - mse ** 2, 0) / max(n - 1, 1))
-    return dict(t=d0["t"], s_x=np.sqrt(mse).tolist(), mse_x=mse.tolist(), se_mse_x=se.tolist(), n_images=int(n), ckpt=d0["ckpt"], data=d0["data"], seed=d0["seed"])
+    t = np.asarray(d0["t"])
+    # s_x_trivial = (1 - t) / t, the error of the estimator x_t / t: an exact posterior mean is never worse, so s_x above it is the model's error, not uncertainty
+    return dict(t=d0["t"], s_x=np.sqrt(mse).tolist(), mse_x=mse.tolist(), se_mse_x=se.tolist(), s_x_trivial=((1 - t) / t).tolist(), n_images=int(n), ckpt=d0["ckpt"],
+                data=d0["data"], seed=d0["seed"])
 
 
 def cmd_merge(a):
