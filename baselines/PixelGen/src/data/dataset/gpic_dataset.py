@@ -39,29 +39,84 @@ EMB_TOKEN_BYTES = EMB_DIM * 2   # one token of bf16 outputs
 IMAGE_SUFFIXES = ("jpg", "jpeg", "png", "webp")   # webdataset lowers the suffixes
 _DECODE_PIL = wds.imagehandler("pil")
 
-class EpochShuffledShards(IterableDataset):
-    """ladder: the shard list, reshuffled at every pass with Random(seed * 100003 + pass). Every rank and worker holds
-    its own copy and makes exactly one pass per epoch (persistent workers call iter() once per epoch), so in epoch e
-    every copy uses the same permutation and the node/worker split still reads each shard exactly once per epoch.
-    A fixed order (wds.SimpleShardList, with or without its seed) repeats the same shard order in every epoch."""
+def _rank_world():
+    """(rank, world size): torch.distributed when it is up (also in a forked data worker), else the launcher's env."""
+    dist = torch.distributed
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
 
-    def __init__(self, urls, seed):
+
+class EpochShuffledShards(IterableDataset):
+    """ladder: the shard list, reshuffled at every pass with Random(seed * 100003 + pass), and split by node here: rank r
+    reads the shards r, r + world, r + 2 world, ... of the pass's permutation (what wds.split_by_node did after this
+    stage, so the pipeline has no split_by_node). Every rank and worker holds its own copy and makes exactly one pass
+    per epoch (persistent workers call iter() once per epoch), so in epoch e every copy uses the same permutation and
+    the node/worker split still reads each shard exactly once per epoch. A fixed order (wds.SimpleShardList, with or
+    without its seed) repeats the same shard order in every epoch.
+    Full ladder (docs/ladder_plan.md section 12): with log_dir, every data worker appends "<unix time> <pass> <url>" to
+    log_dir/shards_done_rank<r>.txt when it has read a shard to its end (GPICWebDataset._log_finished), and a resumed
+    launch skips the shards its rank finished in the pass the run stopped in, so a run that is stopped and resumed
+    still reads each shard once per pass. jobs/train_ladder.sh keeps the seed of the run's first launch, so every
+    launch draws the same permutations, and keeps only the log lines up to the resumed checkpoint's time (a shard
+    finished later was read for steps that the resume throws away). The log is read here, in each rank's main
+    process before the workers start, so all workers of a rank split the same remaining list."""
+
+    def __init__(self, urls, seed, log_dir=None):
         super().__init__()
         self.urls, self.seed, self.passes = list(urls), int(seed), 0
+        self.rank, self.world = _rank_world()
+        self.log_path = os.path.join(log_dir, f"shards_done_rank{self.rank}.txt") if log_dir else None
+        self.skip = set()
+        if self.log_path:
+            self.passes, self.skip = self._resume_point()
+            if self.passes or self.skip:
+                print(f"[shards] rank {self.rank}: resume in pass {self.passes}, {len(self.skip)} of its shards "
+                      f"finished before ({self.log_path})", flush=True)
 
-    def __iter__(self):
+    def _perm(self, p):
         import random
         urls = list(self.urls)
-        random.Random(self.seed * 100003 + self.passes).shuffle(urls)
+        random.Random(self.seed * 100003 + p).shuffle(urls)
+        return urls
+
+    def _resume_point(self):
+        """(pass, the shards of this rank finished in that pass) from the rank's log: the newest pass with a finished
+        shard, or the next pass when every shard of this rank in that pass is finished."""
+        try:
+            with open(self.log_path) as f:
+                rows = [line.split() for line in f if line.strip()]
+        except FileNotFoundError:
+            return 0, set()
+        if not rows:
+            return 0, set()
+        assert all(len(r) == 3 for r in rows), f"{self.log_path}: a line is not '<time> <pass> <url>'"
+        rows = [(int(p), u) for _, p, u in rows]
+        p = max(q for q, _ in rows)
+        done = {u for q, u in rows if q == p}
+        mine = set(self._perm(p)[self.rank::self.world])
+        assert done <= mine, (f"{self.log_path}: pass {p} names {len(done - mine)} shards that are not this rank's "
+                              f"(another seed, shard list or number of GPUs?), first {sorted(done - mine)[:2]}")
+        return (p + 1, set()) if done == mine else (p, done)
+
+    def __iter__(self):
+        rank, world = _rank_world()
+        assert (rank, world) == (self.rank, self.world), ("rank or world size changed", (rank, world), (self.rank, self.world))
+        perm = self._perm(self.passes)
+        urls = perm[rank::world]
+        n_skip = 0
+        if self.skip:   # only in the first pass of a resumed launch
+            urls = [u for u in urls if u not in self.skip]
+            n_skip, self.skip = len(perm[rank::world]) - len(urls), set()
         wi = torch.utils.data.get_worker_info()
-        if wi is None or wi.id == 0:   # one line per rank and epoch: every rank must print the same shards
-            dist = torch.distributed
-            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-            print(f"[shards] rank {rank} pass {self.passes}: {' '.join(u.rsplit('/', 1)[-1] for u in urls[:3])}",
+        if wi is None or wi.id == 0:   # one line per rank and epoch: every rank must print the same permutation
+            print(f"[shards] rank {rank} pass {self.passes}: permutation {' '.join(u.rsplit('/', 1)[-1] for u in perm[:3])}; "
+                  f"{len(urls)} shards for this rank" + (f", {n_skip} finished before the resume skipped" if n_skip else ""),
                   flush=True)
+        p = self.passes
         self.passes += 1
         for u in urls:
-            yield dict(url=u)
+            yield dict(url=u, shard_pass=p)
 
 
 class _CycleBatches:
@@ -141,6 +196,8 @@ class GPICWebDataset(IterableDataset):
     ):
         self.tar_dir = tar_dir
         self.tar_pattern = tar_pattern
+        self.is_val = is_val   # full ladder: only the training set keeps a log of finished shards (EpochShuffledShards)
+        self._shard_log = None
         self.shuffle_buffer = shuffle_buffer
         # ladder (option B): tokenize captions in the workers, group samples of similar caption length into the same
         # per-GPU batch, pad each batch only to its longest caption (rounded up to pad_multiple). Off by default.
@@ -336,6 +393,43 @@ class GPICWebDataset(IterableDataset):
         return imgs, caps, {"caption_type": [s[2]["caption_type"] for s in samples], "input_ids": input_ids,
                             "text_mask": text_mask}
 
+    def _log_finished(self, src):
+        """Full ladder, after split_by_worker: append "<unix time> <pass> <url>" to the rank's log when the next stage
+        asks for the next shard, that is when tarfile_to_samples has read the shard before it to its end, and after the
+        last shard of the pass. A shard that a stopped worker was still reading is not logged, so a resume reads it
+        again. One short O_APPEND write per line, so the workers of a rank never mix their lines."""
+        import time
+        fd = os.open(self._shard_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            prev = None
+            for d in src:
+                if prev is not None:
+                    os.write(fd, f"{time.time():.3f} {prev['shard_pass']} {prev['url']}\n".encode())
+                yield d
+                prev = d
+            if prev is not None:
+                os.write(fd, f"{time.time():.3f} {prev['shard_pass']} {prev['url']}\n".encode())
+        finally:
+            os.close(fd)
+
+    def _shard_stages(self, shard_spec):
+        """The pipeline's first stages: the shard list, the node split and the worker split. With GPIC_SHARD_SEED
+        (ladder) EpochShuffledShards splits by node itself; with GPIC_SHARD_LOG_DIR as well (full ladder, training set
+        only) a resumed launch skips the shards finished before and every worker logs the shards it finishes."""
+        seed = os.environ.get("GPIC_SHARD_SEED")
+        if not seed:
+            return [wds.SimpleShardList(shard_spec), wds.split_by_node, wds.split_by_worker]
+        import braceexpand
+        urls = list(braceexpand.braceexpand(shard_spec)) if isinstance(shard_spec, str) else list(shard_spec)
+        log_dir = None if self.is_val else os.environ.get("GPIC_SHARD_LOG_DIR") or None
+        shards = EpochShuffledShards(urls, seed, log_dir)
+        print(f"GPIC_SHARD_SEED={seed}: {len(urls)} shards, reshuffled every epoch"
+              + (f", finished shards logged in {shards.log_path}" if log_dir else ""))
+        if not log_dir:
+            return [shards, wds.split_by_worker]
+        self._shard_log = shards.log_path
+        return [shards, wds.split_by_worker, self._log_finished]
+
     def create_dataset(self):
         shard_spec = make_shard_spec(self.tar_dir, self.tar_pattern)
         print("Using shard_spec:", shard_spec)
@@ -348,25 +442,16 @@ class GPICWebDataset(IterableDataset):
                 and "caption_type" in s
             )
 
-        # ladder: with GPIC_SHARD_SEED set (one value per launch, shared by all ranks through the environment), the
-        # shard list is shuffled before the node/worker split, with a new permutation in every epoch, so a resumed
-        # run does not re-read the same leading shards of every worker and no two epochs read the shards in the same
-        # order. Unset: the official fixed order.
-        shards = wds.SimpleShardList(shard_spec)
-        seed = os.environ.get("GPIC_SHARD_SEED")
-        if seed:
-            import braceexpand
-            urls = list(braceexpand.braceexpand(shard_spec)) if isinstance(shard_spec, str) else list(shard_spec)
-            shards = EpochShuffledShards(urls, seed)
-            print(f"GPIC_SHARD_SEED={seed}: {len(urls)} shards, reshuffled every epoch")
+        # ladder: with GPIC_SHARD_SEED set (shared by all ranks through the environment; one value per run since the
+        # full ladder), the shard list is shuffled before the node/worker split, with a new permutation in every
+        # epoch, so no two epochs read the shards in the same order (_shard_stages). Unset: the official fixed order.
+        stages = self._shard_stages(shard_spec)
         if self.group_text_len:
             assert isinstance(self.transform, T.Compose) and len(self.transform.transforms) >= 2
             self._pre = self.transform.transforms[0]                        # random crop (PIL)
             self._post = T.Compose(self.transform.transforms[1:])          # ToTensor + Normalize
             return wds.DataPipeline(
-                shards,
-                wds.split_by_node,
-                wds.split_by_worker,
+                *stages,
                 wds.tarfile_to_samples(handler=wds.warn_and_continue),
                 wds.select(self._has_caption),
                 wds.map(self._add_caption, handler=wds.warn_and_continue),
@@ -378,9 +463,7 @@ class GPICWebDataset(IterableDataset):
             )
 
         dataset = wds.DataPipeline(
-            shards,
-            wds.split_by_node,
-            wds.split_by_worker,
+            *stages,
 
             wds.tarfile_to_samples(handler=wds.warn_and_continue),
             wds.decode("pil", handler=wds.warn_and_continue),

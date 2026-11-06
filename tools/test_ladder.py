@@ -129,17 +129,27 @@ def main():
     hist = {T: Ts.count(T) for T in sorted(set(Ts))}
     print(f"5. grouping: {n} batches, every batch length-sorted {sorted_ok}, mean padded T {mean_T:.1f}, T histogram {hist}  {'ok' if good else 'FAIL'}", flush=True)
 
-    # 6. shard order per epoch: one permutation per epoch shared by every rank/worker copy, new in every epoch
+    # 6. shard order per epoch: one permutation per epoch shared by every rank/worker copy, new in every epoch. The class
+    #    splits by node itself (full ladder), with the rank and world size of the launcher's env when torch.distributed is down
     from itertools import islice
     from src.data.dataset.gpic_dataset import EpochShuffledShards
     urls = [f"s{i:05d}.tar" for i in range(801)]
     world, nw, epochs = 8, 32, 3
-    copies = {(r, w): EpochShuffledShards(urls, 1762100000) for r in range(world) for w in range(nw)}
+
+    def as_rank(r, f):
+        old = {k: os.environ.get(k) for k in ("RANK", "WORLD_SIZE")}
+        os.environ.update(RANK=str(r), WORLD_SIZE=str(world))
+        try:
+            return f()
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    copies = {(r, w): as_rank(r, lambda: EpochShuffledShards(urls, 1762100000)) for r in range(world) for w in range(nw)}
     cover_ok = True
     for e in range(epochs):
         seen = []
         for (r, w), c in copies.items():
-            seen += [d["url"] for d in islice(islice(iter(c), r, None, world), w, None, nw)]   # split_by_node, _by_worker
+            seen += as_rank(r, lambda: [d["url"] for d in islice(iter(c), w, None, nw)])   # split_by_worker
         cover_ok &= sorted(seen) == urls
     two = EpochShuffledShards(urls, 1762100000)
     a1 = [d["url"] for d in iter(two)]
@@ -150,12 +160,13 @@ def main():
     print(f"6. shard order: every epoch reads each of 801 shards once over {world} ranks x {nw} workers {cover_ok}, "
           f"epoch 2 order differs from epoch 1 {a1 != a2}  {'ok' if good else 'FAIL'}", flush=True)
 
-    # 7. grouping tail: a stream that is not a whole number of chunks yields only full chunks
+    # 7. grouping tail: a stream that is not a whole number of chunks yields only full chunks (_group sorts by text_len,
+    #    the field both the token path and the text cache set, since the cache; the test had only input_ids)
     ds7 = GPICWebDataset(tar_dir="/nonexistent/", tar_pattern="x", group_text_len=True, group_window=1024)
     ds7.group_batch = 32
-    stream = [{"input_ids": [0] * (1 + (i * 7919) % 300)} for i in range(1000 + 1024 + 5)]
+    stream = [{"text_len": 1 + (i * 7919) % 300} for i in range(1000 + 1024 + 5)]
     out = list(ds7._group(iter(stream)))
-    lens = [len(s["input_ids"]) for s in out]
+    lens = [s["text_len"] for s in out]
     chunks_sorted = all(lens[i:i + 32] == sorted(lens[i:i + 32]) for i in range(0, len(lens), 32))
     good = len(out) == (1024 + 1000 // 32 * 32) and len(out) % 32 == 0 and chunks_sorted
     ok &= good

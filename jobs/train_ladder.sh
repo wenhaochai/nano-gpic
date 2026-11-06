@@ -12,19 +12,23 @@
 # width d (heads d/64), nb main blocks and nt text blocks, max_steps steps of 256 images on 8 GPUs.
 # Checkpoints: last.ckpt (full state) every max_steps/32 steps for resuming; ms-step=<step>.ckpt (model + EMA) at
 # max_steps/4, /2, 3/4 and the end, for the FD evals (jobs/eval_ladder.sh).
-# Code: the frozen worktree gpic-wt/ladder_run (the reviewed commit), so later edits cannot reach a running size.
+# Code: the frozen worktree gpic-wt/ladder_full_run (branch ladder-full, the reviewed commit of the full ladder), so later
+# edits cannot reach a running size; the Lite ladder ran gpic-wt/ladder_run.
 # usage: train_ladder.sh <size> <d> <nb> <nt> <max_steps> [main.py arguments...]
-# Resumable (wq --partial): resumes from the newest last*.ckpt; exits 0 only when max_steps are done.
+# Resumable (wq --partial): resumes from the newest last*.ckpt; exits 0 only when max_steps are done. Run again with a
+# larger max_steps, it continues the run (flat LR after the warm-up): the full ladder's budget segments (jobs/train_full.sh).
 # Env (smoke tests only): LADDER_WT (code worktree), LADDER_RUN_ROOT (run root), BENCH_OUT (adds the step timer),
-# LADDER_PARTIAL_OK (a launch stopped early by --trainer.max_steps counts as done).
+# LADDER_PARTIAL_OK (a launch stopped early by --trainer.max_steps counts as done). LADDER_LAST_EVERY: the steps between
+# two last.ckpt saves (default max_steps/32; jobs/train_full.sh).
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 SIZE=$1 D=$2 NB=$3 NT=$4 STEPS=$5; shift 5
-WT=${LADDER_WT:-$WC/project/gpic-wt/ladder_run}
+WT=${LADDER_WT:-$WC/project/gpic-wt/ladder_full_run}
 ROOT=${LADDER_RUN_ROOT:-$WC/runs/gpic-speed}
 RUN=$ROOT/exp_ladder_$SIZE   # main.py: <default_root_dir>/exp_<tags.exp>
 if [ $((STEPS % 32)) -ne 0 ] || [ $((D % 64)) -ne 0 ]; then echo "max_steps must be a multiple of 32 and d of 64"; exit 2; fi
-MS=$((STEPS / 4)); LAST=$((STEPS / 32))
+MS=$((STEPS / 4)); LAST=${LADDER_LAST_EVERY:-$((STEPS / 32))}   # jobs/train_full.sh sets LADDER_LAST_EVERY per size
+[ "$LAST" -gt 0 ] 2>/dev/null || { echo "bad LADDER_LAST_EVERY $LAST"; exit 2; }
 mkdir -p $RUN
 echo "$(date -u +%FT%TZ) $(git -C $WT rev-parse HEAD) size=$SIZE d=$D nb=$NB nt=$NT max_steps=$STEPS ms_every=$MS last_every=$LAST host=$(hostname) job=$JOBID" >> $RUN/launches.txt
 # GPU health gate: a throttled GPU slows the whole run; exit 98 = requeue elsewhere
@@ -32,13 +36,29 @@ python $WT/tools/gpu_health.py > $RUN/gpu_health_$(date +%s).txt 2>&1 || { tail 
 CKPT_ARGS=()
 LASTCK=$(ls -t $RUN/last*.ckpt 2>/dev/null | head -1)
 if [ -n "$LASTCK" ]; then CKPT_ARGS=(--ckpt_path "$LASTCK"); echo "resuming from $LASTCK"; fi
+# Full ladder (docs/ladder_plan.md section 12): the run keeps the shard seed of its first launch (shard_seed.txt), so every
+# launch draws the same permutation in each pass, and the data workers log each shard they read to its end
+# (shards_done_rank<r>.txt; EpochShuffledShards in src/data/dataset/gpic_dataset.py), so a resumed launch skips the shards
+# finished before. Only the lines up to the resumed checkpoint's time stay: a shard finished later was read for steps that
+# this launch trains again. A fresh start (no checkpoint) keeps no line. A test may fix GPIC_SHARD_SEED.
+if [ -z "${GPIC_SHARD_SEED:-}" ]; then
+  [ -s $RUN/shard_seed.txt ] || date +%s > $RUN/shard_seed.txt
+  GPIC_SHARD_SEED=$(cat $RUN/shard_seed.txt)
+fi
+KEEP_T=0
+if [ -n "$LASTCK" ]; then KEEP_T=$(stat -L -c %Y "$LASTCK") || { echo "no mtime for $LASTCK"; exit 2; }; fi
+for f in $RUN/shards_done_rank*.txt; do
+  [ -f "$f" ] || continue
+  awk -v T=$KEEP_T '$1 <= T' "$f" > "$f.tmp" && mv "$f.tmp" "$f" || { echo "cannot filter $f"; exit 2; }
+done
+echo "$(date -u +%FT%TZ) shard seed $GPIC_SHARD_SEED, shard log kept up to $KEEP_T: $(cat $RUN/shards_done_rank*.txt 2>/dev/null | wc -l) lines" >> $RUN/launches.txt
 BENCH_CB=""
 if [ -n "${BENCH_OUT:-}" ]; then BENCH_CB=',{"class_path":"src.callbacks.bench.BenchTimer"}'; fi
 # the ms hook first: a kill between the two saves must not leave last.ckpt ahead of a missing ms file (review N1)
 CB='[{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"ms-{step:06d}","monitor":null,"save_last":false,"save_top_k":-1,"every_n_train_steps":'$MS'}},{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"resume-{step:06d}","monitor":null,"save_last":true,"save_top_k":0,"every_n_train_steps":'$LAST'}},{"class_path":"src.callbacks.compile_warmup.CompileWarmup"},{"class_path":"src.callbacks.host_tuning.HostTuning"}'$BENCH_CB']'
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
-export GPIC_SHARD_SEED=${GPIC_SHARD_SEED:-$(date +%s)}   # shard order shuffled per launch and per epoch, shared by all ranks; a test may fix it
+export GPIC_SHARD_SEED GPIC_SHARD_LOG_DIR=$RUN   # one shard order per run and pass, shared by all ranks (above)
 export GPIC_REGION_CROP=${GPIC_REGION_CROP:-1}   # the crop resizes only the region it keeps: d640 29.5 -> 26.7 ms (w1117); the same random draws; 0.035% of the channel values differ, by at most 2 of 255
 export TORCHINDUCTOR_CPP_WRAPPER=1   # kernels launched from C++: d640 39.3 -> 32.6 ms; the same math up to bf16 rounding (tools/test_cpp_launcher.py)
 # the main thread spent 14.5% of its CPU time in glibc malloc; the threshold keeps tcmalloc's large-alloc report out of the log
