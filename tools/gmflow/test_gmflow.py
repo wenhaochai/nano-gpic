@@ -1008,17 +1008,11 @@ def T24():
     want = torch.tensor([post_std(t) for t in ts], dtype=torch.float64)
     print("  s_x got  " + " ".join(f"{v:.4f}" for v in got.tolist()) + "\n  s_x true " + " ".join(f"{v:.4f}" for v in want.tolist()))
     assert torch.allclose(got, want, rtol=0.02), (got, want)
-    orig = CS.T_GRID
-    try:
-        CS.T_GRID = ts   # noise_for draws one noise per point of the grid
-        s1, s2 = CS.error_sums(predict, images, list(range(N)), ts, seed=0, batch=128)
-        shards = []
-        for k in range(3):
-            rows = [i for i in range(N) if i % 3 == k]
-            a1, a2 = CS.error_sums(predict, images[rows], rows, ts, seed=0, batch=50)
-            shards.append(dict(t=ts, sum_mse=a1.tolist(), sum_sq=a2.tolist(), n=len(rows), ckpt="x", images=N, seed=0, data="toy", shard=k, shards=3))
-    finally:
-        CS.T_GRID = orig
+    shards = []   # review_gmflow_hn F10: noise_for takes len(ts), so no patch of CS.T_GRID
+    for k in range(3):
+        rows = [i for i in range(N) if i % 3 == k]
+        a1, a2 = CS.error_sums(predict, images[rows], rows, ts, seed=0, batch=50)
+        shards.append(dict(t=ts, sum_mse=a1.tolist(), sum_sq=a2.tolist(), n=len(rows), ckpt="x", images=N, seed=0, data="toy", shard=k, shards=3))
     tab = CS.merge(shards)
     assert tab["n_images"] == N and torch.allclose(torch.tensor(tab["mse_x"], dtype=torch.float64), s1 / N, rtol=1e-12), (tab["mse_x"], s1 / N)
     path = _tmp("tab.json")
@@ -1028,6 +1022,10 @@ def T24():
     assert torch.allclose(SpreadTable(path)(torch.tensor(ts)).double(), torch.tensor(tab["s_x"], dtype=torch.float64), rtol=1e-6)
     try:
         CS.merge(shards[:2]); raise RuntimeError("merge took a missing shard")
+    except AssertionError:
+        pass
+    try:
+        CS.merge(shards[:2] + [dict(shards[2], images=N + 1)]); raise RuntimeError("merge took shards of different image counts")
     except AssertionError:
         pass
     if os.path.exists(CS.VAL_TAR):   # the held-out data on a node that sees /scratch

@@ -52,10 +52,10 @@ def load_val(n, res=256, tar_path=VAL_TAR):
     return out
 
 
-def noise_for(index, shape, seed, device):
-    """The noise of image `index` at every t: (len(T), *shape), from its own generator."""
+def noise_for(index, n_t, shape, seed, device):
+    """The noise of image `index` at each of the n_t values of t: (n_t, *shape), from its own generator."""
     g = torch.Generator(device=device).manual_seed(seed * 1_000_003 + index)
-    return torch.randn((len(T_GRID), *shape), generator=g, device=device)
+    return torch.randn((n_t, *shape), generator=g, device=device)
 
 
 @torch.no_grad()
@@ -68,7 +68,7 @@ def error_sums(predict, images, indices, ts, seed, batch):
     for b0 in range(0, len(images), batch):
         rows = list(range(b0, min(b0 + batch, len(images))))
         x = images[rows].float()
-        eps = torch.stack([noise_for(indices[r], x.shape[1:], seed, dev) for r in rows], 1)   # (T, B, C, H, W)
+        eps = torch.stack([noise_for(indices[r], len(ts), x.shape[1:], seed, dev) for r in rows], 1)   # (T, B, C, H, W)
         for ti, t in enumerate(ts):
             x_t = t * x + (1 - t) * eps[ti]
             hat = predict(x_t, torch.full((len(rows),), t, device=dev, dtype=torch.float32), rows).float()
@@ -127,7 +127,8 @@ def merge(shard_dicts):
     """Sum the shards' sums; s_x = sqrt(mean MSE_x); se_mse_x = the standard error of that mean over images."""
     d0 = shard_dicts[0]
     for d in shard_dicts:
-        assert d["t"] == d0["t"] and d["ckpt"] == d0["ckpt"] and d["seed"] == d0["seed"] and d["shards"] == d0["shards"], "shards of different runs"
+        assert d["t"] == d0["t"] and d["ckpt"] == d0["ckpt"] and d["seed"] == d0["seed"] and d["shards"] == d0["shards"] and d["images"] == d0["images"], \
+            "shards of different runs"
     assert sorted(d["shard"] for d in shard_dicts) == list(range(d0["shards"])), "a shard is missing or repeated"
     n = sum(d["n"] for d in shard_dicts)
     s1 = np.sum([d["sum_mse"] for d in shard_dicts], 0)

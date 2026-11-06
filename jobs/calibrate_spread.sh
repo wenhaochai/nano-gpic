@@ -10,16 +10,17 @@
 # The spread table of a point model (docs/gmflow_hn.md, H1): w1147's EMA at C0/16 and C0/8 (runs/gpic-speed/point_nodrop_d640, ms-step=033408 and 066816), its own
 # x-prediction error s_x(t) = sqrt(E||x - x_hat||^2 / D) on 4096 held-out val images (gpic_val_00000.tar) at 64 t in [0.01, 0.99], one process per GPU on disjoint
 # images, then the mean. No training, no FD. Expected: about 10 min. Output: runs/gpic-speed/point_spread_table/<step>/table.json (the input of the sampler gm_ode_cal).
-# Code: the frozen worktree gpic-wt/gmflow_hn_run; the job records its commit and refuses a worktree with local changes.
+# Code: the frozen worktree gpic-wt/gmflow_run3 (the merge of gmflow-hn into gmflow, 2026-11-06); the job writes its commit into each <step>/commit.txt, next to
+# table.json, and refuses a worktree with local changes.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-WT=$WC/project/gpic-wt/gmflow_hn_run
+WT=$WC/project/gpic-wt/gmflow_run3
 [ -f "$WT/tools/gmflow/calibrate_spread.py" ] || { echo "$WT holds old code"; exit 2; }
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }
 SRC=$WC/runs/gpic-speed/point_nodrop_d640/exp_ladder_d640
 ROOT=$WC/runs/gpic-speed/point_spread_table
 mkdir -p $ROOT
-git -C $WT rev-parse HEAD > $ROOT/commit.txt
+SHA=$(git -C $WT rev-parse HEAD)
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD WANDB_MODE=disabled
 IFS=, read -r -a DEV <<<"${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -31,6 +32,7 @@ for STEP in 033408 066816; do
   CKPT=$SRC/ms-step=$STEP.ckpt
   [ -f $CKPT ] || { echo "no $CKPT"; exit 2; }
   mkdir -p $OUT
+  echo $SHA > $OUT/commit.txt   # per table (review_gmflow_hn F9)
   rm -f $OUT/shard*.json
   pids=()
   for i in 0 1 2 3 4 5 6 7; do

@@ -11,10 +11,10 @@
 # (official Euler at 50, 16, 8, 4 calls) and the K = 8 model w1173 (GM-ODE at 8 and 4 calls, PyTorch sub-steps and the fused Triton kernel). bf16, compiled, after a
 # warm-up pass, at least 60 s per setting on 1024 prompts per GPU. Checks fused = not fused (per call in fp32; end to end to bf16 tolerance); exit 1 if a check fails.
 # Expected: about 20 min. Output: runs/gpic-speed/gmflow_k8_d640/exp_ladder_d640/bench_sampling_<date>.json (next to the K = 8 run) and the log beside it.
-# Code: the frozen worktree gpic-wt/gmflow_hn_run.
+# Code: the frozen worktree gpic-wt/gmflow_run3 (the merge of gmflow-hn into gmflow, 2026-11-06).
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-WT=$WC/project/gpic-wt/gmflow_hn_run
+WT=$WC/project/gpic-wt/gmflow_run3
 [ -f "$WT/baselines/PixelGen/src/diffusion/flow_matching/gm_ode_triton.py" ] || { echo "$WT holds old code"; exit 2; }
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }
 POINT=$WC/runs/gpic-speed/point_nodrop_d640/exp_ladder_d640/ms-step=066816.ckpt
