@@ -162,8 +162,10 @@ class LightningModel(pl.LightningModule):
         ]
         if os.environ.get("GPIC_MFU_FSDP") == "1":   # MFU lever B: sharded and replicated tensors in separate fused calls
             from src.utils.fsdp_setup import is_dtensor
+            # without the empty groups (the trainer's and the sampler's have no parameters): the distributed state dict that
+            # loads the optimizer on resume accepts at most one empty group (smoke w1391); nothing to update in them
             param_groups = [{"params": [p for p in params_denoiser if is_dtensor(p)]},
-                            {"params": [p for p in params_denoiser if not is_dtensor(p)]}] + param_groups[1:]
+                            {"params": [p for p in params_denoiser if not is_dtensor(p)]}] + [g for g in param_groups[1:] if g["params"]]
         # optimizer: torch.optim.Optimizer = self.optimizer([*params_trainer, *params_denoiser])
         optimizer: torch.optim.Optimizer = self.optimizer(param_groups)
         if self.lr_scheduler is None:
