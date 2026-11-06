@@ -64,6 +64,11 @@ def main():
     ap.add_argument("--fp32", action="store_true", help="no autocast (for bit-exact checks)")
     ap.add_argument("--profile", default=None, help="a:b, profile measured steps [a, b)")
     ap.add_argument("--record", action="store_true")
+    ap.add_argument("--bucket-mb", type=float, default=1000, help="DDP bucket_cap_mb (production 1000)")
+    ap.add_argument("--hook", default=None, help="DDP comm hook: 'avg' = all-reduce with ReduceOp.AVG (no per-parameter divide)")
+    ap.add_argument("--fsdp", action="store_true", help="FSDP2 instead of DDP: per-block fully_shard, bf16 compute params, "
+                    "fp32 reduce-scatter, fused AdamW and EMA on the shards; RMSNorm weights and pos_embed stay fp32 and "
+                    "replicated (all-reduced), as autocast uses them in fp32")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     nb, nt = (a.nb, a.nt) if a.nb else SIZES[a.d]
@@ -89,19 +94,71 @@ def main():
     for p in ema.parameters():
         p.requires_grad_(False)
     n_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-    if not a.no_compile:
-        net.compile()
     trainer = JiTTrainer(scheduler=LinearScheduler(), loss_weight_fn=constant, lognorm_t=True, timeshift=1.0,
                          P_mean=-0.8, P_std=0.8, t_eps=0.05, null_condition_p=0.0)
-    step_mod = Step(net, trainer)
-    model = step_mod
-    if ddp:
-        model = nn.parallel.DistributedDataParallel(step_mod, device_ids=[local], bucket_cap_mb=1000,
-                                                    gradient_as_bucket_view=True, broadcast_buffers=False)
-    params = [p for p in net.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=1e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0, fused=True)
-    ema_params, net_params = list(ema.parameters()), list(net.parameters())
     ema_stream = torch.cuda.Stream(device=dev)
+    if a.fsdp:
+        assert ddp, "--fsdp needs torchrun"
+        from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+        from torch.distributed.device_mesh import init_device_mesh
+        from src.models.layers.rmsnorm import RMSNorm
+        mesh = init_device_mesh("cuda", (world,))
+        mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=False)
+        keep = {p for m in net.modules() if isinstance(m, RMSNorm) for p in m.parameters()} | {net.pos_embed}
+        for blk in list(net.text_refine_blocks) + list(net.blocks):
+            fully_shard(blk, mesh=mesh, mp_policy=mp, reshard_after_forward=False, ignored_params=keep & set(blk.parameters()))
+            if not a.no_compile:
+                blk.compile()
+        fully_shard(net, mesh=mesh, mp_policy=mp, reshard_after_forward=False, ignored_params=keep)
+        model = Step(net, trainer)
+        sharded = [p for p in net.parameters() if p.requires_grad and p not in keep]
+        repl = [p for p in net.parameters() if p.requires_grad and p in keep]
+        loc = [p.to_local() for p in sharded]   # views of the sharded fp32 parameters
+        st_m = [torch.zeros_like(t) for t in loc + repl]
+        st_v = [torch.zeros_like(t) for t in loc + repl]
+        st_step = [torch.zeros((), dtype=torch.float32, device=dev) for _ in loc + repl]
+        ema_t = [t.detach().clone().float() for t in loc + repl]
+        net_t = loc + repl
+
+        def fsdp_update():
+            """The reduce-scattered shards, the all-reduced replicated parameters, a global-norm clip, fused AdamW."""
+            rg = [p.grad for p in repl]
+            flat = torch._utils._flatten_dense_tensors(rg)
+            dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+            for g_, f_ in zip(rg, torch._utils._unflatten_dense_tensors(flat, rg)):
+                g_.copy_(f_)
+            gl = [p.grad.to_local() for p in sharded] + rg
+            sq = torch.stack(torch._foreach_norm(gl[:len(sharded)])).pow(2).sum()
+            sq_r = torch.stack(torch._foreach_norm(rg)).pow(2).sum()
+            dist.all_reduce(sq)
+            norm = (sq + sq_r).sqrt()
+            coef = (1.0 / (norm + 1e-6)).clamp(max=1.0)
+            torch._foreach_mul_(gl, coef)
+            torch._foreach_add_(st_step, 1.0)
+            torch._fused_adamw_(net_t, gl, st_m, st_v, [], st_step, lr=1e-4, beta1=0.9, beta2=0.95, weight_decay=0.0,
+                                eps=1e-8, amsgrad=False, maximize=False)
+            for p in net.parameters():
+                p.grad = None
+            return norm
+        params = sharded + repl
+        opt = None
+        ema_params, net_params = ema_t, net_t
+    else:
+        if not a.no_compile:
+            net.compile()
+        step_mod = Step(net, trainer)
+        model = step_mod
+        if ddp:
+            model = nn.parallel.DistributedDataParallel(step_mod, device_ids=[local], bucket_cap_mb=a.bucket_mb,
+                                                        gradient_as_bucket_view=True, broadcast_buffers=False)
+            if a.hook == "avg":
+                def avg_hook(state, bucket):
+                    fut = dist.all_reduce(bucket.buffer(), op=dist.ReduceOp.AVG, async_op=True).get_future()
+                    return fut.then(lambda f: f.value()[0])
+                model.register_comm_hook(None, avg_hook)
+        params = [p for p in net.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(params, lr=1e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0, fused=True)
+        ema_params, net_params = list(ema.parameters()), list(net.parameters())
 
     # batches: a pool on the GPU, cycled
     rng = random.Random(a.seed * 1000 + (0 if a.same_T else rank))
@@ -134,10 +191,14 @@ def main():
         with ctx():
             loss = model(x, y, mask)
         loss.backward()
-        gn = torch.nn.utils.clip_grad_norm_(params, 1.0, foreach=True)
-        torch.cuda.current_stream().wait_stream(ema_stream)   # SimpleEMA._join before the optimizer step
-        opt.step()
-        opt.zero_grad(set_to_none=True)
+        if opt is None:   # FSDP2
+            torch.cuda.current_stream().wait_stream(ema_stream)
+            gn = fsdp_update()
+        else:
+            gn = torch.nn.utils.clip_grad_norm_(params, 1.0, foreach=True)
+            torch.cuda.current_stream().wait_stream(ema_stream)   # SimpleEMA._join before the optimizer step
+            opt.step()
+            opt.zero_grad(set_to_none=True)
         ema_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(ema_stream), torch.no_grad():
             torch._foreach_lerp_(ema_params, net_params, 1.0 - 0.9999)
@@ -191,9 +252,10 @@ def main():
     keep = [m for k, m in enumerate(ms) if not (pa and pa[0] - 1 <= k <= pa[1])]
     mean = statistics.mean(keep)
     res = {"d": a.d, "nb": nb, "nt": nt, "params": n_params, "world": world, "rank": rank, "T": a.T, "same_T": a.same_T,
+           "mode": "fsdp" if a.fsdp else ("ddp" if ddp else "single"), "bucket_mb": a.bucket_mb, "hook": a.hook,
            "steps": len(keep), "mean_ms": mean, "median_ms": statistics.median(keep), "min_ms": min(keep),
            "max_ms": max(keep), "compile_warm_s": warm_s, "peak_alloc_gb": torch.cuda.max_memory_allocated() / 2**30,
-           "mean_T": statistics.mean(Tseq[a.warm:]), "step_ms": ms,
+           "mean_T": statistics.mean(Tseq[a.warm:]), "step_ms": ms, "Tseq": Tseq[a.warm:],
            "env": {k: v for k, v in os.environ.items() if k.startswith(("GPIC_", "TORCHINDUCTOR", "NCCL_"))},
            "torch": torch.__version__, "gpu": torch.cuda.get_device_name(dev)}
     if a.d in GF:
@@ -206,7 +268,7 @@ def main():
         res["param_abs"] = float(sum(p.double().abs().sum() for p in net_params))
         res["ema_sum"] = float(sum(p.double().sum() for p in ema_params))
     if rank == 0:
-        print(f"d{a.d} {nb}+{nt} world {world} T={a.T}{' same' if a.same_T else ''}: mean {mean:.2f} ms, median "
+        print(f"d{a.d} {nb}+{nt} world {world} {res['mode']} bucket {a.bucket_mb} hook {a.hook} T={a.T}{' same' if a.same_T else ''}: mean {mean:.2f} ms, median "
               f"{res['median_ms']:.2f}, MFU {100 * res.get('mfu', float('nan')):.1f}%, peak {res['peak_alloc_gb']:.1f} GiB, "
               f"warm-up {warm_s:.0f} s", flush=True)
     if a.out and rank == 0:
