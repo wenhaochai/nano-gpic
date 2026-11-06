@@ -19,7 +19,7 @@ grep -q "gm_k: 8" $WT/baselines/PixelGen/configs_h100/gmflow_train.yaml || { ech
 OUT=$WC/runs/gpic-speed/gmflow_smoke_$(date +%m%d_%H%M%S)
 mkdir -p $OUT
 git -C $WT rev-parse HEAD > $OUT/commit.txt
-export LADDER_WT=$WT LADDER_PARTIAL_OK=1 WANDB_MODE=disabled TORCH_LOGS=recompiles LADDER_RUN_ROOT=$OUT GPIC_GM_PRINT=50
+export LADDER_WT=$WT GMFLOW_WT=$WT LADDER_PARTIAL_OK=1 WANDB_MODE=disabled TORCH_LOGS=recompiles LADDER_RUN_ROOT=$OUT GPIC_GM_PRINT=50   # eval_gmflow.sh needs GMFLOW_WT (review_gmflow2 M4)
 export GPIC_REGION_CROP=0 GPIC_SHARD_SEED=1730000000   # as jobs/run_gmflow.sh, so the step time reads for the real run
 log() { echo "[$(date +%T)] $*" | tee -a $OUT/phases.log; }
 check() {   # <log> <bench dir>: finite [gmflow] lines after the warm-up, the recompiles after it, the median step time of rank 0
