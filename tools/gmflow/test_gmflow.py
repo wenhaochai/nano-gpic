@@ -1128,6 +1128,11 @@ def T26():
             b = sampler(GMODESampler, calls, substeps=n, rank_seed=False)._impl_sampling(fnet, noise, y, None)[0][-1]
             assert torch.isfinite(a).all() and torch.allclose(a, b, atol=1e-4, rtol=1e-4), (calls, (a - b).abs().max())
             print(f"  JiT_T2I gm_spread pixel (K = 8, per-pixel log s_u std {ls.flatten(1).std(1).mean():.3f}): fused = not fused at {calls} x {n}, max |diff| {(a - b).abs().max():.1e}")
+        # review_gmflow_hn F7: fused on the second-order mixture (order 2 reads the corrected logstd, (B, 1, 1, H, W) here). No job uses this combination.
+        a = sampler(GMODESampler, 4, substeps=8, fused=True, order=2, rank_seed=False)._impl_sampling(fnet, noise, y, None)[0][-1]
+        b = sampler(GMODESampler, 4, substeps=8, order=2, rank_seed=False)._impl_sampling(fnet, noise, y, None)[0][-1]
+        assert torch.isfinite(a).all() and torch.allclose(a, b, atol=1e-4, rtol=1e-4), (a - b).abs().max()
+        print(f"  order 2 on the same model: fused = not fused at 4 x 8, max |diff| {(a - b).abs().max():.1e}")
     print("  sampler fused = not fused (K = 8 mixture; point model with a table; per-pixel JiT_T2I)")
 
 

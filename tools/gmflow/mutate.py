@@ -27,6 +27,10 @@ MUTANTS = {
     "s_x_squared_twice_kernel": (F + "gm_ode_triton.py", "        v = sx * sx\n", "        v = (sx * sx) * (sx * sx)\n"),
     "s_x_squared_twice_spread": (F + "gm_spread.py", "logstd = torch.log(s_x) - ", "logstd = torch.log(s_x * s_x) - "),
     "kernel_substep_time_off_by_one": (F + "gm_ode_triton.py", "s = tl.load(sig_ptr + j).to(tl.float32)", "s = tl.load(sig_ptr + j - 1).to(tl.float32)"),
+    # docs/gmflow.md section 10: the merge's guards
+    "bound_guard_off": (F + "gm_spread.py", "            if s_x > bound:\n", "            if s_x > 2 * bound:\n"),
+    "table_ckpt_unchecked": (F + "gm_spread.py", "    if not m or int(m.group(1)) != int(step):\n", "    if not m:\n"),
+    "fused_grid_off_by_one": (F + "sampling_gmflow.py", "torch.tensor([j / n for j in range(n + 1)]", "torch.tensor([(j + 1) / (n + 1) for j in range(n + 1)]"),
 }
 
 
