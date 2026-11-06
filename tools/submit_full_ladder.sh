@@ -21,14 +21,15 @@ CACHE=$1 DRY=${2:-}
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }
 [ -z "$(git -C $EV status --porcelain --untracked-files=no)" ] || { echo "$EV has local changes"; exit 2; }
 # size d nb nt C0-steps max-multiple hours-per-C0-on-8-H100 forward-GFLOP-per-image
+# Hours per C0: the Lite ladder runs w1015-w1035 up to d1280; d1536 and d1792 from smoke w1313 (median step 136.5 and
+# 193.0 ms, 8 last.ckpt saves per C0 at 36.6 and 57.8 s each, about 6 min of start-up per C0).
 SIZES="d640 640 9 2 534400 1 4.85 34.7
 d768 768 10 2 340000 2 3.37 54.6
 d896 896 11 2 230400 4 2.97 80.7
 d1024 1024 12 3 160800 8 2.62 115.6
 d1280 1280 14 3 89600 8 2.36 207.5
-d1536 1536 16 4 54400 8 H1536 341.6
-d1792 1792 18 4 36000 8 H1792 518.3"
-if grep -q -E "H1536|H1792" <<< "$SIZES"; then echo "fill in the measured hours per C0 of d1536 and d1792 (smoke w1313)"; [ -n "$DRY" ] || exit 2; SIZES=${SIZES//H1536/2.36}; SIZES=${SIZES//H1792/2.36}; fi
+d1536 1536 16 4 54400 8 2.25 341.6
+d1792 1792 18 4 36000 8 2.15 518.3"
 hm() { awk -v h="$1" 'BEGIN { q = int(h * 4 + 0.999); printf "%02d:%02d:00", int(q / 4), (q % 4) * 15 }'; }   # hours, up to the next quarter
 calc() { awk "BEGIN { printf \"%.3f\", $1 }"; }
 submit() {   # submit <dir> <wq submit arguments...>: prints the new job id
