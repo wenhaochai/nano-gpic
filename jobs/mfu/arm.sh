@@ -4,7 +4,8 @@
 # shard seed) with the step timer (src/callbacks/bench.py) and without checkpoints or W&B. Sourced env: jobs/env.sh.
 # usage: arm.sh <out dir> <tag> <d> <nb> <nt> <steps> [main.py arguments...]
 #   env: MFU_WT (code worktree, default this script's worktree), BENCH_PROFILE / BENCH_STAGES (bench.py), MFU_LIMIT (s,
-#   MFU_STRATEGY (a trainer.strategy JSON, e.g. FSDP2's ModelParallelStrategy for GPIC_MFU_FSDP=1),
+#   MFU_STRATEGY (a trainer.strategy JSON, e.g. FSDP2's ModelParallelStrategy for GPIC_MFU_FSDP=1), MFU_SAVE_EVERY (last.ckpt
+#   every N steps), MFU_RESUME (a checkpoint to resume from), MFU_KEEP_CKPT (keep the arm's checkpoints),
 #   default 1200), anything else the arm changes (NCCL_*, GPIC_* switches), set by the caller.
 set -o pipefail
 OUT=$1 TAG=$2 D=$3 NB=$4 NT=$5 STEPS=$6; shift 6
@@ -17,6 +18,7 @@ if [ -n "${MFU_SAVE_EVERY:-}" ]; then   # save tests: last.ckpt every MFU_SAVE_E
   CB='[{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"resume-{step:06d}","monitor":null,"save_last":true,"save_top_k":0,"every_n_train_steps":'$MFU_SAVE_EVERY'}},'${CB:1}
   CKPT_ARGS=()
 fi
+[ -n "${MFU_RESUME:-}" ] && CKPT_ARGS+=(--ckpt_path "$MFU_RESUME")   # resume tests: a last.ckpt to continue from
 # MFU lever F: checkpoint writes in a separate process (src/plugins/async_ckpt_io.py)
 [ "${GPIC_MFU_ASYNC_CKPT:-}" = 1 ] && CKPT_ARGS+=(--trainer.plugins+='{"class_path":"src.plugins.async_ckpt_io.AsyncShmCheckpointIO"}')
 cd $WT/baselines/PixelGen
@@ -32,6 +34,6 @@ timeout -k 60 ${MFU_LIMIT:-1200} python main.py fit --config configs_h100/lite_l
   "${CKPT_ARGS[@]}" --tags.exp mfu_$TAG --trainer.logger.init_args.name mfu_$TAG \
   ${MFU_STRATEGY:+--trainer.strategy "$MFU_STRATEGY"} "$@" > $OUT/$TAG/train.log 2>&1
 rc=$?
-rm -f $OUT/$TAG/exp_mfu_$TAG/*.ckpt $OUT/$TAG/*.ckpt
+[ -n "${MFU_KEEP_CKPT:-}" ] || rm -f $OUT/$TAG/exp_mfu_$TAG/*.ckpt $OUT/$TAG/*.ckpt
 echo "$(date -u +%FT%TZ) tag=$TAG rc=$rc" >> $OUT/arms.txt
 exit $rc
