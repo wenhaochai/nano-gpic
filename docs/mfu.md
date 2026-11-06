@@ -51,7 +51,27 @@ ms alone (334 GB/s), so the all-reduce and the backward kernels slow each other.
   2026-11-06). Alternatives measured in w1316: cuDNN with the mask (backward 30-50% faster than the current kernel under
   torch 2.7.1; torch 2.15 picks cuDNN by default and is 30-50% faster again), FlexAttention (1-2 TFLOP/s here: dropped).
 - Expectation: attention 3-4x faster; d1280 about -6 ms per step.
-- Result: probe2 (w1317), pending.
+- Result (w1321, step_bench on one GPU, SDPA / FA3 / SDPA on the same GPU, mean step):
+
+| width | SDPA | FA3 | change | MFU (one GPU) |
+|---|---|---|---|---|
+| d640 | 19.75 ms | 17.54 | -11.2% | 17.1 -> 19.2% |
+| d768 | 25.41 | 22.32 | -12.2% | 20.9 -> 23.7% |
+| d896 | 34.18 | 30.17 | -11.7% | 23.0 -> 26.0% |
+| d1024 | 43.55 | 38.61 | -11.3% | 25.8 -> 29.1% |
+| d1280 | 70.68 | 63.74 | -9.8% | 28.5 -> 31.6% |
+| d1536 | 107.35 | 97.50 | -9.2% | 30.9 -> 34.0% |
+| d1792 | 154.82 | 142.01 | -8.3% | 32.5 -> 35.4% |
+
+  The gain is larger than the attention kernels alone (FA3 also removes the permutes, copies and the cat around SDPA).
+  Kernel speed at d1280 (H 20, T 56): FA3 forward 88 TFLOP/s and backward 81 against SDPA's 63 and 60; in the text
+  blocks (T ~ 50 keys) SDPA is faster (0.23 vs 0.45 ms forward + backward), so the text blocks keep SDPA
+  (GPIC_MFU_TEXT_ATTN=sdpa, the default from commit after w1321; w1321 ran FA3 in them).
+- Correctness: tools/mfu/fa3_check.py (forward and backward against fp32, eager and compiled with a dynamic T, padded
+  keys get exactly zero gradient); whole-model parity (tools/mfu/test_attn_parity.py, 4 configurations): FA3's error
+  against fp32 equals SDPA's (ratio 0.97-1.01); 300 steps at d640 with the same batches: loss differs from the fp32-math
+  run by 1.8e-6 (SDPA: 2.5e-6), and two FA3 runs differ from each other by 2.1e-6 (FA3's backward is not deterministic).
+- Decision: keep. Reaches the full ladder only through the genmodel session (production path test: probe5).
 
 ### Where the 8-GPU step loses against one GPU (w1316, step_bench, synthetic batches, no data path)
 
@@ -68,7 +88,18 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   captions, and host work (8-GPU production vs one GPU); the optimizer and EMA cost 11 ms (d1280) and 28 + 7 ms (d1792).
   Sharding the optimizer and the EMA over the 8 ranks (reduce-scatter in DDP's buckets, AdamW and EMA on each rank's shard,
   all-gather of the updated parameters) divides their work by 8 with the same math.
-- Pending: the DDP arms of w1316 (own T per rank vs one T for all ranks) split communication from rank imbalance.
+- Setup: step_bench --fsdp (per-block fully_shard, bf16 compute params, fp32 reduce-scatter, RMSNorm weights and
+  pos_embed replicated in fp32, fused AdamW and EMA on the shards); production path behind GPIC_MFU_FSDP=1
+  (src/utils/fsdp_setup.py, ModelParallelStrategy via MFU_STRATEGY in jobs/mfu/arm.sh).
+- Result (w1320, 8 GPUs, synthetic batches, own T per rank, SDPA attention, mean step):
+
+| width | DDP (production) | DDP + AVG hook | DDP, 250 MiB buckets | FSDP2 | change | peak memory |
+|---|---|---|---|---|---|---|
+| d1280 | 87.99, 88.02 ms | 88.22 | 87.77 | 78.77 | -10.5% | 24.6 -> 15.9 GiB |
+| d1792 | 186.49 | 187.57 | - | 157.93 | -15.3% | 52.9 -> 31.1 GiB |
+
+  The AVG hook (no per-parameter divide kernels) and smaller buckets give nothing; FSDP2 does.
+- Correctness: pending (loss parity against DDP, production path).
 
 ### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
 - Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches

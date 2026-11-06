@@ -15,6 +15,9 @@ from src.models.layers.rmsnorm import RMSNorm as Norm
 # MFU lever A (docs/mfu.md): GPIC_MFU_ATTN=fa3 runs the masked attention with FlashAttention-3 and per-sample key counts
 # (src/models/layers/fa3_op.py) instead of SDPA with a boolean mask; the same attention, in FA's [B, S, H, D] layout.
 _ATTN = os.environ.get("GPIC_MFU_ATTN", "sdpa")
+# the text blocks' attention (T ~ 50 keys): SDPA's memory-efficient kernel beats FA3 there (w1321: 0.23 vs 0.45 ms forward
+# + backward at d1280); GPIC_MFU_TEXT_ATTN=fa3 keeps FA3 in them as well
+_TEXT_ATTN = os.environ.get("GPIC_MFU_TEXT_ATTN", "sdpa")
 if _ATTN == "fa3":
     from src.models.layers.fa3_op import fa3_attention, fa3_varlen
 
@@ -182,13 +185,24 @@ class TextRefineAttention(nn.Module):
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         if isinstance(mask, dict):   # lever E: packed captions, x [S, C]
             S, C = x.shape
-            q, k, v = self.qkv(x).view(S, 3, self.num_heads, C // self.num_heads).unbind(1)
-            o = fa3_varlen(self.q_norm(q), self.k_norm(k), v, mask["cu"], mask["cu"], mask["max_T"], mask["max_T"])
+            H, Hc = self.num_heads, C // self.num_heads
+            q, k, v = self.qkv(x).view(S, 3, H, Hc).unbind(1)
+            q, k = self.q_norm(q), self.k_norm(k)
+            if _TEXT_ATTN == "fa3":
+                o = fa3_varlen(q, k, v, mask["cu"], mask["cu"], mask["max_T"], mask["max_T"])
+            else:   # SDPA on the padded layout (faster than FA3 at T ~ 50, w1321); padded queries are dropped again
+                B, Tp = mask["lens"].shape[0], mask["Tp"]
+                pad = lambda t: t.new_zeros(B * Tp, H, Hc).index_copy(0, mask["pidx"], t).view(B, Tp, H, Hc).transpose(1, 2)
+                km = (torch.arange(Tp, device=x.device)[None] < mask["lens"][:, None])[:, None, None, :]
+                o = attention(pad(q), pad(k), pad(v), attn_mask=km).transpose(1, 2).reshape(B * Tp, H, Hc)
+                o = o.index_select(0, mask["pidx"])
             return self.proj_drop(self.proj(o.reshape(S, C)))
         B, N, C = x.shape
-        if mask is not None and mask.dtype == torch.int32:   # lever A: mask = caption length per sample
+        if mask is not None and mask.dtype == torch.int32 and _TEXT_ATTN == "fa3":   # lever A: caption length per sample
             q, k, v = self.qkv(x).view(B, N, 3, self.num_heads, C // self.num_heads).unbind(2)
             return self.proj_drop(self.proj(fa3_attention(self.q_norm(q), self.k_norm(k), v, mask).reshape(B, N, C)))
+        if mask is not None and mask.dtype == torch.int32:   # lever A with SDPA in the text blocks: lengths -> key mask
+            mask = (torch.arange(N, device=x.device)[None] < mask[:, None])[:, None, None, :]
         qkv_x = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv_x[0], qkv_x[1], qkv_x[2]
         q = self.q_norm(q)

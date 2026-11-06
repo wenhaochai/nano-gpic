@@ -18,6 +18,10 @@ global train_transform, val_transform
 _train_crop = random_crop_arr_region if os.environ.get("GPIC_REGION_CROP") == "1" else random_crop_arr   # docs/text_cache.md; jobs/train_ladder.sh sets it
 _UINT8 = os.environ.get("GPIC_MFU_UINT8") == "1"   # MFU lever D: grouped training batches carry uint8 HWC images
 _PACK = os.environ.get("GPIC_MFU_PACK") == "1"     # MFU lever E: packed captions (src/utils/rebalance.py)
+# MFU lever C: the region crop's two resize passes run on the GPU, bit for bit Pillow's (pil_exact.py, pil_exact_gpu.py);
+# the workers decode, draw the crop and compute the coefficient tables. Needs the region crop (GPIC_REGION_CROP=1).
+_GPU_RESIZE = os.environ.get("GPIC_MFU_GPU_RESIZE") == "1"
+assert not _GPU_RESIZE or os.environ.get("GPIC_REGION_CROP") == "1", "GPIC_MFU_GPU_RESIZE needs GPIC_REGION_CROP=1"
 train_transform = T.Compose([
     T.Lambda(lambda pil_image: _train_crop(pil_image, 256)),
     T.ToTensor(),
@@ -296,10 +300,15 @@ class GPICWebDataset(IterableDataset):
 
     def _crop_uint8(self, sample):
         """Decode (wds's own handler, so the same pixels as wds.decode("pil")) and the transform's first step, the random
-        crop, as a uint8 array."""
+        crop, as a uint8 array; with lever C the crop's plan (source rows, two passes) for the GPU instead."""
         for k in IMAGE_SUFFIXES:
             if k in sample:
-                return np.asarray(self._pre(_DECODE_PIL(k, sample[k]).convert("RGB")), dtype=np.uint8)
+                img = _DECODE_PIL(k, sample[k]).convert("RGB")
+                if _GPU_RESIZE:
+                    from .pil_exact import plan_region_crop
+                    src, passes = plan_region_crop(img, 256)
+                    return np.ascontiguousarray(src), passes
+                return np.asarray(self._pre(img), dtype=np.uint8)
         raise ValueError("no image")
 
     def _tokenize(self, sample):
@@ -368,7 +377,10 @@ class GPICWebDataset(IterableDataset):
         try:
             # MFU lever D (docs/mfu.md): GPIC_MFU_UINT8=1 keeps the crop as uint8 HWC; the training step maps it to the same
             # float32 values the transform's ToTensor + Normalize give (uint8_to_float: a table made by those transforms)
-            img = torch.from_numpy(self._crop_uint8(s)) if _UINT8 else self._post(self._crop_uint8(s))
+            if _GPU_RESIZE:
+                img = self._crop_uint8(s)   # (src, passes): pil_exact_gpu.pack in the collate
+            else:
+                img = torch.from_numpy(self._crop_uint8(s)) if _UINT8 else self._post(self._crop_uint8(s))
             out = (img, s["caption"], {"caption_type": s["caption_type"], **text})
         except Exception as exn:
             self._repeats += 1
@@ -380,7 +392,11 @@ class GPICWebDataset(IterableDataset):
         return out
 
     def _collate_cached(self, samples):
-        imgs = torch.stack([s[0] for s in samples])
+        if _GPU_RESIZE:   # MFU lever C: one packed resize job for the batch
+            from .pil_exact_gpu import pack
+            imgs = pack([s[0] for s in samples])
+        else:
+            imgs = torch.stack([s[0] for s in samples])
         lens = [s[2]["text_len"] for s in samples]
         if _PACK:   # MFU lever E: the real caption tokens back to back, [sum(lens), EMB_DIM]; no mask, no padding
             emb = torch.empty((sum(lens), EMB_DIM), dtype=torch.bfloat16)
