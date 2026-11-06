@@ -90,6 +90,16 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   crops (tools/mfu/tests/test_uint8_path.py). Saves the workers' ToTensor + Normalize (0.56 ms of 7.3 ms CPU per image on
   vis1) and 3/4 of the collate, pin and copy bytes. Matters only where the CPUs bind (d640, d768).
 
+### F. Checkpoint writes in a separate process (`GPIC_MFU_ASYNC_CKPT=1`)
+- Hypothesis: Lightning writes on rank 0 while every rank waits at the barrier: 57.8 s per last.ckpt at d1792, 36.6 s
+  at d1536, 8 saves per C0, so about 6% and 4% of those runs' hours (the "saves included" MFU).
+- Setup: `src/plugins/async_ckpt_io.py`: rank 0 copies the tensors into a shared, page-locked buffer (a few seconds), a
+  writer process rebuilds and torch.saves the same dict, renames the file into place, and sets its mtime to the snapshot
+  time (train_ladder.sh filters the shard logs by it). Two buffers (the ms checkpoint and last.ckpt of one step); teardown
+  waits for every write. Same files, no math.
+- Test: tools/mfu/tests/test_async_ckpt.py (CPU): three saves, tensors changed right after each save call; every file
+  loads to exactly the saved state; mtime = snapshot time; no temporary file left. GPU timing: pending.
+
 ### C. Data path at the small widths (planned)
 - d640 is bound by the node's CPUs (7.3 ms of worker CPU per image on vis1: decode 2.79, crop and resize 2.25, ToTensor
   0.35, Normalize 0.21, collate 0.25). Same-math candidates: uint8 batches normalized on the GPU (the same float32 ops);
