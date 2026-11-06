@@ -11,10 +11,11 @@
 # jobs/train_ladder.sh (jobs/mfu/arm.sh), 8 GPUs, 300 steps per arm, no checkpoints. Arms per width, on one node:
 # production; A (FA3); A + B (FSDP2, ModelParallelStrategy); A + B + E (packed captions rebalanced over the ranks);
 # A + B + C + D + E (and the crops' resize on the GPU, uint8 batches); production again.
-# usage: probe5.sh <code worktree> <width tag> (d640 | d1024 | d1280 | d1792)
+# usage: probe5.sh <code worktree> <width tag> (d640 | d1024 | d1280 | d1792) [profile]   (profile: one more arm, A + B + E
+#   with torch.profiler over steps 150-154)
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-WT=${1:?code worktree} SZ=${2:?size}
+WT=${1:?code worktree} SZ=${2:?size} PROBE5_PROFILE=${3:-}
 case $SZ in d640) A=(640 9 2) ;; d1024) A=(1024 12 3) ;; d1280) A=(1280 14 3) ;; d1792) A=(1792 18 4) ;; *) echo "size?"; exit 2 ;; esac
 OUT=$WC/runs/gpic-speed/mfu/probe5b_${SZ}_$(date +%m%d_%H%M)
 mkdir -p $OUT
@@ -32,5 +33,8 @@ GPIC_MFU_ATTN=fa3 GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP arm AB ${A[@]} 300
 GPIC_MFU_ATTN=fa3 GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1 arm ABE ${A[@]} 300
 GPIC_MFU_ATTN=fa3 GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1 GPIC_MFU_UINT8=1 GPIC_MFU_GPU_RESIZE=1 arm ABCDE ${A[@]} 300
 arm base2 ${A[@]} 300
+if [ -n "${PROBE5_PROFILE:-}" ]; then   # where the time goes with A + B + E: kernel table for the next levers
+  GPIC_MFU_ATTN=fa3 GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1 BENCH_PROFILE=150:155 BENCH_STAGES=1 arm ABE_prof ${A[@]} 200
+fi
 python $WT/tools/mfu/bench_summary.py $OUT/base1 $OUT/A $OUT/AB $OUT/ABE $OUT/ABCDE $OUT/base2 --skip 50 | tee $OUT/summary.txt
 echo "DONE $OUT"
