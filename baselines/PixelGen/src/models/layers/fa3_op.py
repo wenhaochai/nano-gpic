@@ -41,9 +41,11 @@ def fa3_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seqused_k: torch.
     B, Sq, H, D = q.shape
     Sk = k.shape[1]
     out, lse, *_ = _lib()._flash_attn_forward(
-        q.reshape(B * Sq, H, D), k.reshape(B * Sk, H, D), v.reshape(B * Sk, H, D), None, None, None, None,
-        _cu(B, Sq, q.device), _cu(B, Sk, q.device), None, None, seqused_k, Sq, Sk, None, None, None, None, None, None,
-        None, None, None, None, softmax_scale, False)
+        q.reshape(B * Sq, H, D), k.reshape(B * Sk, H, D), v.reshape(B * Sk, H, D), k_new=None, v_new=None, qv=None,
+        out=None, cu_seqlens_q=_cu(B, Sq, q.device), cu_seqlens_k=_cu(B, Sk, q.device), cu_seqlens_k_new=None,
+        seqused_q=None, seqused_k=seqused_k, max_seqlen_q=Sq, max_seqlen_k=Sk, page_table=None, kv_batch_idx=None,
+        leftpad_k=None, rotary_cos=None, rotary_sin=None, seqlens_rotary=None, q_descale=None, k_descale=None,
+        v_descale=None, softmax_scale=softmax_scale, causal=False)
     return out.view(B, Sq, H, D), lse
 
 
@@ -63,8 +65,9 @@ def fa3_bwd(dout: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tenso
     dv = torch.zeros((B * Sk, H, D), dtype=v.dtype, device=v.device)
     _lib()._flash_attn_backward(
         dout.reshape(B * Sq, H, D), q.reshape(B * Sq, H, D), k.reshape(B * Sk, H, D), v.reshape(B * Sk, H, D),
-        out.reshape(B * Sq, H, D), lse, _cu(B, Sq, q.device), _cu(B, Sk, q.device), None, seqused_k, Sq, Sk,
-        dq, dk, dv, softmax_scale, False)
+        out.reshape(B * Sq, H, D), lse, cu_seqlens_q=_cu(B, Sq, q.device), cu_seqlens_k=_cu(B, Sk, q.device),
+        sequed_q=None, sequed_k=seqused_k, max_seqlen_q=Sq, max_seqlen_k=Sk, dq=dq, dk=dk, dv=dv,
+        softmax_scale=softmax_scale, causal=False)
     return dq.view(B, Sq, H, D), dk.view(B, Sk, H, D), dv.view(B, Sk, H, D)
 
 
