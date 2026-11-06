@@ -122,6 +122,11 @@ class LightningModel(pl.LightningModule):
             torch._inductor.config.aggressive_fusion = True
         if os.environ.get("GPIC_PROF_NO_DDP_SPLIT") == "1":
             torch._dynamo.config.optimize_ddp = False
+        if os.environ.get("GPIC_MFU_PERBLOCK_COMPILE") == "1":   # tests only (MFU lever B parity): DDP with FSDP2's compile units
+            for blk in list(self.denoiser.text_refine_blocks) + list(self.denoiser.blocks):
+                blk.compile()
+            print("per-block compile (DDP)", flush=True)
+            return
         self.denoiser.compile(**({"mode": os.environ["GPIC_PROF_DEN_COMPILE_MODE"]} if "GPIC_PROF_DEN_COMPILE_MODE" in os.environ else {}))
         self.ema_denoiser.compile()
         print("Model compilation done.")

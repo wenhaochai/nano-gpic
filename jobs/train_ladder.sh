@@ -81,7 +81,9 @@ export TORCHINDUCTOR_CPP_WRAPPER=1   # kernels launched from C++: d640 39.3 -> 3
 # resize on the GPU, bit for bit Pillow's. D: uint8 batches, mapped to the transform's floats on the GPU. E: packed captions,
 # the samples of each step dealt over the ranks by caption length. F: checkpoint writes in a separate process.
 export GPIC_MFU_ATTN=${GPIC_MFU_ATTN:-fa3}
-export GPIC_MFU_FSDP=${GPIC_MFU_FSDP:-1}
+# B helps where the step is GPU-bound and hurts where the host binds it (production path, 8 GPUs, w1389/w1390: d1280 76.0 ->
+# 64.9 ms with C + D; d640 26.6 -> 43.9 ms): on from d1280 by default (d1024: measured in w139x)
+export GPIC_MFU_FSDP=${GPIC_MFU_FSDP:-$([ $D -ge 1280 ] && echo 1 || echo 0)}
 export GPIC_MFU_GPU_RESIZE=${GPIC_MFU_GPU_RESIZE:-1} GPIC_MFU_UINT8=${GPIC_MFU_UINT8:-1}
 export GPIC_MFU_PACK=${GPIC_MFU_PACK:-0} GPIC_MFU_REBALANCE=${GPIC_MFU_REBALANCE:-0}   # E: off until its slowdown is fixed (docs/mfu.md)
 GPIC_MFU_ASYNC_CKPT=${GPIC_MFU_ASYNC_CKPT:-1}
