@@ -48,8 +48,10 @@ Mean step over 1024-1216 steps (jobs/mfu/v1_parity.sh, probe11, widths.sh; mean 
 | width | levers off | A | A + C + D | A + B + C + D | A + C + D + E | job |
 |---|---|---|---|---|---|---|
 | d640 | 26.33 / 26.36 ms (12.8%) | 26.56 | 24.36 (13.8%) | 43.89 | 27.23 | w1389, w1394 |
-| d1024 | 52.14 (21.5%) | 47.65 (23.5%) | 48.20 | 54.87 | - | w1394 |
-| d1280 | 83.18 (24.2%) | 76.02 (26.5%) | - | 64.86 (31.0%) | - | w1390 |
+| d768 | 31.61 (16.8%) | - | 29.09 (18.2%) | 46.90 | - | w1396 |
+| d896 | 41.58 (18.8%) | - | 37.75 (20.7%) | 50.09 | - | w1396 |
+| d1024 | 52.14 (21.5%) | 47.65 (23.5%) | 48.20 (23.3%) | 54.87 | - | w1394 |
+| d1280 | 83.18 / 83.37 (24.2%) | 76.02 (26.5%) | - | 64.86 / 64.98 (31.0%) | 67.04 (A+B+C+D+E) | w1390, w1397 |
 | d1536 | (136.5 median, 5cd3372 smoke w1322) | | | 102.9 median (A+B+C+D+F, smoke w1391) | | |
 | d1792 | (193.0 median, w1322) | | | 145.2 median (w1391) | | |
 
@@ -58,6 +60,23 @@ Mean step over 1024-1216 steps (jobs/mfu/v1_parity.sh, probe11, widths.sh; mean 
 - C + D pay where the data path's CPUs bind (d640: -7.6%); E costs more than it saves at d640 even with bucketed rows
   (its per-step gloo plan and two all_to_all calls add host work to a host-bound step). E stays off by default.
 - Saves (lever F, w1391): a save step adds up to 15.3 s at d1536 and 21.9 s at d1792 (36.6 s and 57.8 s before).
+
+Full ladder (ladder_full_run: C0 steps 534400 ... 36000, the same FLOPs per C0 at every width; trained to 1, 2, 4, 8, 8, 8,
+8 x C0 from d640 to d1792), GPU-h-weighted MFU (total FLOPs / total time): levers off 22.3%, head defaults 26.8% (d1536
+and d1792 from the smoke medians). GPU-h shares at the head: d640 5%, d768 8%, d896 13%, d1024 24%, d1280 18%, d1536 17%,
+d1792 16%; d1024 is the largest share and the one with the most left (A+C+D 48.2 ms against 38.6 ms on one GPU).
+
+B's checks besides the loss (2026-11-06): the EMA (tools/mfu/check_ema.py; on the tensors whose initial value is fixed,
+the EMA's share of the denoiser's travel f and cos(ema - init, den - init)) at step 1600: f 0.0961 / 0.0967 / 0.0964, cos
+0.9506 / 0.9504 / 0.9496 for 5cd3372's smoke, the head with DDP, the head with FSDP2 after a resume at step 600; at step
+4800 f 0.2342 / 0.2353 / 0.2340. The FSDP2 last.ckpt holds Adam step 4800 for all 143 parameters (resumed at 600), the
+same hyperparameters, exp_avg_sq per tensor between those of two DDP runs. A last.ckpt does not resume across strategies
+(2 param groups under FSDP2, 3 under DDP). The real evaluation path (gmflow_run4 eval_gmflow.sh) loads the FSDP2 ms
+checkpoint and samples; its sample check (std > 5) fails on any 1600-step checkpoint: the EMA there is ~90% initial weights.
+Early per-step loss differences against levers off: every B arm 0 at steps 0-1, 2e-8 at step 2, 1e-6 at step 10, 2e-5 at
+step 40, the same profile as DDP with FSDP2's per-block compile units (d640: 1e-8, 9e-7, 1e-5); A + C + D about 1e-8 over
+the first 100 steps (d640: identical up to step 60). A math difference (gradient scale, unsynced replicated weights)
+would show at steps 1-2.
 
 Parity (the per-step global loss, mean of the 8 ranks): every arm, the levers-off repeat included, diverges from the
 reference chaotically, from about 1e-8 at step 100 to about 1% by step 1000; what differs is the onset. A (FA3) and the
