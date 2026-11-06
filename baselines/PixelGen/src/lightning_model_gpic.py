@@ -203,6 +203,8 @@ class LightningModel(pl.LightningModule):
         print(f"[rank {self.trainer.global_rank}] on_train_start done")
 
     def on_load_checkpoint(self, checkpoint):
+        if "state_dict" not in checkpoint:   # MFU lever B: ModelParallelStrategy loaded the model itself and took the key (smoke w1395)
+            return
         keys_to_check = [
             "denoiser.pos_embed", 
             "ema_denoiser.pos_embed"
