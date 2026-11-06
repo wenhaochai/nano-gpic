@@ -11,16 +11,22 @@
 # prompt's own noise, EMA, no CFG. Finished tasks are skipped, so a rerun does only the rest.
 # K = 0 evaluates a point model. --link <run dir> links that run's ms checkpoints into <root>/exp_ladder_<size>, so nothing is written in its directory (the ladder's
 # own evaluations use one noise for all prompts, so the ladder's checkpoints are evaluated again here).
-# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] <step:sampler:calls> ...
-# Code: the frozen worktree gpic-wt/gmflow_run2; every evaluation checks that it still holds the commit of the start.
+# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] [--wt <worktree>] [--spread pixel] <step:sampler:calls> ...
+# --spread pixel: the run has the per-pixel spread (docs/gmflow.md section 7; eval_gmflow.sh EVAL_SPREAD); default image.
+# Code: the frozen worktree gpic-wt/gmflow_run2, or gpic-wt/<worktree> with --wt (the per-pixel spread and gm_sde2 / gm_ode2 need a commit that has them; a wq job
+# cannot take it from the environment); every evaluation checks that it still holds the commit of the start.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-[ $# -ge 7 ] || { echo "usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <dir>] <tasks...>"; exit 2; }
+[ $# -ge 7 ] || { echo "usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <dir>] [--wt <worktree>] [--spread pixel] <tasks...>"; exit 2; }
 K=$1 SIZE=$2 WD=$3 NB=$4 NT=$5 ROOT=$6; shift 6
 LINK=""
 if [ "$1" = "--link" ]; then LINK=$2; shift 2; [ -d "$LINK" ] || { echo "no run directory $LINK"; exit 2; }; fi
+WTN=gmflow_run2
+if [ "$1" = "--wt" ]; then WTN=$2; shift 2; fi
+SPREAD=image
+if [ "$1" = "--spread" ]; then SPREAD=$2; shift 2; case $SPREAD in image|pixel) ;; *) echo "--spread must be image or pixel"; exit 2 ;; esac; fi
 [ $# -ge 1 ] || { echo "no tasks"; exit 2; }
-WT=$WC/project/gpic-wt/gmflow_run2
+WT=$WC/project/gpic-wt/$WTN
 [ -f "$WT/baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py" ] || { echo "$WT holds old code"; exit 2; }
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }
 SHA=$(git -C $WT rev-parse HEAD)
@@ -35,7 +41,7 @@ for t in "$@"; do
   fi
 done
 [ -f $ROOT/commit.txt ] || echo $SHA > $ROOT/commit.txt
-export GMFLOW_WT=$WT LADDER_RUN_ROOT=$ROOT EVAL_SIZE=$SIZE EVAL_D=$WD EVAL_NB=$NB EVAL_NT=$NT
+export GMFLOW_WT=$WT LADDER_RUN_ROOT=$ROOT EVAL_SIZE=$SIZE EVAL_D=$WD EVAL_NB=$NB EVAL_NT=$NT EVAL_SPREAD=$SPREAD
 fail=0
 for t in "$@"; do
   STEP=${t%%:*} rest=${t#*:}; S=${rest%%:*} C=${rest#*:}

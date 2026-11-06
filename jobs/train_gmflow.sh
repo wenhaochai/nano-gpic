@@ -14,37 +14,53 @@
 # data: ladder = train_ladder.sh's defaults (shard order per launch, the region crop), as the ladder's point models; w1147 = the fixed shard seed and the official
 # crop of w1147, w1173 and w1174 (the C0/8 comparison).
 # Optional evaluation tasks after the training (<step>:<sampler>:<calls>, jobs/evals_gmflow.sh); long runs evaluate in separate jobs.
-# usage: train_gmflow.sh <K> <size> <d> <nb> <nt> <steps> <tag> <data: ladder | w1147> [step:sampler:calls ...]
+# usage: train_gmflow.sh <K> <size> <d> <nb> <nt> <steps> <tag> <data: ladder | w1147> [--wt <worktree>] [--spread pixel] [step:sampler:calls ...]
+# --spread pixel: train with gm_spread pixel (a per-pixel offset on log s_u, docs/gmflow.md section 7) and evaluate with it; default image. The run records its spread
+# and refuses another. --wt: the frozen worktree gpic-wt/<worktree> instead of gpic-wt/gmflow_run2 (the per-pixel spread needs a commit that has it).
 # Output: runs/gpic-speed/gmflow_k<K>_<size>_<tag>/exp_ladder_<size>; W&B gmflow-k<K>-<size>-<tag>. Code: the frozen worktree gpic-wt/gmflow_run2; the run records its
 # commit and refuses a worktree that moved.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-[ $# -ge 8 ] || { echo "usage: train_gmflow.sh <K> <size> <d> <nb> <nt> <steps> <tag> <ladder | w1147> [tasks...]"; exit 2; }
+[ $# -ge 8 ] || { echo "usage: train_gmflow.sh <K> <size> <d> <nb> <nt> <steps> <tag> <ladder | w1147> [--wt <worktree>] [--spread pixel] [tasks...]"; exit 2; }
 K=$1 SIZE=$2 WD=$3 NB=$4 NT=$5 STEPS=$6 TAG=$7 DATA=$8; shift 8
+WTN=gmflow_run2
+if [ "$1" = "--wt" ]; then WTN=$2; shift 2; fi
+SPREAD=image
+if [ "$1" = "--spread" ]; then SPREAD=$2; shift 2; case $SPREAD in image|pixel) ;; *) echo "--spread must be image or pixel"; exit 2 ;; esac; fi
 case $DATA in
   ladder) ;;
   w1147) export GPIC_SHARD_SEED=1730000000 GPIC_REGION_CROP=0 ;;
   *) echo "data must be ladder or w1147"; exit 2 ;;
 esac
 [ $((STEPS % 128)) -eq 0 ] || { echo "steps must be a multiple of 128"; exit 2; }
-WT=$WC/project/gpic-wt/gmflow_run2
+WT=$WC/project/gpic-wt/$WTN
 [ -d "$WT/baselines/PixelGen" ] || { echo "no worktree $WT"; exit 2; }
 grep -q "lam: 0.5" $WT/baselines/PixelGen/configs_h100/gmflow_train.yaml || { echo "$WT holds old code"; exit 2; }
+SPREAD_ARGS=()
+if [ $SPREAD = pixel ]; then
+  grep -q "gm_spread" $WT/baselines/PixelGen/src/models/transformer/JiT_T2I.py || { echo "$WT has no per-pixel spread"; exit 2; }
+  SPREAD_ARGS=(--model.denoiser.init_args.gm_spread pixel)
+fi
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }
 ROOT=$WC/runs/gpic-speed/gmflow_k${K}_${SIZE}_${TAG}
 mkdir -p $ROOT
 SHA=$(git -C $WT rev-parse HEAD)
 if [ -f $ROOT/commit.txt ] && [ "$(cat $ROOT/commit.txt)" != "$SHA" ]; then echo "$ROOT was started at $(cat $ROOT/commit.txt), the worktree holds $SHA"; exit 2; fi
 echo $SHA > $ROOT/commit.txt
+if [ ! -f $ROOT/spread.txt ]; then   # a run started before this option has a checkpoint and no spread.txt: it is image
+  if ls $ROOT/exp_ladder_$SIZE/last*.ckpt > /dev/null 2>&1; then echo image > $ROOT/spread.txt; else echo $SPREAD > $ROOT/spread.txt; fi
+fi
+[ "$(cat $ROOT/spread.txt)" = "$SPREAD" ] || { echo "$ROOT was started with spread $(cat $ROOT/spread.txt), not $SPREAD"; exit 2; }
 export LADDER_WT=$WT LADDER_RUN_ROOT=$ROOT GMFLOW_WT=$WT
 if ls $ROOT/exp_ladder_$SIZE/ms-step=$(printf %06d $STEPS)*.ckpt > /dev/null 2>&1; then
   echo "training done before"
 else
-  bash $WT/jobs/train_ladder.sh $SIZE $WD $NB $NT $STEPS --config configs_h100/gmflow_train.yaml --model.denoiser.init_args.gm_k $K \
+  bash $WT/jobs/train_ladder.sh $SIZE $WD $NB $NT $STEPS --config configs_h100/gmflow_train.yaml --model.denoiser.init_args.gm_k $K "${SPREAD_ARGS[@]}" \
     --trainer.logger.init_args.name gmflow_k${K}_${SIZE}_${TAG} --trainer.logger.init_args.id gmflow-k${K}-${SIZE}-${TAG} >> $ROOT/train.log 2>&1
   rc=$?
   echo "train rc=$rc launches=$(wc -l < $ROOT/exp_ladder_$SIZE/launches.txt 2>/dev/null)"
   [ $rc -eq 0 ] || exit $rc
 fi
 [ $# -eq 0 ] && exit 0
-bash $WT/jobs/evals_gmflow.sh $K $SIZE $WD $NB $NT $ROOT "$@"
+EV_OPTS=(); [ $WTN = gmflow_run2 ] || EV_OPTS+=(--wt $WTN); [ $SPREAD = image ] || EV_OPTS+=(--spread $SPREAD)
+bash $WT/jobs/evals_gmflow.sh $K $SIZE $WD $NB $NT $ROOT "${EV_OPTS[@]}" "$@"
