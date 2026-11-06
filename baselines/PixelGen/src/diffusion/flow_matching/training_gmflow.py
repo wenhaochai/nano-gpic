@@ -10,7 +10,7 @@ import os
 
 import torch
 
-from src.diffusion.flow_matching.gmflow import EPS, forward_transition, transition_nll
+from src.diffusion.flow_matching.gmflow import EPS, forward_transition, image_scope, transition_nll, transition_wins
 from src.diffusion.flow_matching.training_JiT import JiTTrainer, time_shift_fn
 
 SIGMA_BINS = (0.0, 0.25, 0.5, 0.75, 1.0 + 1e-6)
@@ -43,18 +43,35 @@ class GMFlowTrainer(JiTTrainer):
         gm = net(x_high, t_net, y, gm_mode="full") if y_mask is None else net(x_high, t_net, y, y_mask=y_mask, gm_mode="full")
         with torch.autocast(device_type=x.device.type, enabled=False):
             gm = {k: v.float() for k, v in gm.items()}
-            nll = transition_nll(gm, x_low, x_high, sigma_high, sigma_low)            # (B, H, W)
+            nll = transition_nll(gm, x_low, x_high, sigma_high, sigma_low)            # (B, H, W); (B, 1, 1) for one mixture per image (section 15)
             per_sample = self.weight_scale * nll.mean((1, 2))
             out = dict(loss=per_sample.mean(), loss_per_sample=per_sample.detach())
             if self.diag_now:
                 out.update(self.diagnostics(gm, sigma_high.view(-1)), **{"gm/nll": nll.detach().mean()})
+                if image_scope(gm):
+                    out.update(self.win_stats(gm, x_low, x_high, sigma_high, sigma_low))
         if self._print_every:
             self._calls += 1
             if self._calls % self._print_every == 0:
                 d = self.diagnostics(gm, sigma_high.view(-1))
                 pix = f" logsu_pix_mean {d['gm/logsu_pix_mean'].item():.4f} logsu_pix_std {d['gm/logsu_pix_std'].item():.4f}" if "gm/logsu_pix_std" in d else ""
+                if image_scope(gm):
+                    ws = self.win_stats(gm, x_low, x_high, sigma_high, sigma_low)
+                    pix += f" win_max {ws['gm/win_max'].item():.3f} win_alive {int(ws['gm/win_alive'].item())} w_dead {ws['gm/w_dead'].item():.4f}"
                 print(f"[gmflow] call {self._calls}: loss {out['loss'].item():.5f} s_u {d['gm/s_u'].item():.4f} n_eff {d['gm/n_eff'].item():.3f} max_w {d['gm/max_w'].item():.3f}{pix}", flush=True)
         return out
+
+    @staticmethod
+    @torch.no_grad()
+    def win_stats(gm, x_low, x_high, sigma_high, sigma_low):
+        """One mixture per image (section 15): in this batch (one rank's images), the largest share of images that one component wins (gets the gradient of its mean),
+        the number of components that win at least one image, and w_dead, the mean weight A on the components that win none: a component that never wins is never
+        trained, and its weight still sends draws to its untrained candidate (review_image_mix S1). n_eff and max_w do not show this. one_hot, not bincount: bincount
+        on CUDA syncs the host."""
+        wins = transition_wins(gm, x_low, x_high, sigma_high, sigma_low)
+        share = torch.nn.functional.one_hot(wins, gm["means"].shape[1]).float().mean(0)                  # (K,)
+        A = gm["logweights"].exp().flatten(1).mean(0)                                                     # (K,)
+        return {"gm/win_max": share.max(), "gm/win_alive": (share > 0).sum().float(), "gm/w_dead": (A * (share == 0)).sum()}
 
     @staticmethod
     @torch.no_grad()

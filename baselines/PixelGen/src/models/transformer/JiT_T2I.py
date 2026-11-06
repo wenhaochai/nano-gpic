@@ -330,6 +330,7 @@ class JiT_T2I(nn.Module):
             head_width=0,
             gm_k=0,
             gm_spread="image",
+            gm_scope="pixel",
     ):
         """xi_dim > 0 makes the model an implicit sampler of p(x | x_t, y) (docs/distribution_step.md): before block xi_block the batch
         forks into m copies, and each copy gets its own noise. xi_dim = 0 is the official point model, unchanged.
@@ -341,13 +342,18 @@ class JiT_T2I(nn.Module):
         gm_k = 0 is the official point model, unchanged.
         gm_spread (gm_k > 0 only, docs/gmflow.md section 7): "image" = one log s_u per sample, as GMFlow; "pixel" = that log s_u plus an offset per pixel from
         gm_spread_head, a zero-initialized Linear(hidden, p^2) per token on the detached input of the final linear. The offset is shared by the C channels and the
-        K components of a pixel. "image" is the model before this option, unchanged."""
+        K components of a pixel. "image" is the model before this option, unchanged.
+        gm_scope (gm_k > 0 only, docs/gmflow.md section 15, owner 2026-11-06): "pixel" = K weights per pixel, the model before this option, unchanged; "image" = one
+        mixture per image: the K per-pixel logits are averaged over the image before the softmax, so each image has one set of K weights (no new parameter), and
+        the K means are K whole candidate images. Needs gm_spread "image"."""
         super().__init__()
         assert not (head_width and xi_dim), "the energy head and the implicit fork are two different models"
         assert not (gm_k and (head_width or xi_dim or code_dim)), "the GMFlow head is a model of its own"
         assert gm_spread in ("image", "pixel") and (gm_spread == "image" or gm_k), (gm_spread, gm_k)
+        assert gm_scope in ("pixel", "image") and (gm_scope == "pixel" or (gm_k and gm_spread == "image")), (gm_scope, gm_k, gm_spread)
         self.gm_k = gm_k
         self.gm_spread = gm_spread
+        self.gm_scope = gm_scope
         self.head_width = head_width
         self.xi_dim, self.xi_block = xi_dim, xi_block
         self.code_dim, self.code_rate = code_dim, code_rate
@@ -527,7 +533,8 @@ class JiT_T2I(nn.Module):
         official unmasked path (y padded to txt_max_length). m: samples per input of the implicit sampler; the
         output is [B * m, C, H, W], each input's samples next to each other. z: plan A's code, [B, code_dim].
         gm_mode (gm_k > 0 only): "mean" returns the mixture mean sum_k A_k mu_k as the x prediction, so the point model's samplers run on it unchanged;
-        "full" returns dict(means (B, K, C, H, W), logweights (B, K, 1, H, W), log-softmax over K, fp32, logstd (B, 1, 1, 1, 1) = log s_u, fp32; (B, 1, 1, H, W) with gm_spread "pixel")."""
+        "full" returns dict(means (B, K, C, H, W), logweights (B, K, 1, H, W), log-softmax over K, fp32, logstd (B, 1, 1, 1, 1) = log s_u, fp32; (B, 1, 1, H, W) with gm_spread "pixel").
+        With gm_scope "image", logweights is (B, K, 1, 1, 1): one set of weights per image."""
         B, _, H, W = x.shape
         x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
@@ -569,6 +576,8 @@ class JiT_T2I(nn.Module):
         if self.gm_k:
             assert return_layer is None and gm_mode in ("mean", "full"), gm_mode
             means, logits = self.gm_unpatchify(x, H, W)
+            if self.gm_scope == "image":   # one mixture per image: logweights (B, K, 1, 1, 1)
+                logits = logits.float().mean((-2, -1), keepdim=True)
             logweights = logits.float().log_softmax(dim=1)
             if gm_mode == "mean":
                 return (logweights.exp() * means.float()).sum(1)

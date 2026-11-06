@@ -11,7 +11,7 @@ import os
 
 import torch
 
-from src.diffusion.flow_matching.gmflow import bridge_coefs, gm_convert_mean, gm_draw, gm_mean, gm_second_order
+from src.diffusion.flow_matching.gmflow import bridge_coefs, gm_convert_mean, gm_draw, gm_mean, gm_pick, gm_second_order, image_scope
 from src.diffusion.flow_matching.sampling import EulerSamplerJiT
 
 
@@ -95,7 +95,9 @@ class GMDrawSampler(_GMSampler):
     drawn from the mixture as GM-SDE draws it (gm_draw: a component by its weights, then + s_x xi), and the straight step along the draw's velocity,
     x' = x + (sigma - sigma') (x0 - x) / sigma, with no fresh noise (GM-SDE adds sqrt(c3) xi of the bridge). The last step (sigma' = 0) returns the draw.
     With the exact posterior every state keeps the exact marginal: x' = (1 - sigma') x0 + sigma' eps' with (x0, eps') a posterior draw. The mixture is per pixel,
-    so the pixels draw independently of each other. On a point model (K = 1, s = 0) the draw is the network's x, so this is the exact one step. First order only."""
+    so the pixels draw independently of each other. On a point model (K = 1, s = 0) the draw is the network's x, so this is the exact one step. First order only.
+    One mixture per image (gm_scope "image", section 15): at every call one candidate image is chosen by its weight (gm_pick) and the step goes toward that
+    candidate's mean, with no noise added (the owner's popup, 2026-11-06), so all pixels follow one choice."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         assert self.order == 1, "GMDrawSampler is first order only"
@@ -109,7 +111,12 @@ class GMDrawSampler(_GMSampler):
             gm = self._call(net, x, t_cur, condition)
             with torch.autocast(device_type=dev, enabled=False):
                 sigma, sigma_to = (1 - t_cur).view(1, 1, 1, 1), (1 - t_next).view(1, 1, 1, 1)
-                x0 = gm if torch.is_tensor(gm) else gm_draw(gm, sigma.expand(x.shape[0], -1, -1, -1))
+                if torch.is_tensor(gm):
+                    x0 = gm
+                elif image_scope(gm):   # one mixture per image (section 15): one candidate image per call, chosen by its weight, no noise added
+                    x0 = gm_pick(gm)
+                else:
+                    x0 = gm_draw(gm, sigma.expand(x.shape[0], -1, -1, -1))
                 v = (x0 - x) / sigma
                 x = x0 if float(sigma_to) == 0.0 else x + (sigma - sigma_to) * v
             v_trajs.append(v)

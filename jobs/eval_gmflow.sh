@@ -17,6 +17,8 @@
 # Output: <run>/eval_<step>_<sampler>_calls<calls>[_n<substeps>][_official]/metrics.json (eval_dir below). It never overwrites a finished result; a directory without metrics.json is moved aside.
 # Env: LADDER_RUN_ROOT (run root); EVAL_SIZE, EVAL_D, EVAL_NB, EVAL_NT (run directory exp_ladder_<size>, width and blocks; default d640, 640, 9, 2; jobs/evals_gmflow.sh sets them);
 # EVAL_SPREAD (image | pixel, default image: gm_spread of the model; the checkpoint must hold the per-pixel offset head if and only if it is pixel);
+# EVAL_SCOPE (pixel | image, default pixel: gm_scope of the model, docs/gmflow.md section 15; it must equal the run root's scope.txt, none = pixel; image takes
+# only gm_draw and euler_mean);
 # EVAL_LIMIT_BATCHES (smoke test only: predict only that many batches per rank, keep the samples, skip the FD).
 # EVAL_NOISE (official | prompt, default official; owner 2026-11-06: the official evaluation setup, except that CFG stays 1): official is the official noise, one
 # noise tensor for all prompts (gpic_jsonl_dataset noise_per_prompt false), and adds _official to the output directory; prompt is each prompt's own noise, the
@@ -48,6 +50,11 @@ case $SPREAD in image|pixel) ;; *) echo "EVAL_SPREAD must be image or pixel"; ex
 NOISE=${EVAL_NOISE:-official}
 case $NOISE in official) NPP=false NTAG=official ;; prompt) NPP=true NTAG="" ;; *) echo "EVAL_NOISE must be official or prompt"; exit 2 ;; esac
 if [ $K -eq 0 ] && [ $SPREAD = pixel ]; then echo "the per-pixel spread needs a mixture (K > 0)"; exit 2; fi
+SCOPE=${EVAL_SCOPE:-pixel}   # gm_scope of the model (docs/gmflow.md section 15): pixel, or image = one mixture per image; jobs/evals_gmflow.sh --scope
+case $SCOPE in pixel) ;; image)
+  [ $K -gt 0 ] || { echo "one mixture per image needs a mixture (K > 0)"; exit 2; }
+  case $SAMPLER in gm_draw|euler_mean) ;; *) echo "one mixture per image is evaluated with gm_draw or euler_mean (the owner's popup, 2026-11-06)"; exit 2 ;; esac ;;
+  *) echo "EVAL_SCOPE must be pixel or image"; exit 2 ;; esac
 SUBSTEPS=$(( (128 + CALLS - 1) / CALLS )); [ $SUBSTEPS -ge 2 ] || SUBSTEPS=2
 NSUF=""
 if [ -n "${EVAL_SUBSTEPS:-}" ]; then
@@ -84,6 +91,10 @@ if [ $SPREAD = pixel ] || [ ${SAMPLER%2} != $SAMPLER ]; then
 fi
 RUN=${LADDER_RUN_ROOT:-$DEF_ROOT}/exp_ladder_$SIZE
 CKPT=$(ls -t $RUN/ms-*$STEP*.ckpt 2>/dev/null | head -1); [ -n "$CKPT" ] || { echo "no ms checkpoint for step $STEP in $RUN"; exit 2; }
+# the scope has no weights of its own, so a checkpoint loads under either scope: the run's scope.txt (jobs/train_gmflow.sh; none = pixel) must match
+RSCOPE=pixel; [ ! -f ${LADDER_RUN_ROOT:-$DEF_ROOT}/scope.txt ] || RSCOPE=$(cat ${LADDER_RUN_ROOT:-$DEF_ROOT}/scope.txt)
+[ "$RSCOPE" = "$SCOPE" ] || { echo "the run was trained with scope $RSCOPE, EVAL_SCOPE is $SCOPE"; exit 2; }
+if [ $SCOPE = image ]; then grep -q "gm_scope" $WT/baselines/PixelGen/src/models/transformer/JiT_T2I.py || { echo "$WT has no gm_scope"; exit 2; }; fi
 OUT=$RUN/$(eval_dir $STEP $SAMPLER $CALLS "$NSUF" "$TABLE" "$NTAG")
 [ ! -f $OUT/metrics.json ] || { echo "$OUT/metrics.json exists; not overwriting"; exit 3; }
 [ ! -d $OUT ] || mv $OUT $OUT.unfinished_$(date +%m%d_%H%M%S)
@@ -107,9 +118,10 @@ assert any(n.startswith("ema_denoiser.gm_logstd") for n in sd) == (k > 0), "s-ML
 assert ("ema_denoiser.gm_spread_head.weight" in sd) == (spread == "pixel"), f"per-pixel offset head presence does not match EVAL_SPREAD={spread}"
 PY
 mkdir -p $OUT
-echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K spread=$SPREAD sampler=$SAMPLER calls=$CALLS substeps=$SUBSTEPS noise=$NOISE" | tee $OUT/ckpt.txt
+echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K spread=$SPREAD scope=$SCOPE sampler=$SAMPLER calls=$CALLS substeps=$SUBSTEPS noise=$NOISE" | tee $OUT/ckpt.txt
 [ $SAMPLER != gm_ode_cal ] || { echo "spread_table=$TABLE sha1=$(sha1sum < "$TABLE" | cut -c1-40)" | tee -a $OUT/ckpt.txt; cp "$TABLE" $OUT/spread_table.json; }
 SPREAD_ARGS=(); [ $SPREAD = image ] || SPREAD_ARGS=(--model.denoiser.init_args.gm_spread $SPREAD)   # image: the command line of before this option
+[ $SCOPE = pixel ] || SPREAD_ARGS+=(--model.denoiser.init_args.gm_scope $SCOPE)   # pixel: the command line of before this option
 LIMIT=(); [ -z "${EVAL_LIMIT_BATCHES:-}" ] || LIMIT=(--trainer.limit_predict_batches $EVAL_LIMIT_BATCHES)
 t0=$(date +%s)
 WANDB_MODE=disabled python main.py predict --config configs_h100/lite_ladder_sample.yaml "${SARGS[@]}" --trainer.devices 8 \

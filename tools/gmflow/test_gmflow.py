@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """CPU tests of the GMFlow head (docs/gmflow.md): JiT_T2I(gm_k > 0), GMFlowTrainer (training_gmflow.py), GMSDESampler / GMODESampler (sampling_gmflow.py).
-T11-T14 (docs/gmflow.md section 7): the per-pixel spread (gm_spread "pixel") and the second-order samplers (order 2).
-Run on a vis node from baselines/PixelGen: CUDA_VISIBLE_DEVICES= PYTHONPATH=. python ../../tools/gmflow/test_gmflow.py [T1 T2 ...]
+T11-T14 (docs/gmflow.md section 7): the per-pixel spread (gm_spread "pixel") and the second-order samplers (order 2). T32 (section 15): one mixture per image.
+Run on a vis node from baselines/PixelGen: CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=6 MKL_NUM_THREADS=6 PYTHONPATH=. python ../../tools/gmflow/test_gmflow.py [T1 T2 ...]
+(the vis nodes give 7 cores per user: with torch's default 96 threads, T4 took over 80 min instead of 10 s, 2026-11-06)
 Each test prints PASS or FAIL; the exit code is the number of failed tests. tools/gmflow/mutate.py runs this file on mutated copies of the source."""
 import math
 import os
@@ -1464,6 +1465,237 @@ def T31():
     except AssertionError as e:
         assert "first order only" in str(e), e
     print("  order 2 refused")
+
+
+def image_posterior(x, t, imgs, pi):
+    """p(x0 | x_t) for data that is a mixture of whole images (imgs (K, C, H, W) with probabilities pi): one set of weights per image, s = 0. x (B, C, H, W), t (B,)."""
+    B, K = x.shape[0], imgs.shape[0]
+    a, s = t.view(B, 1, 1, 1, 1), (1 - t).view(B, 1, 1, 1, 1)
+    means = imgs[None].expand(B, -1, -1, -1, -1)
+    ll = -((x[:, None] - a * means) ** 2).sum((2, 3, 4), keepdim=True) / (2 * s ** 2)          # (B, K, 1, 1, 1)
+    return dict(means=means, logweights=(torch.log(pi).view(1, K, 1, 1, 1) + ll).log_softmax(1), logstd=torch.full((B, 1, 1, 1, 1), -float("inf")))
+
+
+def image_marginal_err(x, t, imgs, pi):
+    """Largest error of the mean and the covariance of the projections of x on the K images (unit directions), against the exact marginal of x_t = t x0 + (1 - t) eps,
+    in units of the exact standard deviations. Per-pixel moments cannot see whether the pixels of one sample come from one image; these projections can."""
+    M = imgs.flatten(1) / imgs.flatten(1).norm(dim=1, keepdim=True)                            # (K, D)
+    proj = imgs.flatten(1) @ M.T                                                               # (K data images, K directions)
+    m0 = (pi[:, None] * proj).sum(0)
+    c0 = (pi[:, None, None] * (proj - m0)[:, :, None] * (proj - m0)[:, None, :]).sum(0)
+    mean, cov = t * m0, t ** 2 * c0 + (1 - t) ** 2 * (M @ M.T)
+    u = x.flatten(1) @ M.T
+    sd = cov.diag().sqrt()
+    return max(((u.mean(0) - mean).abs() / sd).max().item(), ((torch.cov(u.T) - cov).abs() / (sd[:, None] * sd[None, :])).max().item())
+
+
+@test
+def T32():
+    """One mixture per image (docs/gmflow.md section 15, owner 2026-11-06): the model option (no new parameter, the image's weights are the softmax of the per-pixel
+    logits averaged over the image), the whole-image loss against a brute force (K = 1 equals the per-pixel loss, the trainer too), its gradient, the winners, gm_pick,
+    GMDrawSampler's exact whole-image samples and marginals at 1, 4 and 50 calls, the refusals, and the scope plumbing of train_gmflow.sh, eval_gmflow.sh, evals_gmflow.sh."""
+    import glob
+    import shutil
+    import tempfile
+    from torch.distributions import Normal
+    # 1. the model: same parameters and the same draws as the per-pixel model; weights (B, K, 1, 1, 1)
+    torch.manual_seed(5); mp = JiT_T2I(**small, gm_k=8)
+    torch.manual_seed(5); mi = JiT_T2I(**small, gm_k=8, gm_scope="image")
+    sp, si = mp.state_dict(), mi.state_dict()
+    assert sp.keys() == si.keys() and all(torch.equal(sp[k], si[k]) for k in sp), "gm_scope image changed the parameters"
+    x, t, y, mask = model_io(8)
+    with torch.no_grad():
+        op, oi = mp(x, t, y, y_mask=mask, gm_mode="full"), mi(x, t, y, y_mask=mask, gm_mode="full")
+        mean_i = mi(x, t, y, y_mask=mask)
+    assert oi["logweights"].shape == (2, 8, 1, 1, 1) and op["logweights"].shape == (2, 8, 1, 64, 64), (oi["logweights"].shape, op["logweights"].shape)
+    assert torch.equal(oi["means"], op["means"]) and torch.equal(oi["logstd"], op["logstd"])
+    # log_softmax removes a constant per pixel, so the image's weights are the log_softmax of the per-pixel log weights averaged over the image
+    assert torch.allclose(oi["logweights"], op["logweights"].mean((-2, -1), keepdim=True).log_softmax(1), atol=1e-5)
+    assert torch.allclose(mean_i, (oi["logweights"].exp() * oi["means"].float()).sum(1), atol=1e-5)
+    assert G.image_scope(oi) and not G.image_scope(op)
+    for kw in (dict(gm_k=0, gm_scope="image"), dict(gm_k=8, gm_spread="pixel", gm_scope="image"), dict(gm_k=8, gm_scope="patch")):
+        try:
+            JiT_T2I(**small, **kw)
+            raise RuntimeError(f"accepted {kw}")
+        except AssertionError:
+            pass
+    print("  model: the same parameters as the per-pixel model; weights (B, K, 1, 1, 1) = log_softmax of the per-pixel logits averaged over the image; means and log s_u"
+          " unchanged; mean mode = sum_k A_k mu_k; K = 0, the per-pixel spread and an unknown scope refused")
+    # 2. the loss against a brute force with torch.distributions (float64): -log sum_k A_k prod_pixels N(target; mu_k, s^2 I) / pixels
+    torch.manual_seed(1)
+    B, K, C, H, W = 3, 4, 3, 8, 8
+    target = torch.randn(B, C, H, W, dtype=torch.float64)
+    means = 0.9 * target[:, None] + 0.3 * torch.randn(B, K, C, H, W, dtype=torch.float64)
+    lw = torch.randn(B, K, 1, 1, 1, dtype=torch.float64).log_softmax(1)
+    logstd = 0.2 * torch.randn(B, 1, 1, 1, 1, dtype=torch.float64)
+    lp = Normal(means, logstd.exp()).log_prob(target[:, None]).sum((2, 3, 4)) + 0.5 * math.log(2 * math.pi) * C * H * W   # (B, K), without the constant as gm_nll
+    got = G.gm_nll(target, means, lw, logstd)
+    assert got.shape == (B, 1, 1) and torch.allclose(got.flatten(), -torch.logsumexp(lp + lw.flatten(1), 1) / (H * W), rtol=1e-12, atol=1e-12)
+    a = G.gm_nll(target, means[:, :1], torch.zeros(B, 1, 1, 1, 1, dtype=torch.float64), logstd).mean((1, 2))
+    b = G.gm_nll(target, means[:, :1], torch.zeros(B, 1, 1, H, W, dtype=torch.float64), logstd).mean((1, 2))
+    assert torch.allclose(a, b, rtol=1e-12), (a, b)
+    # its gradient on mu_k is the posterior responsibility of k times that component's own term, r_k (mu_k - x) / (s^2 pixels)
+    mg = means.clone().requires_grad_(True)
+    G.gm_nll(target, mg, lw, logstd).sum().backward()
+    resp = (lp + lw.flatten(1)).softmax(1)
+    want = resp[:, :, None, None, None] * (means - target[:, None]) / ((2 * logstd).exp() * H * W)
+    assert torch.allclose(mg.grad, want, rtol=1e-9, atol=1e-14), (mg.grad - want).abs().max()
+    wins = G.image_wins(target, means, lw, logstd)
+    assert torch.equal(wins, resp.argmax(1)), (wins, resp)
+    print(f"  loss: equals the brute force (float64, 1e-12); K = 1 equals the per-pixel loss; the gradient on mu_k is r_k (mu_k - x) / (s^2 pixels); winners = argmax r"
+          f" (responsibilities of the winners {resp.max(1).values.min().item():.3f} and up on 192 dimensions)")
+    # 3. the transition loss's winners from the loss itself: argmax_k log A_k - pixels * nll(component k alone)
+    torch.manual_seed(4)
+    gm = dict(means=torch.randn(6, 8, 3, 8, 8), logweights=torch.randn(6, 8, 1, 1, 1).log_softmax(1), logstd=0.3 * torch.randn(6, 1, 1, 1, 1))
+    x_low, x_high = torch.randn(6, 3, 8, 8), torch.randn(6, 3, 8, 8)
+    sh = torch.rand(6).view(-1, 1, 1, 1) * 0.9 + 0.05; sl = 0.5 * sh
+    one = lambda k: G.transition_nll(dict(means=gm["means"][:, k:k + 1], logweights=torch.zeros(6, 1, 1, 1, 1), logstd=gm["logstd"]), x_low, x_high, sh, sl).flatten()
+    score = gm["logweights"].flatten(1) - 64 * torch.stack([one(k) for k in range(8)], 1)
+    assert torch.equal(G.transition_wins(gm, x_low, x_high, sh, sl), score.argmax(1))
+    ws = GMFlowTrainer.win_stats(gm, x_low, x_high, sh, sl)
+    w = G.transition_wins(gm, x_low, x_high, sh, sl)
+    assert ws["gm/win_alive"].item() == len(set(w.tolist())) and abs(ws["gm/win_max"].item() - torch.bincount(w).max().item() / 6) < 1e-6, (ws, w)
+    dead = [k for k in range(8) if k not in set(w.tolist())]
+    assert dead and abs(ws["gm/w_dead"].item() - gm["logweights"].exp().flatten(1).mean(0)[dead].sum().item()) < 1e-6, (ws, dead)
+    print(f"  transition winners = argmax of log A_k minus pixels x the loss of component k alone; win_max, win_alive count them; w_dead {ws['gm/w_dead'].item():.3f}"
+          f" = the mean weight of the {len(dead)} components that win no image")
+    # 4. the trainer: K = 1 gives the per-pixel model's loss; K = 8 trains, logs the winners and sends gradient to the logits
+    x1 = x.clamp(-1, 1)
+    torch.manual_seed(5); mp1 = JiT_T2I(**small, gm_k=1)
+    torch.manual_seed(5); mi1 = JiT_T2I(**small, gm_k=1, gm_scope="image")
+    torch.manual_seed(2); l_p = gm_trainer()._impl_trainstep(mp1, None, None, x1, y, {"y_mask": mask})["loss"]
+    torch.manual_seed(2); l_i = gm_trainer()._impl_trainstep(mi1, None, None, x1, y, {"y_mask": mask})["loss"]
+    assert torch.allclose(l_p, l_i, rtol=1e-5, atol=1e-6), (l_p, l_i)
+    tr = gm_trainer(); tr.diag_now = True
+    torch.manual_seed(2); res = tr._impl_trainstep(mi, None, None, x1, y, {"y_mask": mask})
+    res["loss"].backward()
+    assert torch.isfinite(res["loss"]) and {"gm/win_max", "gm/win_alive", "gm/n_eff", "gm/max_w"} <= set(res), sorted(res)
+    g = mi.final_layer.linear.weight.grad
+    p2 = 16 ** 2
+    assert g is not None and torch.isfinite(g).all() and g[8 * 3 * p2:].abs().sum() > 0 and g[:8 * 3 * p2].abs().sum() > 0
+    print(f"  trainer: K = 1 loss {l_i.item():.6f} = the per-pixel model's {l_p.item():.6f}; K = 8: loss {res['loss'].item():.4f}, win_max {res['gm/win_max'].item():.2f},"
+          f" win_alive {int(res['gm/win_alive'].item())}, n_eff {res['gm/n_eff'].item():.3f}; gradient reaches the means and the logits")
+    # 5. gm_pick: a whole candidate image, chosen with its weight; gm_draw and gm_convert refuse one mixture per image
+    torch.manual_seed(3)
+    Bp, wt = 20000, torch.tensor([0.2, 0.3, 0.5])
+    pattern = torch.randn(1, 3, 3, 4, 4)
+    gmp = dict(means=pattern.expand(Bp, -1, -1, -1, -1), logweights=wt.log().view(1, 3, 1, 1, 1).expand(Bp, -1, -1, -1, -1), logstd=torch.zeros(Bp, 1, 1, 1, 1))
+    x0 = G.gm_pick(gmp)
+    d = (x0[:, None] - pattern).abs().flatten(2).amax(2)
+    share = torch.bincount(d.argmin(1), minlength=3).float() / Bp
+    assert (d.amin(1) == 0).all() and (share - wt).abs().max() < 0.015, share
+    for name, fn in (("gm_draw", lambda: G.gm_draw(gmp, torch.ones(Bp, 1, 1, 1))),
+                     ("gm_convert", lambda: G.gm_convert(gmp, torch.ones(Bp, 1, 1, 1), 0.5 * torch.ones(Bp, 1, 1, 1), x0, x0))):
+        try:
+            fn()
+            raise RuntimeError(f"{name} accepted one mixture per image")
+        except AssertionError as e:
+            assert "one mixture per image" in str(e), e
+    print(f"  gm_pick: every draw is one whole candidate, shares {share.tolist()} for weights {wt.tolist()}; gm_draw and gm_convert refuse one mixture per image")
+    # 6. GMDrawSampler on data that is a mixture of 3 whole images, with the exact posterior: exact images and exact marginals at any number of calls
+    torch.manual_seed(6)
+    imgs, pi = 0.8 * torch.randn(3, 3, 8, 8), torch.tensor([0.2, 0.3, 0.5])
+    post = lambda x, t, c, gm_mode="mean": (lambda q: q if gm_mode == "full" else G.gm_mean(q))(image_posterior(x, t, imgs, pi))
+    noise = torch.randn(8192, 3, 8, 8)
+    for n in (1, 4, 50):
+        xs, _ = sampler(GMDrawSampler, n, rank_seed=False)._impl_sampling(post, noise, None, None)
+        d = (xs[-1][:, None] - imgs).abs().flatten(2).amax(2)
+        share = torch.bincount(d.argmin(1), minlength=3).float() / len(noise)
+        steps = sampler(GMDrawSampler, n).timesteps
+        merr = max([image_marginal_err(xs[i], steps[i].item(), imgs, pi) for i in range(1, n)] or [0.0])
+        print(f"  draw sampler, one mixture per image, {n} calls: largest distance to the nearest image {d.amin(1).max().item():.1e}, shares {[round(v, 3) for v in share.tolist()]},"
+              f" largest marginal error {merr:.4f}")
+        assert d.amin(1).max() < 1e-5 and (share - pi).abs().max() < 0.02 and merr < 0.06, (n, d.amin(1).max(), share, merr)
+    xs, _ = sampler(GMDrawSampler, 1, rank_seed=False)._impl_sampling(lambda x, t, c, gm_mode=None: post(x, t, c), noise, None, None)
+    dm = (xs[-1][:, None] - imgs).abs().flatten(2).amax(2).amin(1)
+    assert dm.min() > 0.1, dm.min()   # the test can tell: the mean of the posterior, one call, is the average of the images, not an image
+    print(f"  control: the posterior mean in one call lands {dm.min().item():.2f} or more from every image")
+    torch.manual_seed(7)
+    xs, _ = sampler(GMDrawSampler, 4, rank_seed=False)._impl_sampling(post, noise[:4], None, None)
+    torch.manual_seed(7)
+    xm, steps = noise[:4], sampler(GMDrawSampler, 4).timesteps
+    for i in range(4):
+        q = image_posterior(xm, steps[i].repeat(4), imgs, pi)
+        s, s2 = (1 - steps[i]).view(1, 1, 1, 1), (1 - steps[i + 1]).view(1, 1, 1, 1)
+        x0 = G.gm_pick(q)
+        xm = x0 if i == 3 else xm + (s - s2) * (x0 - xm) / s
+    assert torch.allclose(xs[-1], xm, atol=1e-6), (xs[-1] - xm).abs().max()
+    print("  step by step: gm_pick, then the straight step, no noise; the last step returns the candidate")
+    # 7. the scripts: train_gmflow.sh --scope image passes gm_scope, records scope.txt and evaluates with --scope image; eval_gmflow.sh checks the scope
+    tmp = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+    wt_dir = os.path.join(tmp, "project/gpic-wt/scope_wt")
+    for p, text in (("baselines/PixelGen/configs_h100/gmflow_train.yaml", "lam: 0.5\n"), ("baselines/PixelGen/src/models/transformer/JiT_T2I.py", "gm_spread gm_scope\n"),
+                    ("baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py", ""), ("jobs/train_ladder.sh", 'echo "LADDER $*"\n'),
+                    ("jobs/evals_gmflow.sh", 'echo "EVALS $*"\n'), ("jobs/eval_gmflow.sh", 'echo "ARGS=$* Z=$EVAL_NOISE SC=$EVAL_SCOPE"\n')):
+        os.makedirs(os.path.dirname(os.path.join(wt_dir, p)), exist_ok=True)
+        open(os.path.join(wt_dir, p), "w").write(text)
+    subprocess.run("git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x", shell=True, cwd=wt_dir, check=True)
+    env0 = {k: v for k, v in os.environ.items() if not k.startswith("EVAL_") and k not in ("GMFLOW_WT", "LADDER_RUN_ROOT")}
+    stub_t = os.path.join(tmp, "train.sh")
+    open(stub_t, "w").write(open(os.path.join(REPO, "jobs/train_gmflow.sh")).read().replace("source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh", f"WC={tmp}"))
+    tr_run = lambda *a: subprocess.run(["bash", stub_t, "8", "d640", "640", "9", "2", "128", *a], env=env0, capture_output=True, text=True)
+    r = tr_run("sc", "w1147", "--wt", "scope_wt", "--scope", "image", "64:gm_draw:8")
+    root = os.path.join(tmp, "runs/gpic-speed/gmflow_k8_d640_sc")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--model.denoiser.init_args.gm_scope image" in open(os.path.join(root, "train.log")).read() and open(os.path.join(root, "scope.txt")).read().strip() == "image"
+    assert f"EVALS 8 d640 640 9 2 {root} --wt scope_wt --scope image 64:gm_draw:8" in r.stdout, r.stdout
+    r = tr_run("sc", "w1147", "--wt", "scope_wt", "64:gm_draw:8")
+    assert r.returncode == 2 and "started with scope image, not pixel" in r.stdout, r.stdout
+    r = tr_run("sc2", "w1147", "--wt", "scope_wt", "--spread", "pixel", "--scope", "image")
+    assert r.returncode == 2 and "takes the image spread" in r.stdout, r.stdout
+    old = os.path.join(tmp, "runs/gpic-speed/gmflow_k8_d640_old/exp_ladder_d640"); os.makedirs(old); open(os.path.join(old, "last.ckpt"), "w").close()
+    r = tr_run("old", "w1147", "--wt", "scope_wt", "--scope", "image")
+    assert r.returncode == 2 and "started with scope pixel, not image" in r.stdout, r.stdout   # a run from before this option is per pixel
+    r = tr_run("sc3", "w1147", "--wt", "scope_wt")
+    assert r.returncode == 0 and "gm_scope" not in open(os.path.join(tmp, "runs/gpic-speed/gmflow_k8_d640_sc3/train.log")).read() and "--scope" not in r.stdout
+    # the tasks are checked before the training (review_image_mix M2): no run directory is made
+    for tag, args, msg in (("sc4", ["--scope", "image", "64:gm_ode:8"], "evaluated with gm_draw or euler_mean"),
+                           ("sc5", ["--scope", "image", "--lam", "0.5"], "is not step:sampler:calls"),
+                           ("sc6", ["64:gm_ode"], "is not step:sampler:calls")):
+        r = tr_run(tag, "w1147", "--wt", "scope_wt", *args)
+        assert r.returncode == 2 and msg in r.stdout and not os.path.exists(os.path.join(tmp, f"runs/gpic-speed/gmflow_k8_d640_{tag}")), (tag, r.stdout)
+    r = tr_run("sc7", "w1147", "--wt", "scope_wt", "64:gm_ode:8", "64:gm_ode:8:4", "64:euler_mean:50")
+    assert r.returncode == 0 and "EVALS 8 d640 640 9 2" in r.stdout and "--scope" not in r.stdout, r.stdout   # per pixel, every sampler as before
+    print("  train_gmflow.sh: --scope image passes gm_scope image, records scope.txt, evaluates with --scope image; a second scope, the per-pixel spread, and a run from"
+          " before the option refused; the default command line is unchanged; bad tasks (a sampler the scope cannot use, a misordered option, 2 fields) refused"
+          " before the training")
+    src = open(os.path.join(REPO, "jobs/eval_gmflow.sh")).read()
+    assert "[ $SCOPE = pixel ] || SPREAD_ARGS+=(--model.denoiser.init_args.gm_scope $SCOPE)" in src and src.count('"${SPREAD_ARGS[@]}"') == 1
+    head, sep, _ = src.replace("source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh", f"WC={tmp}").partition("[ ! -f $OUT/metrics.json ]")
+    assert sep
+    stub_e = os.path.join(tmp, "eval.sh"); open(stub_e, "w").write(head + 'echo "OUT=$(basename $OUT) SCOPE=$SCOPE"\n')
+    def ev(args, scope_txt=None, **extra):
+        rr = os.path.join(tmp, "eroot"); shutil.rmtree(rr, ignore_errors=True); os.makedirs(os.path.join(rr, "exp_ladder_d640"))
+        open(os.path.join(rr, "exp_ladder_d640/ms-step=062336.ckpt"), "w").close()
+        if scope_txt:
+            open(os.path.join(rr, "scope.txt"), "w").write(scope_txt + "\n")
+        p = subprocess.run(["bash", stub_e, *map(str, args)], env=dict(env0, GMFLOW_WT=REPO, LADDER_RUN_ROOT=rr, **extra), capture_output=True, text=True)
+        return p.returncode, (p.stdout.strip().splitlines() or [p.stderr])[-1]
+    rc, out = ev([8, 62336, "gm_draw", 8], "image", EVAL_SCOPE="image")
+    assert rc == 0 and out == "OUT=eval_062336_gm_draw_calls8_official SCOPE=image", out
+    rc, out = ev([8, 62336, "euler_mean", 50], "image", EVAL_SCOPE="image")
+    assert rc == 0 and out == "OUT=eval_062336_euler_mean_calls50_official SCOPE=image", out
+    for args, txt, extra, msg in (([8, 62336, "gm_ode", 8], "image", {"EVAL_SCOPE": "image"}, "gm_draw or euler_mean"),
+                                  ([0, 62336, "gm_draw", 8], "image", {"EVAL_SCOPE": "image"}, "needs a mixture"),
+                                  ([8, 62336, "gm_draw", 8], "image", {}, "trained with scope image, EVAL_SCOPE is pixel"),
+                                  ([8, 62336, "gm_draw", 8], None, {"EVAL_SCOPE": "image"}, "trained with scope pixel, EVAL_SCOPE is image"),
+                                  ([8, 62336, "gm_draw", 8], None, {"EVAL_SCOPE": "patch"}, "EVAL_SCOPE must be")):
+        rc, out = ev(args, txt, **extra)
+        assert rc == 2 and msg in out, (args, extra, out)
+    rc, out = ev([8, 62336, "gm_ode", 8])
+    assert rc == 0 and out == "OUT=eval_062336_gm_ode_calls8_official SCOPE=pixel", out   # a run without scope.txt, as every run before this option
+    src = open(os.path.join(REPO, "jobs/evals_gmflow.sh")).read().replace("source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh", f"WC={tmp}")
+    stub_s = os.path.join(tmp, "evals.sh"); open(stub_s, "w").write(src)
+    for opt, want in (([], "SC=pixel"), (["--scope", "image"], "SC=image")):
+        rr = os.path.join(tmp, "sroot"); shutil.rmtree(rr, ignore_errors=True)
+        p = subprocess.run(["bash", stub_s, "8", "d640", "640", "9", "2", rr, "--wt", "scope_wt", *opt, "62336:gm_draw:8"], env=env0, capture_output=True, text=True)
+        logs = [open(f).read().strip() for f in glob.glob(os.path.join(rr, "eval_*.log"))]
+        assert p.returncode == 0 and logs == [f"ARGS=8 62336 gm_draw 8 Z=official {want}"], (p.stdout, p.stderr, logs)
+    p = subprocess.run(["bash", stub_s, "8", "d640", "640", "9", "2", rr, "--wt", "scope_wt", "--scope", "patch", "62336:gm_draw:8"], env=env0, capture_output=True, text=True)
+    assert p.returncode == 2 and "--scope must be" in p.stdout, p.stdout
+    shutil.rmtree(tmp)
+    print("  eval_gmflow.sh: EVAL_SCOPE must match the run's scope.txt (none = pixel), image takes gm_draw and euler_mean only and K > 0; the gm_scope argument reaches"
+          " the predict command; evals_gmflow.sh --scope image sets EVAL_SCOPE")
 
 
 if __name__ == "__main__":

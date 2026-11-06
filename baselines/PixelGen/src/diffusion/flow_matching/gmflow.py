@@ -35,13 +35,36 @@ def logstd_x(gm, sigma):
     return gm["logstd"] + torch.log(sigma.clamp(min=EPS))
 
 
-def gm_nll(target, means, logweights, logstd):
-    """Per-pixel -log sum_k A_k N(target; means_k, exp(logstd)^2 I) over the C channels, without the constant C/2 log 2 pi (GMFlow diffusion_loss.py:33-36).
-    target (B, C, H, W); means (B, K, C, H, W); logweights (B, K, 1, H, W); logstd broadcastable to (B, K, 1, H, W). Returns (B, H, W)."""
+def image_scope(gm):
+    """True for one mixture per image (JiT_T2I gm_scope "image", docs/gmflow.md section 15): logweights (B, K, 1, 1, 1) over means of a larger image."""
+    lw, m = gm["logweights"], gm["means"]
+    return lw.shape[-2:] == (1, 1) and m.shape[-2:] != (1, 1)
+
+
+def gm_component_ll(target, means, logstd):
+    """log N(target; means_k, exp(logstd)^2 I) of each component at each pixel, summed over the C channels, without the constant C/2 log 2 pi. Returns (B, K, H, W)."""
     inverse_std = torch.exp(-logstd).clamp(max=1 / EPS)
     diff = (means - target.unsqueeze(1)) * inverse_std
-    ll = (-0.5 * diff.square() - logstd).sum(dim=2)          # (B, K, H, W)
-    return -torch.logsumexp(ll + logweights.squeeze(2), dim=1)
+    return (-0.5 * diff.square() - logstd).sum(dim=2)
+
+
+def gm_nll(target, means, logweights, logstd):
+    """Per-pixel -log sum_k A_k N(target; means_k, exp(logstd)^2 I) over the C channels, without the constant C/2 log 2 pi (GMFlow diffusion_loss.py:33-36).
+    target (B, C, H, W); means (B, K, C, H, W); logweights (B, K, 1, H, W); logstd broadcastable to (B, K, 1, H, W). Returns (B, H, W).
+    One mixture per image (logweights (B, K, 1, 1, 1), docs/gmflow.md section 15): each component scores the whole image, -log sum_k A_k prod_pixels N(...),
+    divided by the number of pixels, returned as (B, 1, 1), so a mean over the pixels gives the same scale as the per-pixel loss. With K = 1 the two agree."""
+    ll = gm_component_ll(target, means, logstd)                                         # (B, K, H, W)
+    lw = logweights.squeeze(2)                                                         # (B, K, H, W) or (B, K, 1, 1)
+    if lw.shape[-2:] == (1, 1) and ll.shape[-2:] != (1, 1):
+        n_pix = ll.shape[-2] * ll.shape[-1]
+        return (-torch.logsumexp(ll.sum((-2, -1)) + lw.flatten(1), dim=1) / n_pix).view(-1, 1, 1)
+    return -torch.logsumexp(ll + lw, dim=1)
+
+
+def image_wins(target, means, logweights, logstd):
+    """One mixture per image: for each image the component with the highest posterior responsibility (the one that gets the gradient of the means). Returns (B,)."""
+    ll = gm_component_ll(target, means, logstd).sum((-2, -1))                          # (B, K)
+    return (ll + logweights.flatten(1)).argmax(1)
 
 
 def transition_nll(gm, x_low, x_high, sigma_high, sigma_low):
@@ -54,13 +77,24 @@ def transition_nll(gm, x_low, x_high, sigma_high, sigma_low):
     return gm_nll(x_low, c1 * x_high.unsqueeze(1) + c2 * gm["means"], gm["logweights"], logstd_low)
 
 
+def transition_wins(gm, x_low, x_high, sigma_high, sigma_low):
+    """One mixture per image: the winning component of each image under the transition loss's mixture (as transition_nll). Returns (B,)."""
+    c1, c2, c3 = bridge_coefs(sigma_high, sigma_low)
+    c1, c2, c3 = c1.unsqueeze(1), c2.unsqueeze(1), c3.unsqueeze(1)
+    lsx = logstd_x(gm, sigma_high.unsqueeze(1))
+    logstd_low = torch.logaddexp(2 * (lsx + torch.log(c2.clamp(min=1e-6))), torch.log(c3.clamp(min=0))) / 2
+    return image_wins(x_low, c1 * x_high.unsqueeze(1) + c2 * gm["means"], gm["logweights"], logstd_low)
+
+
 def gm_mean(gm):
     """sum_k A_k mu_x,k, (B, C, H, W)."""
     return (gm["logweights"].exp() * gm["means"]).sum(1)
 
 
 def gm_draw(gm, sigma):
-    """One x0 per pixel, independently: a component by its weights (Gumbel-max), then + s_x xi on the C channels (GMFlow gmflow_ops.py:637-655). sigma (B, 1, 1, 1)."""
+    """One x0 per pixel, independently: a component by its weights (Gumbel-max), then + s_x xi on the C channels (GMFlow gmflow_ops.py:637-655). sigma (B, 1, 1, 1).
+    Not for one mixture per image: its (B, K, 1, 1, 1) weights would gather one pixel only (gm_pick draws whole images)."""
+    assert not image_scope(gm), "gm_draw draws per pixel; use gm_pick for one mixture per image"
     lw = gm["logweights"].squeeze(2)                                                    # (B, K, H, W)
     u = torch.rand_like(lw).clamp(min=1e-12, max=1 - 1e-7)   # fp32: 1 - 1e-7 < 1, so -log(u) > 0
     gumbel = -torch.log(-torch.log(u))
@@ -70,10 +104,22 @@ def gm_draw(gm, sigma):
     return mu + logstd_x(gm, sigma.unsqueeze(1)).squeeze(1).exp() * torch.randn_like(mu)
 
 
+def gm_pick(gm):
+    """One mixture per image (docs/gmflow.md section 15, the owner's sampler): one component per image by its weights (Gumbel-max), and that whole candidate image,
+    with no noise added. Returns (B, C, H, W)."""
+    assert image_scope(gm), "gm_pick is for one mixture per image"
+    lw = gm["logweights"].flatten(1)                                                    # (B, K)
+    u = torch.rand_like(lw).clamp(min=1e-12, max=1 - 1e-7)
+    k = (lw - torch.log(-torch.log(u))).argmax(1)                                       # (B,)
+    return gm["means"][torch.arange(k.shape[0], device=k.device), k]
+
+
 def gm_convert(gm, sigma_src, sigma_tgt, x_src, x_tgt, eps=1e-6):
     """The analytic sub-step (GMFlow Eq. 10; code gmflow.py:41-70): q(x0 | x_tgt) proportional to p(x_tgt | x0) / p(x_src | x0) q(x0 | x_src), for sigma_tgt < sigma_src.
     q(x0 | x_src) is gm with s_x = sigma_src s_u. Returns (means, logweights, var) of the new mixture: (B, K, C, H, W), (B, K, 1, H, W), and the shape of gm's logstd.
-    Pixel by pixel: nothing here reduces over pixels, so a per-pixel s_x gives each pixel its own Bayes update (tools/gmflow/test_gmflow.py T13)."""
+    Pixel by pixel: nothing here reduces over pixels, so a per-pixel s_x gives each pixel its own Bayes update (tools/gmflow/test_gmflow.py T13).
+    Not for one mixture per image: its update would need the whole image's likelihood, so it refuses."""
+    assert not image_scope(gm), "gm_convert updates per pixel; one mixture per image has no sub-step here (docs/gmflow.md section 15)"
     alpha_src, alpha_tgt = 1 - sigma_src, 1 - sigma_tgt
     ats, ast = alpha_tgt * sigma_src, alpha_src * sigma_tgt
     denom = (ats.square() - ast.square()).clamp(min=eps)

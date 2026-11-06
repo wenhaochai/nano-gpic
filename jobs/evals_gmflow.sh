@@ -11,7 +11,8 @@
 # official noise (--noise below), EMA, no CFG. Finished tasks are skipped, so a rerun does only the rest.
 # K = 0 evaluates a point model. --link <run dir> links that run's ms checkpoints into <root>/exp_ladder_<size>, so nothing is written in its directory (the ladder's
 # own evaluations, official noise and Euler at 50 steps, have no other call counts, so the ladder's checkpoints are evaluated again here).
-# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] <step:sampler:calls[:substeps]> ...
+# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--scope image] <step:sampler:calls[:substeps]> ...
+# --scope image: one mixture per image (docs/gmflow.md section 15; eval_gmflow.sh EVAL_SCOPE, checked against the root's scope.txt); default pixel.
 # --noise: official (the default since 2026-11-06, owner: the official evaluation setup except CFG = 1; one noise for all prompts, directories end in _official) or
 # prompt (each prompt's own noise, the protocol of every result before; the old directory names); eval_gmflow.sh EVAL_NOISE.
 # --spread pixel: the run has the per-pixel spread (docs/gmflow.md section 7; eval_gmflow.sh EVAL_SPREAD); default image.
@@ -20,7 +21,7 @@
 # Code: the frozen worktree gpic-wt/gmflow_run2, or gpic-wt/<worktree> with --wt; every evaluation checks that it still holds the commit of the start.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-[ $# -ge 7 ] || { echo "usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] <tasks...>"; exit 2; }
+[ $# -ge 7 ] || { echo "usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--scope image] <tasks...>"; exit 2; }
 K=$1 SIZE=$2 WD=$3 NB=$4 NT=$5 ROOT=$6; shift 6
 LINK=""
 if [ "$1" = "--link" ]; then LINK=$2; shift 2; [ -d "$LINK" ] || { echo "no run directory $LINK"; exit 2; }; fi
@@ -33,6 +34,8 @@ if [ "$1" = "--table" ]; then TABLE=$2; shift 2; [ -f "$TABLE" ] || { echo "no t
 NOISE=official
 if [ "$1" = "--noise" ]; then NOISE=$2; shift 2; case $NOISE in official|prompt) ;; *) echo "--noise must be official or prompt"; exit 2 ;; esac; fi
 NTAG=""; [ $NOISE = prompt ] || NTAG=official
+SCOPE=pixel
+if [ "$1" = "--scope" ]; then SCOPE=$2; shift 2; case $SCOPE in pixel|image) ;; *) echo "--scope must be pixel or image"; exit 2 ;; esac; fi
 [ $# -ge 1 ] || { echo "no tasks"; exit 2; }
 WT=$WC/project/gpic-wt/$WTN
 [ -f "$WT/baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py" ] || { echo "$WT holds old code"; exit 2; }
@@ -54,7 +57,7 @@ for t in "$@"; do
   fi
 done
 [ -f $ROOT/commit.txt ] || echo $SHA > $ROOT/commit.txt
-export GMFLOW_WT=$WT LADDER_RUN_ROOT=$ROOT EVAL_SIZE=$SIZE EVAL_D=$WD EVAL_NB=$NB EVAL_NT=$NT EVAL_SPREAD=$SPREAD EVAL_NOISE=$NOISE
+export GMFLOW_WT=$WT LADDER_RUN_ROOT=$ROOT EVAL_SIZE=$SIZE EVAL_D=$WD EVAL_NB=$NB EVAL_NT=$NT EVAL_SPREAD=$SPREAD EVAL_NOISE=$NOISE EVAL_SCOPE=$SCOPE
 fail=0
 for t in "$@"; do
   STEP=${t%%:*} rest=${t#*:}; S=${rest%%:*} C=${rest#*:}
