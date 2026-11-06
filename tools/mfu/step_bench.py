@@ -45,8 +45,43 @@ class Step(nn.Module):
         super().__init__()
         self.net, self.trainer = net, trainer
 
-    def forward(self, x, y, mask):
-        return self.trainer(self.net, None, None, x, y, None, {"y_mask": mask})["loss"]
+    def forward(self, x, y, meta):
+        return self.trainer(self.net, None, None, x, y, None, dict(meta))["loss"]
+
+
+def make_pack(lens, Tp, dev, max_T=320):
+    """y_pack (src/models/transformer/JiT_T2I.py, lever E) for caption lengths lens, padded key length Tp."""
+    lt = torch.tensor(lens, dtype=torch.int32)
+    cu = torch.zeros(len(lens) + 1, dtype=torch.int32)
+    cu[1:] = torch.cumsum(lt, 0)
+    tok_b = torch.repeat_interleave(torch.arange(len(lens)), lt.long())
+    pos = torch.cat([torch.arange(n) for n in lens])
+    return {"lens": lt.to(dev), "cu": cu.to(dev), "tok_b": tok_b.to(dev), "pos": pos.to(dev),
+            "pidx": (tok_b * Tp + pos).to(dev), "Tp": Tp, "max_T": max_T}
+
+
+def rebalance_plan(all_lens, me, world, B):
+    """Which rank computes each sample: at every batch position i the world samples there (one per rank) are dealt to
+    the ranks, longest first to the rank with the fewest caption tokens so far, positions with the longest samples first.
+    A sample keeps its position, so it keeps its t and noise (the official seeding draws them alike on every rank).
+    Returns this rank's send order and split sizes, the receive permutation, and the new caption lengths."""
+    load = [0] * world
+    dst = {}
+    for i in sorted(range(B), key=lambda i: -max(all_lens[r][i] for r in range(world))):
+        col = sorted(range(world), key=lambda r: -all_lens[r][i])
+        order = sorted(range(world), key=lambda r: load[r])
+        for r, d in zip(col, order):
+            dst[(r, i)] = d
+            load[d] += all_lens[r][i]
+    send = sorted(range(B), key=lambda i: (dst[(me, i)], i))
+    in_splits = [sum(dst[(me, i)] == d for i in range(B)) for d in range(world)]
+    recv = [(r, i) for r in range(world) for i in range(B) if dst[(r, i)] == me]   # all_to_all order: by source rank
+    out_splits = [sum(1 for (r, _) in recv if r == src) for src in range(world)]
+    pos_of = [i for (_, i) in recv]
+    assert sorted(pos_of) == list(range(B)), "one sample per position"
+    inv = [pos_of.index(p) for p in range(B)]
+    new_lens = [all_lens[r][i] for (r, i) in sorted(recv, key=lambda ri: ri[1])]
+    return send, in_splits, out_splits, inv, recv, new_lens, max(load) / (sum(load) / world)
 
 
 def main():
@@ -66,6 +101,9 @@ def main():
     ap.add_argument("--record", action="store_true")
     ap.add_argument("--bucket-mb", type=float, default=1000, help="DDP bucket_cap_mb (production 1000)")
     ap.add_argument("--hook", default=None, help="DDP comm hook: 'avg' = all-reduce with ReduceOp.AVG (no per-parameter divide)")
+    ap.add_argument("--packed", action="store_true", help="lever E: packed captions (y_pack); needs GPIC_MFU_ATTN=fa3")
+    ap.add_argument("--rebalance", action="store_true", help="lever E under DDP: deal the samples of every batch "
+                    "position over the ranks by caption length (all_to_all of images and caption tokens each step)")
     ap.add_argument("--fsdp", action="store_true", help="FSDP2 instead of DDP: per-block fully_shard, bf16 compute params, "
                     "fp32 reduce-scatter, fused AdamW and EMA on the shards; RMSNorm weights and pos_embed stay fp32 and "
                     "replicated (all-reduced), as autocast uses them in fp32")
@@ -172,9 +210,12 @@ def main():
     def batch(i, T):
         """Built before the timed loop: a pageable host-to-device copy inside it would stall the host on the GPU."""
         lens = make_lengths(T, a.batch, rng)
+        if a.packed or a.rebalance:
+            y = torch.cat([emb[b, :n] for b, n in enumerate(lens)])
+            return xs[i % pool_n], y, {"y_pack": make_pack(lens, T, dev)}, lens
         mask = torch.arange(T, device=dev)[None] < torch.tensor(lens, device=dev)[:, None]
         y = emb[:, :T] * mask[..., None]
-        return xs[i % pool_n], y, mask
+        return xs[i % pool_n], y, {"y_mask": mask}, lens
 
     ctx = (lambda: torch.autocast("cuda", dtype=torch.bfloat16)) if not a.fp32 else (lambda: torch.autocast("cuda", enabled=False))
     if os.environ.get("GPIC_MFU_SDPA_BACKEND"):   # e.g. MATH: a parity floor at bf16 inputs with fp32 attention math
@@ -187,9 +228,17 @@ def main():
             with base_ctx(), sdpa_kernel(be):
                 yield
 
-    def train_step(x, y, mask, rec=None):
+    def train_step(x, y, meta, rec=None, ex=None):
+        if ex is not None:   # lever E: the samples of this step move to the ranks the plan names
+            send, in_s, out_s, inv, tsend, tin, tout, tperm, meta = ex
+            xr = torch.empty_like(x)
+            dist.all_to_all_single(xr.view(x.shape[0], -1), x.index_select(0, send).view(x.shape[0], -1), out_s, in_s)
+            x = xr.index_select(0, inv)
+            yr = y.new_empty(sum(tout), y.shape[1])
+            dist.all_to_all_single(yr, y.index_select(0, tsend), tout, tin)
+            y = yr.index_select(0, tperm)
         with ctx():
-            loss = model(x, y, mask)
+            loss = model(x, y, meta)
         loss.backward()
         if opt is None:   # FSDP2
             torch.cuda.current_stream().wait_stream(ema_stream)
@@ -203,13 +252,16 @@ def main():
         with torch.cuda.stream(ema_stream), torch.no_grad():
             torch._foreach_lerp_(ema_params, net_params, 1.0 - 0.9999)
         if rec is not None:
-            rec.append((loss.detach(), gn.detach()))
+            l_ = loss.detach().clone()
+            if ddp:   # the global mean loss: a rebalanced rank holds other samples than before
+                dist.all_reduce(l_, op=dist.ReduceOp.AVG)
+            rec.append((l_, gn.detach()))
 
     # compile warm-up as CompileWarmup: T = 64, 128 (dynamic T), 320, 192
     t0 = time.time()
     for T in (64, 128, 320, 192):
-        x, y, mask = batch(0, T)
-        train_step(x, y, mask)
+        x, y, meta, _ = batch(0, T)
+        train_step(x, y, meta)
     torch.cuda.synchronize()
     warm_s = time.time() - t0
     if a.T == "hist":
@@ -217,6 +269,35 @@ def main():
     else:
         Tseq = [int(a.T)] * total
     batches = [batch(i, Tseq[i]) for i in range(total)]
+    exs = [None] * total
+    balance = []
+    if a.rebalance:
+        assert ddp
+        all_lens = [None] * world
+        dist.all_gather_object(all_lens, [b[3] for b in batches])
+        for i in range(total):
+            lens_i = [all_lens[r][i] for r in range(world)]
+            send, in_s, out_s, inv, recv, new_lens, bal = rebalance_plan(lens_i, rank, world, a.batch)
+            balance.append(bal)
+            lens = batches[i][3]
+            cu = [0]
+            for n in lens:
+                cu.append(cu[-1] + n)
+            tsend = [t for p in send for t in range(cu[p], cu[p + 1])]
+            tin, k = [], 0
+            for d in range(world):
+                tin.append(sum(lens[p] for p in send[k:k + in_s[d]]))
+                k += in_s[d]
+            tout = [sum(lens_i[r][p] for (rr, p) in recv if rr == r) for r in range(world)]
+            # received tokens come by (source rank, position); put them in position order
+            starts, off = {}, 0
+            for (r, p) in recv:
+                starts[p] = off
+                off += lens_i[r][p]
+            tperm = [starts[p] + j for p in range(a.batch) for j in range(new_lens[p])]
+            Tp = min(-(-max(new_lens) // 8) * 8, 320)
+            exs[i] = (torch.tensor(send, device=dev), in_s, out_s, torch.tensor(inv, device=dev), torch.tensor(tsend, device=dev),
+                      tin, tout, torch.tensor(tperm, device=dev), {"y_pack": make_pack(new_lens, Tp, dev)})
     torch.cuda.synchronize()
     torch.manual_seed(a.seed + 1)
     rec = [] if a.record else None
@@ -229,15 +310,15 @@ def main():
         if pa and j == pa[0]:
             prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
             prof.__enter__()
-        x, y, mask = batches[i]
+        x, y, meta, _ = batches[i]
         e = torch.cuda.Event(enable_timing=True)
         e.record()
         evs.append(e)
         if prof is not None:
             with torch.profiler.record_function(f"ProfilerStep#{j}"):
-                train_step(x, y, mask, rec if j >= 0 else None)
+                train_step(x, y, meta, rec if j >= 0 else None, exs[i])
         else:
-            train_step(x, y, mask, rec if j >= 0 else None)
+            train_step(x, y, meta, rec if j >= 0 else None, exs[i])
         if pa and j == pa[1] - 1:
             torch.cuda.synchronize()
             prof.__exit__(None, None, None)
@@ -253,6 +334,8 @@ def main():
     mean = statistics.mean(keep)
     res = {"d": a.d, "nb": nb, "nt": nt, "params": n_params, "world": world, "rank": rank, "T": a.T, "same_T": a.same_T,
            "mode": "fsdp" if a.fsdp else ("ddp" if ddp else "single"), "bucket_mb": a.bucket_mb, "hook": a.hook,
+           "packed": a.packed or a.rebalance, "rebalance": a.rebalance,
+           "plan_balance": statistics.mean(balance[a.warm:]) if balance else None,
            "steps": len(keep), "mean_ms": mean, "median_ms": statistics.median(keep), "min_ms": min(keep),
            "max_ms": max(keep), "compile_warm_s": warm_s, "peak_alloc_gb": torch.cuda.max_memory_allocated() / 2**30,
            "mean_T": statistics.mean(Tseq[a.warm:]), "step_ms": ms, "Tseq": Tseq[a.warm:],

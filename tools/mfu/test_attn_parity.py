@@ -6,7 +6,7 @@ The zero-initialized layers (adaLN, final layer) get small random weights, so ev
 images, a padded caption length T with prefix masks of different lengths. Reported per path: relative L2 error of the
 output and of the gradient of every parameter against the fp32 reference (the worst parameter and the median). The lever
 passes when its errors stay within 1.5x of the production path's errors (both are bf16 rounding).
-usage: python test_attn_parity.py [--d 640] [--lever fa3]
+usage: python test_attn_parity.py [--d 640] [--lever fa3|packed]
 """
 import argparse, os, statistics, sys
 
@@ -25,9 +25,9 @@ def main():
     ap.add_argument("--compile", action="store_true")
     a = ap.parse_args()
     import src.models.transformer.JiT_T2I as M
-    if a.lever == "fa3":
-        from src.models.layers.fa3_op import fa3_attention
-        M.fa3_attention = fa3_attention
+    if a.lever in ("fa3", "packed"):
+        from src.models.layers.fa3_op import fa3_attention, fa3_varlen
+        M.fa3_attention, M.fa3_varlen = fa3_attention, fa3_varlen
     dev = "cuda"
     torch.manual_seed(0)
     net = M.JiT_T2I(input_size=256, in_channels=3, num_groups=a.d // 64, hidden_size=a.d, num_blocks=a.nb,
@@ -45,12 +45,19 @@ def main():
     y = (torch.randn(B, T, 2048, device=dev, generator=g) * mask[..., None]).to(torch.bfloat16)
     dout = torch.randn(B, 3, 256, 256, device=dev, generator=g)
 
+    if a.lever == "packed":   # lever E: the captions back to back, as the data path will deliver them
+        sys.path.insert(0, os.path.dirname(__file__))
+        from step_bench import make_pack
+        y_p, pk = y[mask], make_pack(lens.tolist(), T, dev)
+
     def run(path, autocast, fn=None):
-        M._ATTN = path
+        M._ATTN = "fa3" if path == "packed" else path
         net.zero_grad(set_to_none=True)
         f = fn or net
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
-            if path == "math":
+            if path == "packed":
+                out = f(x, t, y_p, y_pack=pk)
+            elif path == "math":
                 M._ATTN = "sdpa"
                 with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
                     out = f(x, t, y.float() if not autocast else y, y_mask=mask)

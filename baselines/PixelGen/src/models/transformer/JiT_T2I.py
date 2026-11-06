@@ -16,7 +16,15 @@ from src.models.layers.rmsnorm import RMSNorm as Norm
 # (src/models/layers/fa3_op.py) instead of SDPA with a boolean mask; the same attention, in FA's [B, S, H, D] layout.
 _ATTN = os.environ.get("GPIC_MFU_ATTN", "sdpa")
 if _ATTN == "fa3":
-    from src.models.layers.fa3_op import fa3_attention
+    from src.models.layers.fa3_op import fa3_attention, fa3_varlen
+
+# MFU lever E (docs/mfu.md): packed captions. With y_pack (a dict, below) the caption tokens of the batch lie back to back,
+# y [S, 2048], S = the sum of the caption lengths: the text blocks and the caption key projections run on the S real tokens
+# only (no padded rows), the text blocks' attention is FA3 varlen, and the image blocks' keys keep the padded layout
+# [B, N + Tp] with per-sample key counts. The same math as the masked path (padded tokens never reach a real token there).
+# y_pack: lens [B] int32, cu [B + 1] int32 (offsets), tok_b [S] int64 (sample of each token), pos [S] int64 (position in
+# its caption), pidx [S] int64 (b * Tp + pos: the token's row in a padded [B * Tp] layout), Tp (int, >= the longest caption),
+# max_T (int, the bound for the varlen kernels: txt_max_length).
 
 
 def _rope_bshd(x, cos, sin):
@@ -92,6 +100,15 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, y, pos, mask=None) -> torch.Tensor:
         B, N, C = x.shape
+        if isinstance(mask, dict):   # lever E: packed captions, y [S, C]
+            H, Hc, Tp = self.num_heads, C // self.num_heads, mask["Tp"]
+            q, kx, vx = self.qkv_x(x).view(B, N, 3, H, Hc).unbind(2)
+            q, kx = _rope_bshd(self.q_norm(q), pos[0], pos[1]), _rope_bshd(self.k_norm(kx), pos[0], pos[1])
+            ky, vy = self.kv_y(y).view(-1, 2, H, Hc).unbind(1)
+            pad = lambda t: t.new_zeros(B * Tp, H, Hc).index_copy(0, mask["pidx"], t).view(B, Tp, H, Hc)
+            k = torch.cat([kx, pad(self.k_norm(ky))], dim=1)
+            v = torch.cat([vx, pad(vy)], dim=1)
+            return self.proj_drop(self.proj(fa3_attention(q, k, v, mask["lens"] + N).reshape(B, N, C)))
         if mask is not None and mask.dtype == torch.int32:   # lever A: mask = valid keys per sample (N + caption length)
             H, Hc = self.num_heads, C // self.num_heads
             q, kx, vx = self.qkv_x(x).view(B, N, 3, H, Hc).unbind(2)
@@ -163,6 +180,11 @@ class TextRefineAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
+        if isinstance(mask, dict):   # lever E: packed captions, x [S, C]
+            S, C = x.shape
+            q, k, v = self.qkv(x).view(S, 3, self.num_heads, C // self.num_heads).unbind(1)
+            o = fa3_varlen(self.q_norm(q), self.k_norm(k), v, mask["cu"], mask["cu"], mask["max_T"], mask["max_T"])
+            return self.proj_drop(self.proj(o.reshape(S, C)))
         B, N, C = x.shape
         if mask is not None and mask.dtype == torch.int32:   # lever A: mask = caption length per sample
             q, k, v = self.qkv(x).view(B, N, 3, self.num_heads, C // self.num_heads).unbind(2)
@@ -194,6 +216,11 @@ class TextRefineBlock(nn.Module):
         )
 
     def forward(self, x, c, mask=None):
+        if isinstance(mask, dict):   # lever E: x [S, C]; each token takes its sample's modulation
+            m = self.adaLN_modulation(c).squeeze(1).index_select(0, mask["tok_b"])
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = m.chunk(6, dim=-1)
+            x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), mask)
+            return x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), mask)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
@@ -376,12 +403,23 @@ class JiT_T2I(nn.Module):
         )
         return x
     
-    def forward(self, x, t, y, return_layer=None, y_mask=None):
+    def forward(self, x, t, y, return_layer=None, y_mask=None, y_pack=None):
         """y_mask (ladder option B): [B, T] bool, True = a real caption token, T <= txt_max_length; None = the
-        official unmasked path (y padded to txt_max_length)."""
+        official unmasked path (y padded to txt_max_length). y_pack (lever E): packed captions, y [S, txt_embed_dim]."""
         B, _, H, W = x.shape
         x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
+        if y_pack is not None:
+            t = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
+            y = self.y_embedder(y) + self.y_pos_embedding[0].index_select(0, y_pack["pos"]).to(y.dtype)
+            condition = nn.functional.silu(t)
+            for block in self.text_refine_blocks:
+                y = block(y, condition, y_pack)
+            x = self.x_embedder(x)
+            x += self.pos_embed
+            for block in self.blocks:
+                x = block(x, y, condition, xpos, y_pack)
+            return self.unpatchify(self.final_layer(x), H, W)
         ypos = self.y_pos_embedding if y_mask is None else self.y_pos_embedding[:, :y.shape[1]]
         text_mask = full_mask = None
         if y_mask is not None and _ATTN == "fa3":   # lever A: valid keys per sample; captions are left-aligned (padding after)

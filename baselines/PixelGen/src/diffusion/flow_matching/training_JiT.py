@@ -48,7 +48,11 @@ class JiTTrainer(BaseTrainer):
         v_t = (x - x_t) / (1 - t.view(-1, 1, 1, 1)).clamp_min(self.t_eps)
 
         y_mask = metadata.get("y_mask") if isinstance(metadata, dict) else None
-        pred_img = net(x_t, t, y) if y_mask is None else net(x_t, t, y, y_mask=y_mask)
+        y_pack = metadata.get("y_pack") if isinstance(metadata, dict) else None   # MFU lever E: packed captions
+        if y_pack is not None:
+            pred_img = net(x_t, t, y, y_pack=y_pack)
+        else:
+            pred_img = net(x_t, t, y) if y_mask is None else net(x_t, t, y, y_mask=y_mask)
         out = (pred_img - x_t) / (1 - t.view(-1, 1, 1, 1)).clamp_min(self.t_eps)
 
         weight = self.loss_weight_fn(alpha, sigma)

@@ -98,3 +98,63 @@ def fa3_attention(q, k, v, seqused_k, softmax_scale=None):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
     return fa3_fwd(q.contiguous(), k.contiguous(), v.contiguous(), seqused_k, softmax_scale)[0]
+
+
+# Packed (varlen) form: q [Tq, H, D] and k/v [Tk, H, D] hold the sequences back to back; cu_seqlens_q/k [B + 1] int32
+# their offsets; max_seqlen_q/k bound the longest sequence (fixed bounds keep the compiled graphs static: the kernel's grid
+# covers max_seqlen, and blocks past a sequence's end exit at once).
+@torch.library.custom_op("gpic::fa3_varlen_fwd", mutates_args=(), device_types="cuda")
+def fa3_varlen_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor,
+                   max_seqlen_q: int, max_seqlen_k: int, softmax_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+    out, lse, *_ = _lib()._flash_attn_forward(
+        q, k, v, k_new=None, v_new=None, qv=None, out=None, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        cu_seqlens_k_new=None, seqused_q=None, seqused_k=None, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+        page_table=None, kv_batch_idx=None, leftpad_k=None, rotary_cos=None, rotary_sin=None, seqlens_rotary=None,
+        q_descale=None, k_descale=None, v_descale=None, softmax_scale=softmax_scale, causal=False)
+    return out, lse
+
+
+@fa3_varlen_fwd.register_fake
+def _(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale):
+    return torch.empty_like(q), q.new_empty((q.shape[1], q.shape[0]), dtype=torch.float32)
+
+
+@torch.library.custom_op("gpic::fa3_varlen_bwd", mutates_args=(), device_types="cuda")
+def fa3_varlen_bwd(dout: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor,
+                   lse: torch.Tensor, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor, max_seqlen_q: int,
+                   max_seqlen_k: int, softmax_scale: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dq, dk, dv = torch.empty_like(q), torch.zeros_like(k), torch.zeros_like(v)
+    _lib()._flash_attn_backward(
+        dout, q, k, v, out, lse, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, sequed_q=None, sequed_k=None,
+        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k, dq=dq, dk=dk, dv=dv, softmax_scale=softmax_scale,
+        causal=False)
+    return dq, dk, dv
+
+
+@fa3_varlen_bwd.register_fake
+def _(dout, q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale):
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+def _setup_varlen(ctx, inputs, output):
+    q, k, v, cu_q, cu_k, max_q, max_k, softmax_scale = inputs
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse, cu_q, cu_k)
+    ctx.max_q, ctx.max_k, ctx.softmax_scale = max_q, max_k, softmax_scale
+
+
+def _backward_varlen(ctx, dout, dlse):
+    q, k, v, out, lse, cu_q, cu_k = ctx.saved_tensors
+    dq, dk, dv = fa3_varlen_bwd(dout.contiguous(), q, k, v, out, lse, cu_q, cu_k, ctx.max_q, ctx.max_k, ctx.softmax_scale)
+    return dq, dk, dv, None, None, None, None, None
+
+
+fa3_varlen_fwd.register_autograd(_backward_varlen, setup_context=_setup_varlen)
+
+
+def fa3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale=None):
+    """Packed attention: q [Tq, H, D], k/v [Tk, H, D]; sequence b is rows cu[b]:cu[b+1]. Returns [Tq, H, D]."""
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    return fa3_varlen_fwd(q.contiguous(), k.contiguous(), v.contiguous(), cu_seqlens_q, cu_seqlens_k, int(max_seqlen_q),
+                          int(max_seqlen_k), softmax_scale)[0]
