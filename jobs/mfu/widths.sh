@@ -10,7 +10,9 @@
 # MFU per-width table (docs/mfu.md): on the production path (jobs/mfu/arm.sh, real Lite batches, shard seed 20261106, the
 # same batches in every arm, each rank's loss per step), for each given width: levers off, then each given lever set.
 # usage: widths.sh <code worktree> <steps> <width>:<set>[,<set>...] ...   sets: ACD, ACDE, ABCD, ABCDE (A FA3, B FSDP2,
-#   C GPU resize, D uint8, E packed + rebalanced captions)
+#   C GPU resize, D uint8, E packed + rebalanced captions), off (a second levers-off arm, d<width>_off2)
+# Parity floor (tools/mfu/parity_loss.py): off2 if listed, else the first set (put a rounding-only set first: ACD changes
+# only the attention kernel's rounding, C and D are bit-exact).
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 WT=${1:?code worktree} STEPS=${2:?steps}; shift 2
@@ -31,6 +33,7 @@ for spec in "$@"; do
   read -r nb nt <<< "$(geom $d)"
   arm d${d}_off $d $nb $nt $STEPS
   for s in ${sets//,/ }; do
+    [ $s = off ] && { arm d${d}_off2 $d $nb $nt $STEPS; continue; }
     env=(GPIC_MFU_ATTN=fa3)
     [[ $s == *B* ]] && env+=(GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP)
     [[ $s == *C* ]] && env+=(GPIC_MFU_GPU_RESIZE=1)
@@ -43,6 +46,7 @@ cd $WT
 python tools/mfu/bench_summary.py $(ls -d $OUT/d*/) --skip 100 | tee -a $OUT/summary.txt
 for spec in "$@"; do
   d=${spec%%:*}; sets=${spec#*:}
-  python tools/mfu/parity_loss.py $OUT/d${d}_off $OUT/d${d}_off $(for s in ${sets//,/ }; do echo $OUT/d${d}_$s; done) | tee -a $OUT/summary.txt
+  arms=(); for s in ${sets//,/ }; do [ $s = off ] && arms=($OUT/d${d}_off2 "${arms[@]}") || arms+=($OUT/d${d}_$s); done
+  python tools/mfu/parity_loss.py $OUT/d${d}_off "${arms[@]}" | tee -a $OUT/summary.txt
 done
 echo "DONE $OUT"
