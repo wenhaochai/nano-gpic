@@ -108,9 +108,10 @@ class BenchTimer(Callback):
             torch.cuda.synchronize()
             torch.cuda.profiler.start()
         if self.prof_range and step == self.prof_range[0] and self.prof is None:
+            light = os.environ.get("BENCH_PROFILE_LIGHT") == "1"   # the GPU timeline with little host overhead added
             self.prof = torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-                record_shapes=True, with_stack=True, with_flops=True, profile_memory=True)
+                record_shapes=not light, with_stack=not light, with_flops=not light, profile_memory=not light)
             self.prof.__enter__()
         self.cur = {"step": step,
                     "data_wait_s": (now - self.t_last_end) if self.t_last_end else (now - self.t_train_start),

@@ -58,6 +58,7 @@ for spec in "$@"; do
     [[ $s == *Z* ]] && env+=(GPIC_MFU_FP8=tensorwise)   # lever F8: FP8 GEMMs in the blocks, one scale per tensor (changes the numerics)
     [[ $s == *V* ]] && env+=(GPIC_MFU_FP8=rowwise)      # lever F8: one scale per row
     [[ $s == *P* ]] && env+=(BENCH_STAGES=1 BENCH_PROFILE=500:505)
+    [[ $s == *U* ]] && env+=(BENCH_PROFILE=1000:1006 BENCH_PROFILE_LIGHT=1)   # the GPU timeline, no stacks / shapes / memory
     # lever G0: Inductor's coordinate-descent tuning of the element-wise and reduction kernels (probe7: -2 to -3% at
     # d1024-d1280 on one GPU); its compile takes minutes longer, so the arm gets more time
     [[ $s == *T* ]] && env+=(TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 MFU_LIMIT=2400)
