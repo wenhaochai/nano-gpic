@@ -413,6 +413,32 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   micro-batch, while DDP's no_sync lets the ranks run 3 of 4 micro-batches apart, so their imbalance averages over the
   4 micro-batches before they wait. At 128 x 1 every step syncs anyway; the control without S is w1596.
 
+- A hang at the first data pass end (s8 w1722, w1724; s80 w1718; 2026-11-07 03:xx, my bug): one data pass is one epoch
+  of the wrapped DataLoader, so the first rank to end a pass started a new Lightning epoch alone, and its new iterator's
+  new_group waited for ranks that sat in the old group's all-reduce. Fix (genmodel, 31b2ffe): the loader restarts the
+  wrapped iterator on StopIteration and never ends (the run is one epoch; the scheduler steps per step), and the gloo
+  group is made once per loader. Test: tools/mfu/tests/test_shared_bucket_passes.py (8 gloo processes, different pass
+  lengths per rank: PASS; ddd4b99 hangs).
+- The workers dropped their unfinished bucket batches at every pass end, which costs the rare buckets most (an s8
+  worker's pass held about 164 samples of bucket 320, about 64 of them still queued: about 39% of its long captions per
+  pass; Lite about 12%, Full about 1.2%). 3338a8c keeps the queues on the worker's dataset copy, which persistent
+  workers keep between epochs (tools/mfu/tests/test_group_shared_passes.py: 0 lost against 1832 of 37800).
+- FD (genmodel's A/B, d640, Muon 3.4e-3, about 33.4k steps, FD with 50 Euler steps / held-out loss of the EMA):
+  shared 128 x 1 1016.6 / 0.06857 (K + K2 off: 1006.3 / 0.06852); per-rank 128 x 1 982.6 / 0.06856; per-rank 32 x 4
+  959.3 / 0.06854 (K + K2 off: 958.4); the lr search's code 949.2 / 0.06856. FD worsens as the buckets per optimizer
+  step fall from 32 to 8 to 1, the kernels change nothing (pairs within 1%), and the held-out loss does not see it.
+  Caption length is bimodal (90% at 16-64, 9% at 136-192), so a shared-bucket step at 128 x 1 is all short or all long
+  captions. At Muon 6.8e-3 the shared bucket is only 0.8% above the search (973.0 against 965.2). The bucket's
+  default waits for the owner. Costs: per-rank 128 x 1 is about +3% GPU-h (ladder MFU about 34.6%), per-rank 32 x 4
+  about +18% (about 30.2%, partly estimated).
+- Every process start (every resume) has a transient: the pools and the workers' queues start empty, and a worker emits
+  its first batch of a rare bucket after 128 / share samples (176: about 2.2k, 320: about 9.8k), at about the same time
+  on all 32 workers. In w1592 d640 the first 24 steps were all bucket 24, then 11 of 48, no T >= 144 before step 342,
+  then a burst (14 long-caption steps in 29). Later the sequence is close to i.i.d. (same bucket as the step before:
+  0.170 against 0.154).
+- Test harness note: arm.sh gives every arm its own shard log (GPIC_SHARD_LOG_DIR=<out>/<tag>), so a resumed arm reads
+  pass 0 again from its start (its bucket sequence repeats the first arm's). Production keeps one log per run.
+
 ### Muon (src/optim/muon.py, src/optim/muon_fsdp.py; owner 2026-11-07 00:5x, recipe from the popup at 01:0x)
 - The question-5 reference (branch muon a403ed1: MuonAdamW for the blocks' matrices, AdamW for the rest; under DDP one
   owner rank per matrix part does the bf16 Newton-Schulz, one all_gather spreads the updates) with an update_scale
