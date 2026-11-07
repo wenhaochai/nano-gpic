@@ -530,6 +530,7 @@ owner：「我觉得整张图一个混合不错，是合理的」。原因：逐
     6. M7（以后要改）：`gmflow_b2/jobs/continue_run.sh` 只传 gm_k，不传 gm_scope 和退火参数。gm_scope image 不加参数，所以续训一个整图运行会静默地按逐像素训练。续训 w1402 或这个运行到 2C0 之前，要先让 continue_run.sh 读 scope.txt（以及 spread.txt、lam.txt）。
     7. 运行时要看：r_neff 随 τ 的变化（应该分台阶下降）；mu_spread（应该在 r_neff 下降时上升）；第 15584 步和之后 46752 步精确损失期间的 win_alive 和 w_dead（慢慢减少是 k-means 式的死分量，突然下降是塌缩）；同一步的 gm/nll_exact 和 w1402 比；四个 σ 区间的 s_u。
     8. 如果第 15584 步以后 win_alive 又下降：审查建议的后备是重启死分量（把胜者输出层的行加噪声复制给死分量，像 VQ 码本重置）。它会改变训练动态，所以是一个新的对照臂，要先弹窗。
+12. 冒烟测试（GPU，都通过）：w1424（54253d4，`--anneal 196608:300`，21:18）和 w1428（986665f，`--anneal 196608:768`，22:13，runs/gpic-speed/gmflow_k8_d640_annealsmoke1106220440）。w1428：每一行的 τ 都等于它的全局步数对应的值，续训也在退火期间（第 557 步 τ = 28.47）；τ > 1000 时 r_neff 平均 7.0，τ = 1821 时 3.2，τ ≈ 28 时 1.0；mu_spread 在候选图分享梯度时从 0.43 降到 0.30，续训后是 0.38；nll_exact 有限；预热后没有重新编译；0.0304 s/步；另一个 `--anneal` 被拒绝；gm_draw 和 euler_mean 的采样检查通过。审查 GO 加上这个冒烟以后，w1425 在 22:2x 改回 prio 0，先来后到。
 
 ## 17. GMFlow 上 Full ladder（owner 2026-11-06 21:4x 批准）
 
