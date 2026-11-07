@@ -163,6 +163,81 @@ def _read(view, d):
     return s
 
 
+def write_batch(view, batch):
+    """The whole batch into a slot in six bulk copies (the job's flat crops, the two passes' tables, the geometry, the
+    caption rows); returns the descriptor the other ranks need: per-sample byte ranges and the regions' layout."""
+    job, caps, meta = batch
+    regions, o = {}, 0
+    for name, t in (("src", job["src"]), ("xmin", job["xmin"]), ("kk", job["kk"]), ("hw", job["hw"]),
+                    ("axis", job["axis"]), ("emb", meta["text_emb"])):
+        t = t.contiguous()
+        n = t.numel() * t.element_size()
+        if o + n > view.numel():
+            raise RuntimeError(f"rebalance slot of {view.numel() >> 20} MiB too small (GPIC_MFU_REBALANCE_SLOT_MB)")
+        if n:
+            view[o:o + n].view(t.dtype).view(t.shape).copy_(t)
+        regions[name] = (o, tuple(t.shape), str(t.dtype).replace("torch.", ""))
+        o = _align(o + n)
+    lens = [int(x) for x in meta["text_lens"]]
+    off = job["src_off"].tolist()
+    sizes = [b - a for a, b in zip(off, off[1:] + [job["src"].numel()])]
+    return {"regions": regions, "src_off": off, "src_size": sizes, "lens": lens,
+            "emb_start": np.concatenate([[0], np.cumsum(lens)[:-1]]).astype(int).tolist(),
+            "caps": list(caps), "types": list(meta["caption_type"])}
+
+
+def _region(view, reg):
+    o, shape, dt = reg
+    dtype = getattr(torch, dt)
+    n = int(np.prod(shape)) * torch.empty((), dtype=dtype).element_size()
+    return view[o:o + n].view(dtype).view(shape) if n else torch.empty(shape, dtype=dtype)
+
+
+def assemble_batch(views, infos, mine, pin):
+    """This rank's batch from the slots: mine = [(source rank, position)] in position order. The same batch
+    join_samples builds from the same samples, with one cat or indexed copy per field and source rank."""
+    from src.data.dataset.pil_exact_gpu import OUT, _geometry
+    B = len(mine)
+    R = {r: {k: _region(views[r], v) for k, v in infos[r]["regions"].items()} for r in {r for r, _ in mine}}
+    sizes = [infos[r]["src_size"][i] for r, i in mine]
+    off = np.zeros(B, dtype=np.int64)
+    off[1:] = np.cumsum(sizes)[:-1]
+    flat = torch.empty(sum(sizes), dtype=torch.uint8, pin_memory=pin)
+    torch.cat([R[r]["src"][infos[r]["src_off"][i]:infos[r]["src_off"][i] + infos[r]["src_size"][i]] for r, i in mine],
+              out=flat)
+    K = max(R[r]["kk"].shape[-1] for r in R)
+    xmin = torch.empty(B, 2, OUT, dtype=torch.int32, pin_memory=pin)
+    kk = torch.zeros(B, 2, OUT, K, dtype=torch.int32, pin_memory=pin)
+    hw = torch.empty(B, 3, 2, dtype=torch.int64)
+    axis = torch.empty(B, 2, dtype=torch.int64)
+    for r in R:   # one indexed copy per field and source rank
+        pos = [b for b, (rr, _) in enumerate(mine) if rr == r]
+        idx = torch.tensor([i for rr, i in mine if rr == r])
+        p = torch.tensor(pos)
+        xmin[p] = R[r]["xmin"][idx]
+        kk[p, :, :, :R[r]["kk"].shape[-1]] = R[r]["kk"][idx]
+        hw[p] = R[r]["hw"][idx]
+        axis[p] = R[r]["axis"][idx]
+    hw_np, axis_np = hw.numpy(), axis.numpy()
+    g1, mid_bytes = _geometry(hw_np, axis_np, 0)
+    g2, _ = _geometry(hw_np, axis_np, 1)
+    mid_off = np.zeros(B, dtype=np.int64)
+    mid_off[1:] = np.cumsum(mid_bytes)[:-1]
+    job = {"src": flat, "src_off": torch.from_numpy(off), "xmin": xmin, "kk": kk,
+           "geo": torch.from_numpy(np.stack([g1, g2])), "mid_off": torch.from_numpy(mid_off),
+           "out_off": torch.arange(B, dtype=torch.int64) * (OUT * OUT * 3), "K": int(K), "B": B,
+           "mid_bytes": int(mid_bytes.sum()), "n_i_max": [int(g1[0].max()), int(g2[0].max())], "hw": hw, "axis": axis}
+    lens = [infos[r]["lens"][i] for r, i in mine]
+    D = R[mine[0][0]]["emb"].shape[-1]
+    emb = torch.empty(sum(lens), D, dtype=R[mine[0][0]]["emb"].dtype, pin_memory=pin)
+    torch.cat([R[r]["emb"][infos[r]["emb_start"][i]:infos[r]["emb_start"][i] + infos[r]["lens"][i]] for r, i in mine],
+              out=emb)
+    meta = {"caption_type": [infos[r]["types"][i] for r, i in mine], "text_emb": emb, "text_lens": lens}
+    if pin:   # every tensor pinned, as the loader's pin thread does: a pageable copy to the GPU blocks the host (perf C7)
+        job = {k: (v.pin_memory() if torch.is_tensor(v) and not v.is_pinned() else v) for k, v in job.items()}
+    return job, [infos[r]["caps"][i] for r, i in mine], meta
+
+
 class RebalancingLoader:
     """Wraps the training loader: iterating it yields rebalanced batches (see the module doc)."""
 
@@ -219,18 +294,16 @@ class _Iter:
         try:
             while True:
                 batch = next(it)
-                samples = split_samples(batch)
                 k = s % 2
-                desc = _write(self.slots.view[(self.rank, k)], samples)
+                desc = write_batch(self.slots.view[(self.rank, k)], batch)
                 infos = [None] * self.world
                 dist.all_gather_object(infos, desc, group=self.group)   # also: every rank's slot k is written
-                all_lens = [[d["len"] for d in inf] for inf in infos]
-                B = len(samples)
+                all_lens = [inf["lens"] for inf in infos]
+                B = len(all_lens[self.rank])
                 assert all(len(l) == B for l in all_lens), [len(l) for l in all_lens]
                 _, _, _, recv = plan(all_lens, self.rank, self.world, B)
                 mine = sorted(recv, key=lambda ri: ri[1])   # (source rank, position) in position order
-                new = [_read(self.slots.view[(r, k)], infos[r][i]) for r, i in mine]
-                out = join_samples(new, self.pin)   # copies: the slot is free once this returns
+                out = assemble_batch({r: self.slots.view[(r, k)] for r in range(self.world)}, infos, mine, self.pin)
                 loads = [sum(l) for l in all_lens]
                 self.balance.append((max(loads) / (sum(loads) / self.world), None))
                 self.q.put(out)

@@ -6,7 +6,8 @@ long-captioned as the length grouping makes them). Checks, over 6 steps:
 2. over all ranks each sample of a step comes out once, at its own batch position (its t and noise);
 3. each sample's bytes (source crop, both passes' tables, geometry, caption rows) equal those of its source batch;
 4. the busiest rank's caption tokens over the mean fall (the deal does its job);
-5. an iterator created and dropped before the real one (Lightning's iterability check) takes no batch (w1420).
+5. an iterator created and dropped before the real one (Lightning's iterability check) takes no batch (w1420);
+6. the loader's batched assembly (write_batch, assemble_batch) gives exactly the batch join_samples builds.
 usage: python test_rebalance_loader.py
 """
 import os, random, sys, tempfile
@@ -68,7 +69,7 @@ def worker(rank, init):
     os.environ["MASTER_PORT"] = "0"
     os.environ["GPIC_MFU_REBALANCE_SLOT_MB"] = "64"
     dist.init_process_group("gloo", init_method=init, rank=rank, world_size=W)
-    from src.data.rebalance_loader import RebalancingLoader, split_samples, join_samples
+    from src.data.rebalance_loader import RebalancingLoader, split_samples, join_samples, plan
     ok = True
     # 1. round trip
     b0 = fake_batch(rank, 0)
@@ -81,6 +82,11 @@ def worker(rank, init):
     worst_before, worst_after = [], []
     for s in range(STEPS):
         job, caps, meta = next(it)
+        # the batched assembly equals the per-sample one (join_samples) for the same deal
+        all_lens = [fake_batch(r, s)[2]["text_lens"] for r in range(W)]
+        _, _, _, recv = plan(all_lens, rank, W, B)
+        ref = join_samples([split_samples(fake_batch(r, s))[i] for r, i in sorted(recv, key=lambda ri: ri[1])], pin=False)
+        ok &= same(job, ref[0]) and same(caps, ref[1]) and same(meta, ref[2])
         got = split_samples((job, caps, meta))
         mine = [(c, i) for i, c in enumerate(caps)]
         allc = [None] * W
