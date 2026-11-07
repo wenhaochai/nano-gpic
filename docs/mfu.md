@@ -246,6 +246,22 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   H2 also moves the EMA lerp from its side stream onto the critical path, so H1 is the better form.
 - Decision: off by default. A DDP-width option (d640-d768) only; re-measure H1 with the aligned kernel there.
 
+### B3. FSDP2's per-parameter host work (planned)
+- Observation: under FSDP2 the host binds part of the step at d1024-d1280. Per-stage medians (BENCH_STAGES, GPU / host
+  ms): d1280 A+B+C+D forward 21.3 / 25.9, optimizer 1.7 / 7.8; d1024 A+B+C+D+L+G3 forward 14.0 / 17.1. In the profiled
+  steps FSDP2's hooks hold about a third of the host's time (d1024 L+G3: pre_forward 9.3, post_backward_reduce 6.7,
+  reshard 1.5, root callback 1.9 ms per profiled step), and the part that grouping cannot remove is per parameter:
+  each step FSDP2 builds a new reduce-scatter output, makes one DTensor per sharded gradient and swaps every parameter
+  between its sharded and unsharded tensor (about 200 parameters at d1024). Grouping took d1024 from 52.9 (G1) to 41.3
+  ms (G6) and then stopped (G12 41.5).
+- Design: the same math as B with flat buffers per unit and no per-parameter work per step: the module's parameters
+  are bf16 views into one unsharded buffer per unit (all-gathered after the optimizer step, waited on per unit before
+  its forward); gradients reduce-scattered in fp32 per unit when the unit's backward ends; the fp32 master weights, Adam
+  moments and EMA as flat shards, updated by lever H's kernel on one tensor per unit, which also writes the bf16 shard
+  for the next all-gather; RMSNorm weights and pos_embed replicated in fp32 as now. Checkpoints gather the shards into
+  the same fp32 keys and AdamW states.
+- Expectation: most of FSDP2's host work goes; d1024 and d1280 become GPU-bound: about -10% at d1024, -6% at d1280.
+
 ### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
 - Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches
   (13%) make a step wait in about two thirds of the steps (5.9 ms at d640, 6.1 ms at d1280, w1316). A FLOP model of the
