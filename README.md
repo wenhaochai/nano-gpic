@@ -23,9 +23,9 @@ This repository is a fork of the GPIC code release ([keshik6/gpic](https://githu
 
 ## What we have so far
 
-<img src="docs/readme/readme_all_points.png" width="560" alt="FD of every evaluation against training compute 6ND: our frontier and the official recipe">
+<img src="docs/readme/readme_all_points.png" width="560" alt="FD of every evaluation against training compute 6ND: our frontier and the official recipe's frontier">
 
-Every evaluation of every run, against training compute 6ND. Blue is our frontier, the lowest FD reached at or below each compute in the standard evaluation; red is the official AdamW recipe on GPIC Full, its ladder and the released model; grey is everything else, whatever its sampler.
+Every evaluation of every run, against training compute 6ND. Blue is our frontier, the lowest FD reached at or below each compute in the standard evaluation; red is the same frontier for the official AdamW recipe on GPIC Full, its ladder and the released model; grey is every other evaluation, whatever its sampler.
 
 <img src="docs/readme/readme_muon_adamw.png" width="560" alt="FD at 1.4e19 FLOPs by parameters, Muon against AdamW">
 
