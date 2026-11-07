@@ -2,7 +2,7 @@
 """Per-step breakdown of an arm's profiled window (jobs/mfu/gap_*.sh: BENCH_PROFILE, light): GPU time per kernel class,
 GPU idle time, and the waits, per rank, averaged over the profiled steps after the first.
 
-Kernel classes (by name): gemm (cuBLAS nvjet / cutlass GEMMs), attention (FlashAttention-3), qk_prep (lever K2),
+Kernel classes (by name; Inductor's fused_cat kernels count as other: they compute): gemm (cuBLAS nvjet / cutlass GEMMs), attention (FlashAttention-3), qk_prep (lever K2),
 norm (lever K), copy_index (concatenations, index copies and fills: the unfused packed path's key buffer), optimizer
 (multi_tensor_apply: AdamW / EMA), nccl, memcpy, other (the rest of the elementwise and reduction kernels).
 Waits: idle = the GPU window minus the union of its kernels; straggler = this rank's NCCL time minus the smallest NCCL
@@ -29,8 +29,8 @@ def klass(n):
         return "optimizer"
     if n.startswith("Memcpy") or n.startswith("Memset"):
         return "memcpy"
-    if re.search(r"index|scatter|Fill|fused_cat|_cat_", n):
-        return "copy_index"
+    if re.search(r"index|scatter|Fill", n):   # Inductor's "fused_cat" kernels compute (e.g. the SwiGLU backward writes both
+        return "copy_index"                   # halves of its input gradient into one buffer): they stay in "other"
     return "other"
 
 
