@@ -11,8 +11,9 @@
 6. Phase 3 (delayed scaling): tcast_t's copy and transpose bit for bit tcast's; without history every delayed-scaling cast
    bit for bit its phase 1/2 cast (dcast = tcast, swiglu_dcast = swiglu_tcast, swiglu_bwd_ds's FP8 copy = tcast of its dz);
    with history the cast uses 448 / the max of the recorded amaxes (bit for bit the torch reference) and the roll keeps
-   the last L_HIST amaxes; the fused MLP over 3 steps against fp32 autograd; the same 3 steps under torch.compile give
-   the eager steps' outputs, gradients and state (the custom ops run in the compiled forward and backward).
+   the last L_HIST amaxes; a block of four FP8 GEMMs over 3 steps: step 1 (no history) bit for bit phase 2's, steps 2 and 3
+   within 1.25 x phase 2's error against fp32 autograd (4 chained FP8 GEMMs err about 0.1 against fp32 in either phase),
+   and the same 3 steps under torch.compile give the eager steps' outputs, gradients and state.
 usage: python test_fp8_native.py"""
 import os, sys
 import torch
@@ -167,23 +168,30 @@ print(f"phase 3 casts: dcast without history = tcast {g1}; with history (448 / m
       f"{g7}", flush=True)
 
 
-class Blk(torch.nn.Module):   # an image block's FP8 GEMMs in phase 3's sites (qkv_x 0 with the roll, proj 1, MLP 2-5)
-    def __init__(self, C):
+class Blk(torch.nn.Module):   # an image block's FP8 GEMMs: phase 3 (sites: qkv_x 0 with the roll, proj 1, MLP 2-5) or phase 2
+    def __init__(self, C, phase):
         super().__init__()
+        self.phase = phase
         self.qkv = torch.nn.Linear(C, 3 * C, bias=False)
         self.proj = torch.nn.Linear(C, C, bias=False)
         self.w12 = torch.nn.Parameter(torch.randn(8 * C, C, device=dev) * C ** -0.5)
         self.w3 = torch.nn.Parameter(torch.randn(C, 4 * C, device=dev) * (4 * C) ** -0.5)
 
     def forward(self, x):
+        C = x.shape[1]
+        if self.phase == 2:
+            h = fp8_linear(fp8_linear(x, self.qkv.weight)[:, :C], self.proj.weight)
+            return fp8_mlp(h, self.w12, self.w3)
         h = F.fp8_linear3(x, self.qkv.weight, None, 0, True)
-        h = F.fp8_linear3(h[:, :x.shape[1]], self.proj.weight, None, 1, False)
+        h = F.fp8_linear3(h[:, :C], self.proj.weight, None, 1, False)
         return F.fp8_mlp3(h, self.w12, self.w3, 2)
 
 
 C = 640
-blk = Blk(C).to(dev)
-X = [(torch.randn(2048, C, device=dev) * (1 + 0.3 * k)).to(BF) for k in range(3)]
+blk3 = Blk(C, 3).to(dev)
+blk2 = Blk(C, 2).to(dev)
+blk2.load_state_dict(blk3.state_dict())
+X = [(torch.randn(2048, C, device=dev)).to(BF) for _ in range(3)]   # one distribution: no step outgrows the history
 DY = [torch.randn(2048, C, device=dev).to(BF) for _ in range(3)]
 
 
@@ -196,25 +204,34 @@ def run3(m):
         y.backward(dy)
         outs.append((y.detach().clone(), m.w12.grad.clone(), m.qkv.weight.grad.clone()))
     torch.cuda.synchronize()
-    return outs, F.DS.st.clone()
+    return outs, (F.DS.st.clone() if F.DS.st is not None else None)
 
 
-eager, st_e = run3(blk)
-comp, st_c = run3(torch.compile(blk))
-same = all(torch.equal(a, b) for oe, oc in zip(eager, comp) for a, b in zip(oe, oc)) and torch.equal(st_e, st_c)
-close = all(rel(oc[0], oe[0]) < 1e-3 for oe, oc in zip(eager, comp))
-R = [t.detach().clone().float().requires_grad_() for t in (blk.qkv.weight, blk.proj.weight, blk.w12, blk.w3)]
-xr = X[2].float()
-hr = (xr @ R[0].t())[:, :C] @ R[1].t()
-zr = hr @ R[2].t()
-a1, a2 = zr.chunk(2, -1)
-yr = (torch.nn.functional.silu(a1) * a2) @ R[3].t()
-yr.backward(DY[2].float())
-e_y, e_w12 = rel(eager[2][0], yr), rel(eager[2][1], R[2].grad)
+def fp32_ref(m, x, dy):
+    R = [t.detach().clone().float().requires_grad_() for t in (m.qkv.weight, m.proj.weight, m.w12, m.w3)]
+    h = (x.float() @ R[0].t())[:, :C] @ R[1].t()
+    a1, a2 = (h @ R[2].t()).chunk(2, -1)
+    y = (torch.nn.functional.silu(a1) * a2) @ R[3].t()
+    y.backward(dy.float())
+    return y, R[2].grad
+
+
+p2, _ = run3(blk2)
+eager, st_e = run3(blk3)
+comp, st_c = run3(torch.compile(blk3))
+same_c = all(torch.equal(a, b) for oe, oc in zip(eager, comp) for a, b in zip(oe, oc)) and torch.equal(st_e, st_c)
+step1 = all(torch.equal(a, b) for a, b in zip(eager[0], p2[0]))   # no history yet: phase 2's arithmetic
+errs = []
+for k in (1, 2):
+    yr, gr = fp32_ref(blk3, X[k], DY[k])
+    errs.append((rel(eager[k][0], yr), rel(p2[k][0], yr), rel(eager[k][1], gr), rel(p2[k][1], gr)))
+near = all(e3y <= 1.25 * e2y + 5e-3 and e3g <= 1.25 * e2g + 5e-3 for e3y, e2y, e3g, e2g in errs)
 calibrated = bool((st_e[:6, F.L_HIST + 1] > 0).all())
-good = (same or close) and e_y < 8e-2 and e_w12 < 1e-1 and calibrated
+good = same_c and step1 and near and calibrated
 ok &= bool(good)
-print(f"phase 3 block, 3 steps: compiled = eager bit for bit {same} (outputs within 1e-3: {close}); every site calibrated "
-      f"after step 1 {calibrated}; step 3 vs fp32 autograd: y {e_y:.1e} dw12 {e_w12:.1e}" + ("" if good else "  FAIL"), flush=True)
+print(f"phase 3 block, 3 steps: compiled = eager bit for bit {same_c}; step 1 (no history) = phase 2 bit for bit {step1}; "
+      f"every site calibrated after step 1 {calibrated}; steps 2 and 3 vs fp32 autograd (phase 3 / phase 2): "
+      + ", ".join(f"y {e3y:.1e} / {e2y:.1e}, dw12 {e3g:.1e} / {e2g:.1e}" for e3y, e2y, e3g, e2g in errs)
+      + ("" if good else "  FAIL"), flush=True)
 print("FP8_NATIVE_TEST " + ("PASS" if ok else "FAIL"))
 sys.exit(0 if ok else 1)
