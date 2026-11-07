@@ -213,7 +213,12 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
 - Per-kernel bandwidth (Inductor profile_bandwidth, d1280): the element-wise and reduction kernels of a step move
   about 39 GB (forward 14.8, backward 24.0); the worst are the backward's sums over tokens for the modulation gradients
   (triton_red_fused__to_copy_mul_sum_*, 0.9-1.3 TB/s alone) and many tiny kernels bound by their launch.
-- Production test with 1024-step parity: w1421 (letter T in jobs/mfu/widths.sh).
+- Production (w1421, 1024 steps, mean ms): d1280 A+B+C+D 65.64 -> +T 64.40 (-1.9%); d1024 A+B+C+D+L+G3 42.92 -> 42.86
+  (no gain: the FSDP2 step there is bound by the host); d640 A+C+D 24.60 -> 25.21 (within d640's noise; bound by the
+  host and the data path). Parity: T's early divergence from levers off is A+B+C+D's exactly (first-100 relative
+  difference 1.43e-4 at d1280 in both), the 500-step mean loss +0.12% at d1280 (inside the same-math spread of 0.3-0.65%;
+  the 3x-floor rule flags it only because that job's floor pair happened to agree to 0.03%), PASS at d1024 and d640.
+- Decision: T from d1280 up (GPU-bound widths), not below.
 
 ### H. The clip multiply, AdamW and the EMA in one kernel (`GPIC_MFU_FUSED_OPT=1`: clip + AdamW; `=2`: also the EMA)
 - Hypothesis: under DDP every rank runs the clip's multiply (a read and a write of every gradient), torch's fused AdamW
