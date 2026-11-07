@@ -60,7 +60,7 @@ class CompileWarmup(Callback):
             trainer.strategy.barrier()
             if trainer.is_global_zero:
                 print(f"[warmup] T={T}: {time.time() - t0:.1f} s", flush=True)
-        if os.environ.get("GPIC_MFU_FP8") == "native3":   # FP8 phase 3: the dummy batches' amaxes are not the data's
+        if os.environ.get("GPIC_MFU_FP8") in ("native3", "native4"):   # FP8 phases 3-4: the dummy batches' amaxes are not the data's
             from src.models.layers.fp8_native import ds_reset
             ds_reset()
         if trainer.is_global_zero:

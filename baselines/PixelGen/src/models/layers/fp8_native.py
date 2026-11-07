@@ -14,6 +14,8 @@ at our shapes (tools/mfu/fp8_gemm_bench.py, w1879). Here:
 Changes the numerics: the forward GEMM inputs are rounded to e4m3 (3 mantissa bits) with one scale per tensor; the master weights stay as
 they are (fp32 under DDP, the FSDP2 bf16 compute copy). The SwiGLU product is kept in FP8 (half its bf16 memory).
 """
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -272,12 +274,12 @@ class _Fp8MLP(torch.autograd.Function):
 # their max, so the cast is one pass, and it records this step's amax. A site without history (the first step, or after
 # ds_reset) is cast with its own current amax, as in phases 1 and 2 (the same arithmetic: the same values bit for bit).
 # The first cast of a step (block 0's attention input) rolls every site's history first. The state lives in DS.st
-# [sites, W_ST] fp32 on the device: the history, this step's amax (its int32 bits, an atomic max), the scale and the
-# dequantization scale (both 0 without history). The casts that read or write it are opaque custom ops: the compiler
+# [sites, W_ST] fp32 on the device: the history, this step's amax (its int32 bits, an atomic max) and the history's max (0
+# without history); each cast derives its scale from that max with its own format's largest value. The casts that read or write it are opaque custom ops: the compiler
 # sees pure functions, the state is touched only when they run, and their order is the data's (each site's input
 # depends on the sites before it).
 L_HIST = 16
-W_ST = L_HIST + 3     # history, this step's amax, scale, dequantization scale
+W_ST = L_HIST + 2     # history, this step's amax, the history's max
 
 
 class _DSState:
@@ -309,9 +311,7 @@ def _ds_roll_kernel(ST, STI, L: tl.constexpr, W: tl.constexpr):
         h = tl.where(i == 0, cur, tl.load(ST + s * W + i - 1, mask=i > 0, other=0.0))
         tl.store(ST + s * W + i, h)
         tl.store(STI + s * W + L, 0)
-        mx = tl.max(h, axis=0)
-        tl.store(ST + s * W + L + 1, tl.math.div_rn(448.0, mx))
-        tl.store(ST + s * W + L + 2, tl.math.div_rn(mx, 448.0))
+        tl.store(ST + s * W + L + 1, tl.max(h, axis=0))
 
 
 @triton.jit
@@ -327,10 +327,10 @@ def _ds_cast_kernel(X, Q, S, N, ST, STI, site, L: tl.constexpr, W: tl.constexpr,
     pid = tl.program_id(0)
     i = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     x = tl.load(X + i, mask=i < N, other=0.0).to(tl.float32)
-    sc = tl.load(ST + site * W + L + 1)
-    if sc > 0.0:
-        scale = sc
-        dq = tl.load(ST + site * W + L + 2)
+    mx = tl.load(ST + site * W + L + 1)
+    if mx > 0.0:
+        scale = tl.math.div_rn(448.0, mx)
+        dq = tl.math.div_rn(mx, 448.0)
         tl.atomic_max(STI + site * W + L, tl.max(tl.abs(x), axis=0).to(tl.int32, bitcast=True))
     else:
         a = tl.maximum(tl.load(ST + site * W + L), 1e-12)
@@ -355,10 +355,10 @@ def _swiglu_ds_cast_kernel(Z, Q, S, H, sz, sq, ST, STI, site, L: tl.constexpr, W
     row = tl.program_id(0)
     k = tl.program_id(1) * BH + tl.arange(0, BH)
     a = _swiglu_tile(Z + row.to(tl.int64) * sz, H, k, k < H)
-    sc = tl.load(ST + site * W + L + 1)
-    if sc > 0.0:
-        scale = sc
-        dq = tl.load(ST + site * W + L + 2)
+    mx = tl.load(ST + site * W + L + 1)
+    if mx > 0.0:
+        scale = tl.math.div_rn(448.0, mx)
+        dq = tl.math.div_rn(mx, 448.0)
         tl.atomic_max(STI + site * W + L, tl.max(tl.abs(a), axis=0).to(tl.int32, bitcast=True))
     else:
         am = tl.maximum(tl.load(ST + site * W + L), 1e-12)
@@ -388,8 +388,9 @@ def _swiglu_bwd_ds_kernel(Z, DA, DZ, DQ, H, sz, sda, sdz, sdq, ST, STI, site, L:
     tl.store(DZ + row * sdz + H + k, d2, mask=m)
     a = tl.maximum(tl.max(tl.abs(d1.to(tl.float32)), axis=0), tl.max(tl.abs(d2.to(tl.float32)), axis=0))
     tl.atomic_max(STI + site * W + L, a.to(tl.int32, bitcast=True))
-    sc = tl.load(ST + site * W + L + 1)
-    if sc > 0.0:
+    mx = tl.load(ST + site * W + L + 1)
+    if mx > 0.0:
+        sc = tl.math.div_rn(448.0, mx)
         tl.store(DQ + row * sdq + k, tl.minimum(tl.maximum(d1.to(tl.float32) * sc, -448.0), 448.0).to(tl.float8e4nv), mask=m)
         tl.store(DQ + row * sdq + H + k, tl.minimum(tl.maximum(d2.to(tl.float32) * sc, -448.0), 448.0).to(tl.float8e4nv),
                  mask=m)
@@ -398,10 +399,10 @@ def _swiglu_bwd_ds_kernel(Z, DA, DZ, DQ, H, sz, sda, sdz, sdq, ST, STI, site, L:
 @triton.jit
 def _ds_late_cast_kernel(X, Q, S, N, ST, site, L: tl.constexpr, W: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    sc = tl.load(ST + site * W + L + 1)
-    if sc > 0.0:   # the producer wrote the FP8 copy with the delayed scale
+    mx = tl.load(ST + site * W + L + 1)
+    if mx > 0.0:   # the producer wrote the FP8 copy with the delayed scale
         if pid == 0:
-            tl.store(S, tl.load(ST + site * W + L + 2))
+            tl.store(S, tl.math.div_rn(mx, 448.0))
     else:
         a = tl.maximum(tl.load(ST + site * W + L), 1e-12)
         scale = tl.math.div_rn(448.0, a)
@@ -599,6 +600,291 @@ class Fp8Linear3(torch.nn.Linear):
         return fp8_linear3(x, self.weight, self.bias, self._fp8_site, self._fp8_roll)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Phase 4 (GPIC_MFU_FP8=native4): phase 3 with every backward GEMM of the image blocks in FP8: the weight gradients of
+# qkv_x, proj, w12 and w3 (dW = dY^T X from both operands' transposed FP8 copies, fp32 accumulation) and the dgrads of
+# qkv_x and proj. Each activation and gradient cast writes its row-major and its transposed FP8 copy in one pass (tiles,
+# delayed scaling as phase 3); the SwiGLU backward writes dz's two FP8 copies and no bf16 dz. Sites per block: qkv_x x 0
+# (it rolls) and dy 1, proj x 2 and dy 3, MLP x 4, product 5, dy 6, dz 7. GPIC_MFU_FP8_GRAD=e5m2 casts the gradients to
+# e5m2 (range 2^-16..57344) instead of e4m3; _scaled_mm takes an e5m2 operand beside an e4m3 one.
+_GRAD_E5 = os.environ.get("GPIC_MFU_FP8_GRAD", "e4m3") == "e5m2"
+E5 = torch.float8_e5m2
+
+
+@triton.jit
+def _ds_scale(ST, STI, site, tile_amax, L: tl.constexpr, W: tl.constexpr, FMAX: tl.constexpr):
+    mx = tl.load(ST + site * W + L + 1)
+    if mx > 0.0:
+        scale = tl.math.div_rn(FMAX, mx)
+        dq = tl.math.div_rn(mx, FMAX)
+        tl.atomic_max(STI + site * W + L, tile_amax.to(tl.int32, bitcast=True))
+    else:
+        a = tl.maximum(tl.load(ST + site * W + L), 1e-12)
+        scale = tl.math.div_rn(FMAX, a)
+        dq = tl.math.div_rn(a, FMAX)
+    return scale, dq
+
+
+@triton.jit
+def _ds_cast_t_kernel(X, Q, QT, S, M, K, ST, STI, site, L: tl.constexpr, W: tl.constexpr, FMAX: tl.constexpr,
+                      E5M2: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr):
+    pm = tl.program_id(0)
+    pk = tl.program_id(1)
+    r = pm * BM + tl.arange(0, BM)
+    c = pk * BK + tl.arange(0, BK)
+    m = (r < M)[:, None] & (c < K)[None, :]
+    x = tl.load(X + r.to(tl.int64)[:, None] * K + c[None, :], mask=m, other=0.0).to(tl.float32)
+    scale, dq = _ds_scale(ST, STI, site, tl.max(tl.max(tl.abs(x), axis=1), axis=0), L, W, FMAX)
+    v = tl.minimum(tl.maximum(x * scale, -FMAX), FMAX)
+    if E5M2:
+        tl.store(Q + r.to(tl.int64)[:, None] * K + c[None, :], v.to(tl.float8e5), mask=m)
+        tl.store(QT + c.to(tl.int64)[:, None] * M + r[None, :], tl.trans(v).to(tl.float8e5), mask=tl.trans(m))
+    else:
+        tl.store(Q + r.to(tl.int64)[:, None] * K + c[None, :], v.to(tl.float8e4nv), mask=m)
+        tl.store(QT + c.to(tl.int64)[:, None] * M + r[None, :], tl.trans(v).to(tl.float8e4nv), mask=tl.trans(m))
+    if (pm == 0) & (pk == 0):
+        tl.store(S, dq)
+
+
+@triton.jit
+def _swiglu_ds_cast_t_kernel(Z, Q, QT, S, M, H, sz, ST, STI, site, L: tl.constexpr, W: tl.constexpr, BM: tl.constexpr,
+                             BH: tl.constexpr):
+    pm = tl.program_id(0)
+    ph = tl.program_id(1)
+    r = pm * BM + tl.arange(0, BM)
+    k = ph * BH + tl.arange(0, BH)
+    m = (r < M)[:, None] & (k < H)[None, :]
+    zr = Z + r.to(tl.int64)[:, None] * sz
+    z1 = tl.load(zr + k[None, :], mask=m, other=0.0).to(tl.float32)
+    z2 = tl.load(zr + H + k[None, :], mask=m, other=0.0).to(tl.float32)
+    a = ((z1 * tl.sigmoid(z1)).to(tl.bfloat16).to(tl.float32) * z2).to(tl.bfloat16).to(tl.float32)
+    scale, dq = _ds_scale(ST, STI, site, tl.max(tl.max(tl.abs(a), axis=1), axis=0), L, W, 448.0)
+    v = tl.minimum(tl.maximum(a * scale, -448.0), 448.0)
+    tl.store(Q + r.to(tl.int64)[:, None] * H + k[None, :], v.to(tl.float8e4nv), mask=m)
+    tl.store(QT + k.to(tl.int64)[:, None] * M + r[None, :], tl.trans(v).to(tl.float8e4nv), mask=tl.trans(m))
+    if (pm == 0) & (ph == 0):
+        tl.store(S, dq)
+
+
+@triton.jit
+def _swiglu_bwd_tile(Z, DA, r, k, m, H, sz, sda):
+    zr = Z + r.to(tl.int64)[:, None] * sz
+    z1 = tl.load(zr + k[None, :], mask=m, other=0.0).to(tl.float32)
+    z2 = tl.load(zr + H + k[None, :], mask=m, other=0.0).to(tl.float32)
+    da = tl.load(DA + r.to(tl.int64)[:, None] * sda + k[None, :], mask=m, other=0.0).to(tl.float32)
+    sg = tl.sigmoid(z1)
+    sl = (z1 * sg).to(tl.bfloat16).to(tl.float32)
+    d1 = (da * z2 * (sg * (1.0 + z1 * (1.0 - sg)))).to(tl.bfloat16).to(tl.float32)
+    d2 = (da * sl).to(tl.bfloat16).to(tl.float32)
+    return d1, d2
+
+
+@triton.jit
+def _swiglu_bwd_ds_amax_kernel(Z, DA, M, H, sz, sda, ST, STI, site, L: tl.constexpr, W: tl.constexpr, BM: tl.constexpr,
+                               BH: tl.constexpr):
+    if tl.load(ST + site * W + L + 1) == 0.0:
+        r = tl.program_id(0) * BM + tl.arange(0, BM)
+        k = tl.program_id(1) * BH + tl.arange(0, BH)
+        m = (r < M)[:, None] & (k < H)[None, :]
+        d1, d2 = _swiglu_bwd_tile(Z, DA, r, k, m, H, sz, sda)
+        a = tl.maximum(tl.max(tl.max(tl.abs(d1), axis=1), axis=0), tl.max(tl.max(tl.abs(d2), axis=1), axis=0))
+        tl.atomic_max(STI + site * W + L, a.to(tl.int32, bitcast=True))
+
+
+@triton.jit
+def _swiglu_bwd_dt_kernel(Z, DA, DQ, DQT, S, M, H, sz, sda, ST, STI, site, L: tl.constexpr, W: tl.constexpr,
+                          FMAX: tl.constexpr, E5M2: tl.constexpr, BM: tl.constexpr, BH: tl.constexpr):
+    pm = tl.program_id(0)
+    ph = tl.program_id(1)
+    r = pm * BM + tl.arange(0, BM)
+    k = ph * BH + tl.arange(0, BH)
+    m = (r < M)[:, None] & (k < H)[None, :]
+    d1, d2 = _swiglu_bwd_tile(Z, DA, r, k, m, H, sz, sda)
+    a = tl.maximum(tl.max(tl.max(tl.abs(d1), axis=1), axis=0), tl.max(tl.max(tl.abs(d2), axis=1), axis=0))
+    scale, dq = _ds_scale(ST, STI, site, a, L, W, FMAX)
+    v1 = tl.minimum(tl.maximum(d1 * scale, -FMAX), FMAX)
+    v2 = tl.minimum(tl.maximum(d2 * scale, -FMAX), FMAX)
+    row = r.to(tl.int64)[:, None] * (2 * H)
+    col = k.to(tl.int64)[:, None] * M
+    if E5M2:
+        tl.store(DQ + row + k[None, :], v1.to(tl.float8e5), mask=m)
+        tl.store(DQ + row + H + k[None, :], v2.to(tl.float8e5), mask=m)
+        tl.store(DQT + col + r[None, :], tl.trans(v1).to(tl.float8e5), mask=tl.trans(m))
+        tl.store(DQT + H * M + col + r[None, :], tl.trans(v2).to(tl.float8e5), mask=tl.trans(m))
+    else:
+        tl.store(DQ + row + k[None, :], v1.to(tl.float8e4nv), mask=m)
+        tl.store(DQ + row + H + k[None, :], v2.to(tl.float8e4nv), mask=m)
+        tl.store(DQT + col + r[None, :], tl.trans(v1).to(tl.float8e4nv), mask=tl.trans(m))
+        tl.store(DQT + H * M + col + r[None, :], tl.trans(v2).to(tl.float8e4nv), mask=tl.trans(m))
+    if (pm == 0) & (ph == 0):
+        tl.store(S, dq)
+
+
+def _fmt(grad):
+    e5 = grad and _GRAD_E5
+    return (E5, 57344.0, True) if e5 else (E4, FMAX, False)
+
+
+@torch.library.custom_op("gpic::fp8_dcast_t", mutates_args=())
+def dcast_t(x: torch.Tensor, site: int, roll: bool, grad: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """x [M, K] -> FP8 [M, K], FP8 [K, M] (its transpose) and the dequantization scale [1], with site's delayed scale;
+    grad: a gradient (e5m2 under GPIC_MFU_FP8_GRAD=e5m2)."""
+    st = ds_state(x.device)
+    sti = st.view(torch.int32)
+    if roll:
+        _ds_roll_kernel[(st.shape[0],)](st, sti, L=L_HIST, W=W_ST, num_warps=1)
+    dt, fmax, e5 = _fmt(grad)
+    xc = x.contiguous()
+    M, K = xc.shape
+    q = torch.empty(M, K, dtype=dt, device=x.device)
+    qt = torch.empty(K, M, dtype=dt, device=x.device)
+    s = torch.zeros(1, dtype=torch.float32, device=x.device)
+    if xc.numel():
+        _ds_amax_kernel[(triton.cdiv(xc.numel(), BLOCK),)](xc, xc.numel(), st, sti, site, L=L_HIST, W=W_ST, BLOCK=BLOCK,
+                                                          num_warps=8)
+        _ds_cast_t_kernel[(triton.cdiv(M, 64), triton.cdiv(K, 64))](xc, q, qt, s, M, K, st, sti, site, L=L_HIST, W=W_ST,
+                                                                      FMAX=fmax, E5M2=e5, BM=64, BK=64, num_warps=4)
+    return q, qt, s
+
+
+@dcast_t.register_fake
+def _(x, site, roll, grad):
+    dt = _fmt(grad)[0]
+    M, K = x.shape
+    return x.new_empty(M, K, dtype=dt), x.new_empty(K, M, dtype=dt), x.new_empty(1, dtype=torch.float32)
+
+
+@torch.library.custom_op("gpic::fp8_swiglu_dcast_t", mutates_args=())
+def swiglu_dcast_t(z: torch.Tensor, site: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """z [M, 2H] bf16 -> silu(z1) * z2 as e4m3 [M, H] and [H, M] (its transpose) and the dequantization scale [1]."""
+    st = ds_state(z.device)
+    sti = st.view(torch.int32)
+    M, H2 = z.shape
+    H = H2 // 2
+    zc = z if z.stride(-1) == 1 else z.contiguous()
+    q = torch.empty(M, H, dtype=E4, device=z.device)
+    qt = torch.empty(H, M, dtype=E4, device=z.device)
+    s = torch.zeros(1, dtype=torch.float32, device=z.device)
+    if M:
+        BH = _bh(H)
+        _swiglu_ds_amax_kernel[(M, triton.cdiv(H, BH))](zc, H, zc.stride(0), st, sti, site, L=L_HIST, W=W_ST, BH=BH,
+                                                         num_warps=8)
+        _swiglu_ds_cast_t_kernel[(triton.cdiv(M, 64), triton.cdiv(H, 64))](zc, q, qt, s, M, H, zc.stride(0), st, sti, site,
+                                                                             L=L_HIST, W=W_ST, BM=64, BH=64, num_warps=4)
+    return q, qt, s
+
+
+@swiglu_dcast_t.register_fake
+def _(z, site):
+    M, H2 = z.shape
+    return z.new_empty(M, H2 // 2, dtype=E4), z.new_empty(H2 // 2, M, dtype=E4), z.new_empty(1, dtype=torch.float32)
+
+
+@torch.library.custom_op("gpic::fp8_swiglu_bwd_dt", mutates_args=())
+def swiglu_bwd_dt(z: torch.Tensor, da: torch.Tensor, site: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """z [M, 2H], da [M, H] bf16 -> dz as FP8 [M, 2H] and [2H, M] (its transpose) and the dequantization scale [1]; no bf16 dz."""
+    st = ds_state(z.device)
+    sti = st.view(torch.int32)
+    dt, fmax, e5 = _fmt(True)
+    M, H2 = z.shape
+    H = H2 // 2
+    zc, dac = z.contiguous(), da.contiguous()
+    dq = torch.empty(M, H2, dtype=dt, device=z.device)
+    dqt = torch.empty(H2, M, dtype=dt, device=z.device)
+    s = torch.zeros(1, dtype=torch.float32, device=z.device)
+    if M:
+        g = (triton.cdiv(M, 64), triton.cdiv(H, 64))
+        _swiglu_bwd_ds_amax_kernel[g](zc, dac, M, H, zc.stride(0), dac.stride(0), st, sti, site, L=L_HIST, W=W_ST, BM=64,
+                                      BH=64, num_warps=4)
+        _swiglu_bwd_dt_kernel[g](zc, dac, dq, dqt, s, M, H, zc.stride(0), dac.stride(0), st, sti, site, L=L_HIST, W=W_ST,
+                                 FMAX=fmax, E5M2=e5, BM=64, BH=64, num_warps=4)
+    return dq, dqt, s
+
+
+@swiglu_bwd_dt.register_fake
+def _(z, da, site):
+    M, H2 = z.shape
+    dt = _fmt(True)[0]
+    return z.new_empty(M, H2, dtype=dt), z.new_empty(H2, M, dtype=dt), z.new_empty(1, dtype=torch.float32)
+
+
+def _mmo(aq, sa, bq, sb, out_dtype):
+    """[M, K] FP8 x [N, K] FP8 (each with its tensorwise scale) -> [M, N] out_dtype, full fp32 accumulation."""
+    return torch._scaled_mm(aq, bq.t(), scale_a=sa, scale_b=sb, out_dtype=out_dtype, use_fast_accum=False)
+
+
+class _Fp8Linear4(torch.autograd.Function):
+    """y = x W^T + b with every GEMM in FP8: the forward (fast accumulation), dX = dY W and dW = dY^T X (full accumulation);
+    db = the sum of dY over the rows (bf16 dY, fp32 sum)."""
+    @staticmethod
+    def forward(ctx, x, w, b, site, roll):
+        shape = x.shape
+        x2 = x.reshape(-1, shape[-1])
+        xq, xqt, sx = dcast_t(x2, site, roll, False)
+        wq, sw, wtq = tcast_t(w)
+        y = _mm(xq, sx, wq, sw)
+        if b is not None:
+            y = y + b.to(y.dtype)
+        ctx.save_for_backward(xqt, sx, wtq, sw)
+        ctx.shape, ctx.wdt, ctx.site, ctx.has_b = shape, w.dtype, site, b is not None
+        return y.view(*shape[:-1], w.shape[0])
+
+    @staticmethod
+    def backward(ctx, dy):
+        xqt, sx, wtq, sw = ctx.saved_tensors
+        dy2 = dy.reshape(-1, dy.shape[-1]).to(torch.bfloat16)
+        dyq, dyqt, sdy = dcast_t(dy2, ctx.site + 1, False, True)
+        dx = _mmo(dyq, sdy, wtq, sw, torch.bfloat16).view(ctx.shape)
+        dw = _mmo(dyqt, sdy, xqt, sx, ctx.wdt)
+        db = dy2.sum(0, dtype=torch.float32).to(ctx.wdt) if ctx.has_b else None
+        return dx, dw, db, None, None
+
+
+class _Fp8MLP4(torch.autograd.Function):
+    """Phase 3's MLP with the weight gradients in FP8 too (sites s0: x, s0 + 1: the product, s0 + 2: dy, s0 + 3: dz)."""
+    @staticmethod
+    def forward(ctx, x, w12, w3, s0):
+        shape = x.shape
+        x2 = x.reshape(-1, shape[-1])
+        xq, xqt, sx = dcast_t(x2, s0, False, False)
+        w12q, s12, w12tq = tcast_t(w12)
+        z = _mm(xq, sx, w12q, s12)
+        aq, aqt, sa = swiglu_dcast_t(z, s0 + 1)
+        w3q, s3, w3tq = tcast_t(w3)
+        y = _mm(aq, sa, w3q, s3)
+        ctx.save_for_backward(xqt, sx, z, aqt, sa, w12tq, s12, w3tq, s3)
+        ctx.shape, ctx.dt, ctx.s0 = shape, (w12.dtype, w3.dtype), s0
+        return y.view(*shape[:-1], w3.shape[0])
+
+    @staticmethod
+    def backward(ctx, dy):
+        xqt, sx, z, aqt, sa, w12tq, s12, w3tq, s3 = ctx.saved_tensors
+        dy2 = dy.reshape(-1, dy.shape[-1]).to(torch.bfloat16)
+        dyq, dyqt, sdy = dcast_t(dy2, ctx.s0 + 2, False, True)
+        da = _mmo(dyq, sdy, w3tq, s3, torch.bfloat16)          # [M, H]
+        dw3 = _mmo(dyqt, sdy, aqt, sa, ctx.dt[1])              # [C, H] = dY^T A
+        dzq, dzqt, sdz = swiglu_bwd_dt(z, da, ctx.s0 + 3)
+        dx = _mmo(dzq, sdz, w12tq, s12, torch.bfloat16)        # [M, C]
+        dw12 = _mmo(dzqt, sdz, xqt, sx, ctx.dt[0])             # [2H, C] = dZ^T X
+        return dx.view(ctx.shape), dw12, dw3, None
+
+
+def fp8_linear4(x, w, b, site, roll):
+    with torch.autocast("cuda", enabled=False):
+        return _Fp8Linear4.apply(x.to(torch.bfloat16), w, b, site, roll)
+
+
+def fp8_mlp4(x, w12, w3, s0):
+    with torch.autocast("cuda", enabled=False):
+        return _Fp8MLP4.apply(x.to(torch.bfloat16), w12, w3, s0)
+
+
+class Fp8Linear4(torch.nn.Linear):
+    """nn.Linear with all three GEMMs in FP8 (sites set by convert_native)."""
+    def forward(self, x):
+        return fp8_linear4(x, self.weight, self.bias, self._fp8_site, self._fp8_roll)
+
+
 def fp8_mlp(x, w12, w3):
     with torch.autocast("cuda", enabled=False):
         return _Fp8MLP.apply(x.to(torch.bfloat16), w12, w3)
@@ -625,6 +911,24 @@ def convert_native(net, phase=1):
     qkv_x and proj as in phase 1, the MLP as one fused FP8 function with FP8 dgrads. Phase 3: phase 2 with delayed
     scaling (6 activation sites per block; block 0's qkv_x input rolls the histories). Returns the count of GEMMs."""
     n = 0
+    if phase >= 4:
+        site = 0
+        for blk in getattr(net, "blocks", []):
+            for name in ("qkv_x", "proj"):
+                lin = getattr(blk.attn, name)
+                if type(lin) is torch.nn.Linear:
+                    lin.__class__ = Fp8Linear4
+                    lin._fp8_site, lin._fp8_roll = site, site == 0
+                    site += 2
+                    n += 1
+            mlp = blk.mlp
+            if not getattr(mlp, "_fp8", False):
+                mlp._fp8 = True
+                mlp.forward = (lambda m, s0: (lambda x: fp8_mlp4(x, m.w12.weight, m.w3.weight, s0)))(mlp, site)
+                site += 4
+                n += 2
+        DS.sites, DS.st = site, None
+        return n
     if phase >= 3:
         site = 0
         for blk in getattr(net, "blocks", []):
