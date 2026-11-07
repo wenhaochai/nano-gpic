@@ -116,6 +116,10 @@ class BenchTimer(Callback):
         self.cur = {"step": step,
                     "data_wait_s": (now - self.t_last_end) if self.t_last_end else (now - self.t_train_start),
                     "t_start": now - _T0}
+        try:   # the batch's padded caption length (shared-bucket checks: every rank's T, micro-batch by micro-batch)
+            self.cur["T"] = int(batch[2]["text_mask"].shape[1])
+        except Exception:
+            pass
         if self.queue_on:
             # After a long data wait, q_ahead > 0: one late worker. q_ahead = 0 and q_raw > 0 with q_ready = 0: a late pin thread. All 0: the workers as a whole fell behind.
             # A jump in delay_main_ns or delay_pin_ns: that thread waited for a CPU. q_rcvd - 1 modulo the workers per rank is the worker that delivered this batch.
