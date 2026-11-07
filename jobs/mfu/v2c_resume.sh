@@ -11,7 +11,8 @@
 # (d640 stop at 1000 / resume to 4800, tools/check_shard_resume.py) twice: with the head's defaults (d640: A, C, D, F) and
 # with FSDP2 forced on (GPIC_MFU_FSDP=1: the path the d1280-d1792 runs take); then the layout of the new ms and last
 # checkpoints against 5cd3372's smoke, and gmflow_run4's real evaluation path on the FSDP2 run's ms-step=001600.
-# usage: v2c_resume.sh <code worktree at a clean commit>   (v2b with the FSDP2 pass only; V2_MODES="default fsdp" for both)
+# usage: v2c_resume.sh <code worktree at a clean commit>   (v2b with the FSDP2 pass only; V2_MODES="default fsdp" for both;
+#   V2_MODES=flat: lever B3 with B2, jobs/mfu/v3_flat_smoke.sh)
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 WT=${1:?code worktree}
@@ -26,6 +27,9 @@ REF=$WC/runs/gpic-speed/full_smoke_1106_1433/resume/exp_ladder_d640
 EWT=$WC/project/gpic-wt/gmflow_run4
 for mode in ${V2_MODES:-fsdp}; do
   [ $mode = fsdp ] && export GPIC_MFU_FSDP=1
+  # lever B3 (flat units) with B2, as d896-d1280 would run it: FlatModelParallelStrategy (jobs/train_ladder.sh) splits the
+  # flat parameters into the original keys on save and rebuilds them on load
+  [ $mode = flat ] && export GPIC_MFU_FSDP=1 GPIC_MFU_FSDP_FLAT=1 GPIC_MFU_LOCAL_OPT=1 GPIC_MFU_FSDP_GROUP=3
   bash $WT/jobs/smoke_full.sh $WT resume > $OUT/smoke_$mode.log 2>&1
   echo "[$(date +%T)] smoke resume ($mode) rc=$?" | tee -a $OUT/summary.txt
   SMK=$(ls -dt $WC/runs/gpic-speed/full_smoke_* | head -1)
@@ -33,7 +37,7 @@ for mode in ${V2_MODES:-fsdp}; do
   N=$SMK/resume/exp_ladder_d640
   ( cd $WT/baselines/PixelGen && PYTHONPATH=$PWD python $WT/tools/mfu/compare_ckpt_layout.py $REF/ms-step=001600.ckpt $N/ms-step=001600.ckpt \
     $REF/ms-step=004800.ckpt $N/ms-step=004800.ckpt $REF/last.ckpt $N/last.ckpt ) 2>&1 | tee -a $OUT/summary.txt
-  if [ $mode = fsdp ]; then
+  if [ $mode = fsdp ] || [ $mode = flat ]; then
     EV=$OUT/eval
     mkdir -p $EV/exp_ladder_d640 && ln -sf $N/ms-step=001600.ckpt $EV/exp_ladder_d640/
     GMFLOW_WT=$EWT WANDB_MODE=disabled EVAL_LIMIT_BATCHES=1 LADDER_RUN_ROOT=$EV timeout -k 60 900 bash $EWT/jobs/eval_gmflow.sh 0 1600 euler 8 > $OUT/eval.log 2>&1
