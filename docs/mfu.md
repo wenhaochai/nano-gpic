@@ -437,8 +437,55 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   what no_sync does for DDP: before the last micro-batch, no reduce-scatter (the unsharded gradients add up in FSDP2's
   fp32 reduce dtype) and no reshard after the backward (the next micro-batch needs no all-gather).
 - A d1024 micro-batch under DDP with accumulation costs 39.7 ms (w1484, A C D, no K), about FSDP2 + K + K2's 40.2 at
-  batch 256. Measurements per width: w1574 (d1280-d1792: DDP + K + K2 against FSDP2 + K + K2 with and without N),
-  w1530 (d640-d1024).
+  batch 256. w1574 and w1530 meant to measure 32 x 4 per width, but their Muon overlay was an environment variable at
+  submission, which wq's clean environment drops: they ran batch 256 with AdamW (512 rows, no MuonAdamW line). Their
+  batch-256 numbers confirm the table above with K + K2 (d1280 FSDP2 + L + G7 60.8 ms, DDP 74.6; d1536 FSDP2 91.5, DDP
+  113.3; d1792 FSDP2 131.5, DDP 163.3; d1024 FSDP2 + L + G6 39.9, DDP 46.5). A cold DDP start with K + K2 compiles the
+  whole model (Dynamo splits it into 3 graphs at DDP's buckets): 240-282 s, 18-30 FX graph cache misses; FSDP2 compiles
+  one graph per block class: 29-30 s, cache hits only. A cached start costs about 60-80 s under either.
+
+### Batch 1024 per width (owner 2026-11-07: no accumulation where it fits; w1592 on 693e86c, w1596 the control)
+- Global batch 1024 on 8 GPUs as micro-batch 128 x 1 (64 x 2 where 128 does not fit): the same math as 32 x 4 (the
+  gradient is the mean over the same 1024 samples). Muon (MuP), the shared bucket (S), A C D K K2, 8 GPUs; mean
+  optimizer step over the second half of each arm, MFU over 1024 images:
+
+| width | setting | ms per step | MFU | peak reserved | without S | 32 x 4 (w1576) |
+|---|---|---|---|---|---|---|
+| d640 | DDP 128 x 1 | 76.5 | 17.6% | 19.3 GiB | 80.0 | 92.5 (no S) |
+| d768 | DDP 128 x 1 | 83.6 | 25.4% | 25.4 GiB | | |
+| d896 | DDP 128 x 1 | 103.9 | 30.2% | 32.4 GiB | | |
+| d1024 | DDP 128 x 1 | 128.9 | 34.8% | 41.8 GiB | 132.7 | |
+| d1280 | FSDP2 G7 128 x 1 | 211.2 | 38.1% | 52.5 GiB | 219.6 (DDP) | 247.0 (DDP, no S) |
+| d1280 | DDP 128 x 1 | 213.5 | 37.7% | 60.7 GiB | | |
+| d1536 | FSDP2 128 x 1 | 324.0 | 40.9% | 70.5 GiB | | |
+| d1536 | FSDP2 64 x 2 | 333.9 | 39.7% | 37.8 GiB | | |
+| d1792 | FSDP2 64 x 2 | 476.7 | 42.2% | 50.1 GiB | | |
+
+- Ladder (GPU-h weights 1, 2, 4, 8, 8, 8, 8 from d640): 39 / sum(k / MFU) = 35.7% (batch 256 with AdamW, the best per
+  width with K + K2: 29.5%; the start of this work: about 20%).
+- 128 x 1 against 32 x 4, both DDP without S: d640 -13.5% (80.0 against 92.5), d1280 -11.1% (219.6 against 247.0). At batch 256 the same widths ran 24.4 x 4 = 97.6 and
+  61.0 x 4 = 244 ms per 1024 images (AdamW).
+- d1280: FSDP2 and DDP give the same losses on the same data (the first steps bit for bit, the last 200 0.09497 and
+  0.09484); FSDP2 is 1.1% faster and needs 8 GiB less.
+- d1536 at 128 x 1: the peak reserved is 70.5 GiB of 79.6 over 768 steps, which held no T = 320 batch; CompileWarmup ran
+  a T = 320 batch of 128 before the timer reset the peak, inside the same pool, so T = 320 fits (about 7 GiB left with
+  the optimizer states). d1792 at 128 does not fit (activations scale with d x blocks: about 88 GiB); activation
+  checkpointing to fit it would recompute the forward (+25-33% compute), far more than 64 x 2 costs (d1536: +3.0%).
+- S at 128 x 1: d640 -4.4%, d1024 -2.9%, d1280 -2.8% (DDP). It lowers the GPU time of the slowest rank (d640 77.9 ->
+  64.7 ms max over ranks), but at d640 and d768 the data wait grows (d640 5.8 -> 36 ms per step, d768 25 ms) and the GPU
+  idles. Even the rank that arrives last waits 16.7 ms (median), so the wait is in the DataLoader pulls, not only the
+  barrier.
+- S's pools are not bounded: each rank's batches of a bucket arrive independently, so the ranks' counts of a bucket
+  drift apart like a random walk and only extra pulls realign them (8-rank CPU test, batch 32: the largest pool grows
+  as about 4 sqrt(micro-batches / batch size), 35 -> 103 batches from 2000 to 20000 micro-batches; pool_min 80 only
+  delays it). Estimate at 128 x 1: about 215 batches (about 14 GiB per rank) after an 8 h d640 segment; a resume
+  empties the pools. Before 862d51e the steady state also took two all-reduces per micro-batch (a failed decision,
+  then a pull); one pull before each decision makes it one, with the same pools.
+- The workers are not slower with S (CPU, one process, 6 workers, 128 per batch: 1297 img/s with S, 1240 and 1301
+  without), so the d640 wait is most likely the gloo all-reduce itself on a node whose 96 CPUs the 256 workers keep busy
+  (two per micro-batch before 862d51e). From 862d51e rank 0 prints, every 1000 micro-batches, the largest pool, the
+  decisions and pulls per micro-batch and the DataLoader and all-reduce waits, so the first ladder segments tell. A
+  thread that takes the decisions ahead of the training loop would take the all-reduce off the step's path (not done).
 
 ### The none_dealloc crash (w1204 after 139 min, w1239; genmodel 2026-11-07): fixed in fdea752
 - "Fatal Python error: none_dealloc" aborts Python 3.11 when None's refcount reaches zero (None is immortal only from
