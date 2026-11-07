@@ -264,7 +264,7 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   H2 also moves the EMA lerp from its side stream onto the critical path, so H1 is the better form.
 - Decision: off by default. A DDP-width option (d640-d768) only; re-measure H1 with the aligned kernel there.
 
-### B3. FSDP2's per-parameter host work (planned)
+### B3. One flat parameter per FSDP2 unit (`GPIC_MFU_FSDP_FLAT=1`): not a general lever
 - Observation: under FSDP2 the host binds part of the step at d1024-d1280. Per-stage medians (BENCH_STAGES, GPU / host
   ms): d1280 A+B+C+D forward 21.3 / 25.9, optimizer 1.7 / 7.8; d1024 A+B+C+D+L+G3 forward 14.0 / 17.1. In the profiled
   steps FSDP2's hooks hold about a third of the host's time (d1024 L+G3: pre_forward 9.3, post_backward_reduce 6.7,
@@ -279,6 +279,72 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   for the next all-gather; RMSNorm weights and pos_embed replicated in fp32 as now. Checkpoints gather the shards into
   the same fp32 keys and AdamW states.
 - Expectation: most of FSDP2's host work goes; d1024 and d1280 become GPU-bound: about -10% at d1024, -6% at d1280.
+- Built (simpler than the design: FSDP2 keeps the master weights, AdamW and EMA shards; one flat fp32 parameter per unit,
+  the original parameters its views). v1 read the views through per-instance property classes: every block got its
+  own class, so Dynamo compiled one graph per block (14 graphs, 18 frames against 6 and 9) and past its 8-graph limit
+  ran the rest eagerly: d1024 126.4 against 39.4 ms median (w1431, stopped after 2 of 6 arms). v2: a forward pre-hook
+  (after FSDP2's, which unshards the unit) splits the flat parameter once per unit and sets the views as plain tensor
+  attributes; the compiled blocks read them as ordinary inputs, so one graph serves every block of a class again (CPU
+  test: graphs shared, none new over FSDP2's swaps, and under real FSDP2 with compiled blocks the same graph count and
+  bitwise the same losses and gradients as per-parameter units).
+- Result (w1456, production path, 2048 steps, mean step without -> with B3): d896 36.25 -> 34.39 ms (-5.1%), d1024
+  41.15 -> 41.21 (none), d1280 63.65 -> 69.05 (+8.5%: 47 slow steps against 0, +1.5 GiB). Parity PASS at all three
+  (first 100 steps 1e-8: the same math). Why so little: py-spy of a d1280 rank (next section) shows FSDP2's hook cost
+  is per unit, not per parameter.
+- Decision: off. Kept for d896 as a candidate if nothing better reaches it.
+
+### Host time at the FSDP2 widths (py-spy, d1280 A+B+C+D+L+G7+B3, 8 s of one rank, w1456)
+- The forward runs on the main thread, the backward on the autograd engine's thread. The main thread is busy for the
+  whole forward (about 36 ms of a 64 ms step) and then waits for the backward (29% of its samples); the autograd thread
+  is in Python for about 13 ms per step, so the backward keeps the GPU busy: the forward is the host-bound part.
+- The forward's host time per step: kernel launches from the compiled blocks' wrappers 6.7 ms; FSDP2 pre-forward hooks
+  7.5 ms (per unit: all-gather copy-in, the collective, copy-out, post-backward hook registration); FA3's path 3.4 ms
+  (PyTorch's custom-op dispatch about 100 us and FA3's own C++ host code about 80 us per call); module calls, Dynamo
+  frame entries and AOT wrappers about 5 ms; the eager parts of the step (noise and timestep sampling, embeddings, the
+  loss) about 3 ms; B3's hook 1.9 ms. After the backward: the replicated gradients' all-reduce and the clip 2.1 ms.
+- The step timer itself reads the CUDA memory statistics every step (about 1.3 ms at d1280). Production runs carry no
+  step timer (train_ladder.sh adds it only with BENCH_OUT), so every measured arm's MFU is slightly low there.
+
+### K. Residual add + RMSNorm + adaLN modulation as Triton kernels (`GPIC_MFU_FUSED_NORM=1`, src/models/layers/fused_norm.py)
+- Owner, 2026-11-06 evening: the architecture will rarely change, so architecture-specific fused kernels are welcome.
+- Each image block's two norm sites (norm1 + modulation; the first residual add + norm2 + modulation): one forward
+  kernel each, and one backward kernel that reads dh, x_new, a and the upstream gradient once, writes dx and da, and
+  keeps the column sums of shift, scale, gate and the norm weight per program (added afterwards in a fixed order).
+  Inductor's backward of the same ops is several kernels, its column sums at about 1.2 TB/s (4.4 ms of d1280's 13.2 ms
+  of backward Triton time, probe7). Registered with torch.library.triton_op: Inductor launches the kernels itself.
+- Math: the model's ops in fp32 with its explicit casts kept (x_new and the normalized value rounded to bf16), the
+  other intermediates unrounded as in Inductor's fused kernels, rsqrt as Inductor's (libdevice).
+- Tests (tools/mfu/tests/test_fused_norm.py, CPU interpreter and GPU): the forward correctly rounded against fp64 (on
+  the GPU up to the approximate rsqrt flipping a normalized value by one ulp, 0.0003-0.0007% of elements); every
+  gradient at bf16 rounding (1.6-1.7e-3), below the eager ops' error (2.3-4.2e-3); the norm weight's 1e-7;
+  deterministic. A tiny model: every gradient's error against fp32 within 1.07x of the plain path's.
+- Kernel GPU time per site, forward + backward (w1468, profiler): below Inductor's at every width (site 1 -0.03 to
+  -0.05 ms, site 2 -0.02 to -0.05 ms); the backward takes 32 rows per program above C = 1024.
+
+### K2. q/k RMSNorm + RoPE + the k/v concatenation as Triton kernels (`GPIC_MFU_FUSED_QK=1`, src/models/layers/fused_qk.py)
+- The image blocks' attention inputs on lever A's path: from qkv_x(x) and kv_y(y), one kernel per token kind writes q,
+  k and v in FA3's layout (the per-head norm, the RoPE on interleaved pairs, image and caption keys and values
+  concatenated); the backward reads dq, dk, dv and the projections once and writes the projections' gradients and the
+  norm weights' column sums.
+- Tests (tools/mfu/tests/test_fused_qk.py, CPU and GPU, the model's 16 and 28 heads): q, k correctly rounded, v exact,
+  gradients at bf16 rounding and below the eager ops', the norm weights' 1e-7, deterministic. PASS on the GPU (w1468).
+  A tiny model with K + K2: every gradient's error against fp32 within 1.05x of the plain path's.
+
+### K and K2 on one GPU (w1468, step_bench, compiled, C++ launcher, FA3; mean step A / A+K / A+K+K2)
+- d1024 38.86 / 37.78 / 36.73 ms (-5.5%); d1280 63.53 / 62.71 / 61.04 (-3.9%); d1536 98.75 / 95.83 / 93.27 (-5.5%);
+  d1792 142.32 / 140.42 / 135.76 (-4.6%). Loss relative difference to A about 1e-6 over the first 100 steps (rounding;
+  B's onset was 1e-5). Production test: w1471.
+
+### X. The compiled blocks as CUDA graphs (`GPIC_MFU_CUDAGRAPH=1`)
+- Hypothesis: the FSDP2 widths' forward is bound by the host (previous section). Inductor's CUDA graphs (mode
+  reduce-overhead) replay each block's kernels with one launch: the same kernels in the same order, so the same values.
+- Setup: a graph keeps its parameters' addresses, so FSDP2 keeps each unit's unsharded storage between steps (it frees
+  it after the backward and allocates it again, at a new address, before the next forward; the all-gather still
+  writes the new values every step): one bf16 copy of the parameters per GPU (0.75 GB at d1024, 1.7 GB at d1792), and
+  no change to the peak (every unit is unsharded at the end of the forward anyway). DDP's whole-model compile takes the
+  same mode. A new caption length records new graphs once.
+- Test (w1470): d1024 and d1280 with and without X, X with Inductor's Python launcher, d768 under DDP. Expectation:
+  the forward becomes GPU-bound; bitwise the same losses.
 
 ### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
 - Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches
