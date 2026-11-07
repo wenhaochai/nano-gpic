@@ -2,7 +2,7 @@
 #SBATCH -J gpic-mfu-widths
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=00:50:00
+#SBATCH --time=01:30:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
@@ -11,7 +11,8 @@
 # same batches in every arm, each rank's loss per step), for each given width: levers off, then each given lever set.
 # usage: widths.sh <code worktree> <steps> <width>:<set>[,<set>...] ...   sets: ACD, ACDE, ABCD, ABCDE (A FA3, B FSDP2,
 #   C GPU resize, D uint8, E packed + rebalanced captions, R the same deal on the host one step ahead (E2), L AdamW and EMA on the local shards (B2), G<k> k blocks per
-#   FSDP2 unit, H1 / H2 clip multiply + AdamW (+ EMA) in one kernel (lever H), P torch.profiler over steps 500-505 and
+#   FSDP2 unit, H1 / H2 clip multiply + AdamW (+ EMA) in one kernel (lever H), T Inductor coordinate-descent tuning
+#   (lever G0), P torch.profiler over steps 500-505 and
 #   per-stage CUDA events: read the median), off (a second
 #   levers-off arm, d<width>_off2)
 # Parity floor (tools/mfu/parity_loss.py): off2 if listed, else the first set (put a rounding-only set first: ACD changes
@@ -47,6 +48,9 @@ for spec in "$@"; do
     [[ $s =~ G([0-9]+) ]] && env+=(GPIC_MFU_FSDP_GROUP=${BASH_REMATCH[1]})
     [[ $s =~ H([12]) ]] && env+=(GPIC_MFU_FUSED_OPT=${BASH_REMATCH[1]})
     [[ $s == *P* ]] && env+=(BENCH_STAGES=1 BENCH_PROFILE=500:505)
+    # lever G0: Inductor's coordinate-descent tuning of the element-wise and reduction kernels (probe7: -2 to -3% at
+    # d1024-d1280 on one GPU); its compile takes minutes longer, so the arm gets more time
+    [[ $s == *T* ]] && env+=(TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 MFU_LIMIT=2400)
     ( export "${env[@]}"; arm d${d}_$s $d $nb $nt $STEPS )
   done
 done
