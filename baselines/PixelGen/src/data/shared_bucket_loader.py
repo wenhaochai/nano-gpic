@@ -11,7 +11,11 @@ argmax on every rank (ties to the shorter bucket). So every rank trains micro-ba
 stay bounded (the bucket with the largest supply everywhere goes first), the buckets come at their share of the data,
 and nothing is dropped. The decision depends only on the pools, which the DataLoader fills in its fixed order, so a run
 is deterministic. A resume starts with empty pools on every rank.
+Every 1000 micro-batches rank 0 prints the pools' largest size, the decision rounds per micro-batch and the time spent
+waiting for the DataLoader and in the all-reduce (the d640 data wait at 128 x 1, docs/mfu.md; the pools' bound in the
+repetition arms).
 """
+import time
 from collections import deque
 
 import torch
@@ -45,13 +49,17 @@ class _Iter:
     def __init__(self, parent):
         self.p, self.it, self.group = parent, None, None   # started at the first next(): Lightning's iter() check
         self.pools = [deque() for _ in parent.edges]          # drops an iterator without calling next()
+        self.st = dict(n=0, rounds=0, pulls=0, pull_s=0.0, ar_s=0.0, pool_max=0)
 
     def _bucket(self, batch):
         T = batch[2]["text_mask"].shape[1]
         return self.p.edges.index(T)
 
     def _pull(self):
+        t = time.perf_counter()
         b = next(self.it)
+        self.st["pull_s"] += time.perf_counter() - t
+        self.st["pulls"] += 1
         self.pools[self._bucket(b)].append(b)
 
     def _min_counts(self):
@@ -72,11 +80,30 @@ class _Iter:
     def __next__(self):
         if self.it is None:
             self.it = iter(self.p.loader)
+        elif sum(len(q) for q in self.pools) >= self.p.pool_min:
+            self._pull()   # one batch in for each one out: the decision then rarely fails (one all-reduce, not two)
         while sum(len(q) for q in self.pools) < self.p.pool_min:
             self._pull()
+        st = self.st
+        st["pool_max"] = max(st["pool_max"], sum(len(q) for q in self.pools))
         while True:
+            t = time.perf_counter()
             b = choose(self._min_counts())
+            st["ar_s"] += time.perf_counter() - t
+            st["rounds"] += 1
             if b is not None:
                 self.p.taken[b] += 1
+                st["n"] += 1
+                if st["n"] % 1000 == 0:
+                    self._report()
                 return self.pools[b].popleft()
             self._pull()   # no bucket on every rank yet: one more batch, then decide again
+
+    def _report(self):
+        st = self.st
+        if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
+            n = 1000
+            print(f"[shared_bucket] rank 0, micro-batches {st['n'] - n + 1}-{st['n']}: largest pool {st['pool_max']} batches, "
+                  f"{st['rounds'] / n:.2f} decisions and {st['pulls'] / n:.2f} pulls per micro-batch, waits per micro-batch: "
+                  f"DataLoader {1000 * st['pull_s'] / n:.1f} ms, all-reduce {1000 * st['ar_s'] / n:.1f} ms", flush=True)
+        st.update(rounds=0, pulls=0, pull_s=0.0, ar_s=0.0, pool_max=0)
