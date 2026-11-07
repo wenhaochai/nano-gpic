@@ -50,6 +50,25 @@ def apply_rotary_emb(
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
+def apply_rotary_emb_real(
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """apply_rotary_emb in real arithmetic (perf C4): (a + ib)(c + is) = (ac - bs) + i(as + bc) on the interleaved
+    pairs, in fp32 as the complex version, so Inductor fuses it instead of falling back to complex aten kernels.
+    cos, sin: [N, Hc/2] float32 (the real and imaginary parts of freqs_cis)."""
+    cos, sin = cos[None, None], sin[None, None]
+
+    def rot(x):
+        xf = x.float().reshape(*x.shape[:-1], -1, 2)
+        x0, x1 = xf[..., 0], xf[..., 1]
+        return torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1).flatten(3).type_as(x)
+
+    return rot(xq), rot(xk)
+
+
 def apply_rotary_emb_crossattention(
         xq: torch.Tensor,
         xk: torch.Tensor,
