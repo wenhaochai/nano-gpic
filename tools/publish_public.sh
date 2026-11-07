@@ -15,9 +15,10 @@ SRC=/scratch/gpfs/GROUP/USER/project/gpic
 FR=/scratch/gpfs/GROUP/USER/tmp/pls_blog/.venv/bin/git-filter-repo
 URL=https://github.com/wenhaochai/nano-gpic.git
 SCAN=$(cd "$(dirname "$0")" && pwd)/pub_scan.py   # this script's own scanner (the cluster's name included)
-# private branch -> public branch; main itself is not published (its content is in main)
+# private branch -> public branch; main itself is not published (its content is in main); ladder-p is the code the
+# ladder runs from the FSDP2 widths on (3338a8c plus lever P)
 MAP=(prod:main ar:ar dist-step:dist-step energy-head:energy-head eval-par:eval-par gmflow:gmflow heldout-loss:heldout-loss
-     implicit-nodrop:implicit-nodrop ladder:ladder mfu:mfu muon:muon muon-search2:muon-search2)
+     implicit-nodrop:implicit-nodrop ladder:ladder ladder-p:ladder-p mfu:mfu muon:muon muon-search2:muon-search2)
 git -C $SRC fetch -q origin
 RD=$(git -C $SRC log -1 --format=%cs origin/prod -- README.md)
 [ "$RD" = "$(date +%F)" ] || { echo "README.md on prod was last rewritten on $RD: rewrite it (the ladder, the goals, what works, figures) first"; exit 1; }
