@@ -51,6 +51,8 @@ for spec in "$@"; do
     [[ $s == *L* ]] && env+=(GPIC_MFU_LOCAL_OPT=1)
     [[ $s =~ G([0-9]+) ]] && env+=(GPIC_MFU_FSDP_GROUP=${BASH_REMATCH[1]})
     [[ $s =~ H([12]) ]] && env+=(GPIC_MFU_FUSED_OPT=${BASH_REMATCH[1]})
+    [[ $s == *K* ]] && env+=(GPIC_MFU_FUSED_NORM=1)   # lever K: residual + RMSNorm + modulation kernels
+    [[ $s == *J* ]] && env+=(GPIC_MFU_FUSED_QK=1)     # lever K2: q/k norm + RoPE + k/v concatenation kernels
     [[ $s == *P* ]] && env+=(BENCH_STAGES=1 BENCH_PROFILE=500:505)
     # lever G0: Inductor's coordinate-descent tuning of the element-wise and reduction kernels (probe7: -2 to -3% at
     # d1024-d1280 on one GPU); its compile takes minutes longer, so the arm gets more time
