@@ -67,6 +67,12 @@ class SimpleEMA(Callback):
         self._join()
         torch.cuda.current_stream().synchronize()
 
+    def on_train_start(self, trainer, pl_module) -> None:
+        # Muon ladder (global batch 1024 by gradient accumulation): the EMA moves once per optimizer step. With
+        # accumulation the first micro-batches after a resume end before any optimizer step, so count from the resumed
+        # step, not from 0; without accumulation every batch ends after its own step, as before.
+        self.previous_step = trainer.global_step
+
     def on_train_batch_end(
         self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", outputs: STEP_OUTPUT, batch: Any, batch_idx: int
     ) -> None:

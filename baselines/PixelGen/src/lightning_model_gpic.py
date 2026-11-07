@@ -179,6 +179,10 @@ class LightningModel(pl.LightningModule):
         return super().state_dict(*args, **kwargs)
 
     def configure_optimizers(self) -> OptimizerLRScheduler:
+        # Muon (src/optim/muon.py): mark the hidden matrices of the transformer blocks (MuonAdamW reads the marks; AdamW
+        # ignores them), as the question-5 reference does
+        from src.optim.muon import MuonAdamW, tag_muon_params
+        tag_muon_params(self.denoiser)
         params_denoiser = filter_nograd_tensors(self.denoiser.parameters())
         params_trainer = filter_nograd_tensors(self.diffusion_trainer.parameters())
         params_sampler = filter_nograd_tensors(self.diffusion_sampler.parameters())
@@ -195,7 +199,13 @@ class LightningModel(pl.LightningModule):
                             {"params": [p for p in params_denoiser if not is_dtensor(p)]}] + [g for g in param_groups[1:] if g["params"]]
         # optimizer: torch.optim.Optimizer = self.optimizer([*params_trainer, *params_denoiser])
         optimizer: torch.optim.Optimizer = self.optimizer(param_groups)
-        if os.environ.get("GPIC_MFU_FUSED_OPT", "0") != "0":   # MFU lever H: clip multiply + AdamW (+ EMA) in one kernel
+        if isinstance(optimizer, MuonAdamW):   # DDP: the reference as is; FSDP2: the same update on the row shards
+            assert os.environ.get("GPIC_MFU_FUSED_OPT", "0") == "0" and os.environ.get("GPIC_MFU_FSDP_FLAT") != "1", \
+                "Muon takes neither lever H nor B3 (lever L's local-shard AdamW is built in)"
+            if os.environ.get("GPIC_MFU_FSDP") == "1":
+                from src.optim.muon_fsdp import ShardMuonAdamW
+                optimizer = ShardMuonAdamW.like(optimizer, param_groups)
+        elif os.environ.get("GPIC_MFU_FUSED_OPT", "0") != "0":   # MFU lever H: clip multiply + AdamW (+ EMA) in one kernel
             from src.utils.fused_adamw_ema import FusedAdamWEMA   # (local tensors of DTensors too, as lever B2)
             assert type(optimizer) is torch.optim.AdamW and optimizer.defaults["fused"], type(optimizer)
             optimizer = FusedAdamWEMA.like(optimizer, param_groups)

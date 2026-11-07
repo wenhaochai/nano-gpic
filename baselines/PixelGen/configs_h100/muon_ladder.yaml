@@ -1,0 +1,42 @@
+# The Muon ladder (owner's popup 2026-11-07 01:0x, recipe from genmodel): Muon with the MuP update scale
+# (-lr sqrt(d_out / d_in) msign, kexue.fm 11416 / 11772) on the blocks' matrices, split into their fused parts, Nesterov
+# momentum 0.95, 5 Newton-Schulz steps, weight decay 0; AdamW (0.9 / 0.95, eps 1e-8, wd 0) for every other parameter at
+# the width's lr; linear warmup over 1000 optimizer steps, then flat; global batch 1024 = 8 GPUs x 32 x accumulation 4;
+# EMA 0.9996, once per optimizer step (src/callbacks/simple_ema.py counts optimizer steps).
+# Use after the base config, then set the two learning rates of the width and the run:
+#   --config configs_h100/lite_ladder.yaml --config configs_h100/muon_ladder.yaml \
+#   --model.optimizer.init_args.lr <AdamW lr> --model.optimizer.init_args.muon_lr <Muon lr>
+# AdamW lr per width (genmodel, 4e-4 * (N / 258M)^-0.548): d640 6.4e-4, d768 5.0e-4, d896 4.1e-4, d1024 3.3e-4,
+# d1280 2.4e-4, d1536 1.8e-4, d1792 1.4e-4. update_scale moonlight reproduces question 5's scale.
+trainer:
+  accumulate_grad_batches: 4
+model:
+  ema_tracker:
+    class_path: src.callbacks.simple_ema.SimpleEMA
+    init_args:
+      decay: 0.9996
+      every_n_steps: 1
+  optimizer:
+    class_path: src.optim.muon.MuonAdamW
+    init_args:
+      lr: 0.00033
+      betas:
+      - 0.9
+      - 0.95
+      eps: 1.0e-08
+      weight_decay: 0.0
+      muon_lr: 0.0017
+      muon_weight_decay: 0.0
+      muon_momentum: 0.95
+      muon_nesterov: true
+      ns_steps: 5
+      split: true
+      update_scale: mup
+      fused_adamw: true
+      ns_dtype: bfloat16
+  lr_scheduler:
+    class_path: src.utils.lr_scheduler.WarmupFlatCooldown
+    init_args:
+      num_warmup_steps: 1000
+      num_cooldown_steps: 4000
+      max_steps: 1000000000
