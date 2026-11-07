@@ -75,19 +75,38 @@ def _geometry(hw, axis, p):
 
 def pack(items, K=None):
     """items: [(src HxWx3 uint8, [(axis, xmin, xlen, kk), (axis, xmin, xlen, kk)])] -> a dict of CPU tensors (pinned by
-    the DataLoader with the rest of the batch) and Python ints: everything run() needs, so the step makes no host copy."""
+    the DataLoader with the rest of the batch) and Python ints: everything run() needs, so the step makes no host copy.
+    With GPU decoding (gpic_dataset._GPU_DECODE) an item can also be ("jpeg", file bytes, (H, W), rows or None, passes):
+    its source, rows r0:r1 of the decoded image, is decoded by run() on the GPU. The source buffer holds the CPU items
+    first (job["src"], their bytes) and then the JPEG items, job["src_bytes"] in all; job["jpeg"] is a Host with the files
+    back to back in one tensor (it crosses from the worker through shared memory, not pickled through a pipe)."""
     B = len(items)
-    K = K or max(p[3].shape[1] for _, ps in items for p in ps)
-    srcs = [np.ascontiguousarray(s) for s, _ in items]
+    K = K or max(it[-1][p][3].shape[1] for it in items for p in range(2))
+    pix = [(b, np.ascontiguousarray(it[0])) for b, it in enumerate(items) if not (isinstance(it[0], str) and it[0] == "jpeg")]
+    jpg = [(b, it) for b, it in enumerate(items) if isinstance(it[0], str) and it[0] == "jpeg"]
     off = np.zeros(B, dtype=np.int64)
-    off[1:] = np.cumsum([s.nbytes for s in srcs])[:-1]
-    flat = torch.from_numpy(np.concatenate([s.reshape(-1) for s in srcs]))
+    shapes = [None] * B
+    pos = 0
+    for b, src in pix:
+        off[b], shapes[b] = pos, list(src.shape[:2])
+        pos += src.nbytes
+    pix_bytes = pos
+    index, start = [], 0
+    for b, (_, data, (H, W), rows, _) in jpg:
+        r0, r1 = (0, H) if rows is None else rows
+        off[b], shapes[b] = pos, [r1 - r0, W]
+        index.append((start, len(data), int(H), int(W), int(r0), int(r1), int(pos)))
+        start += len(data)
+        pos += (r1 - r0) * W * 3
+    jpeg = Host(torch.from_numpy(np.frombuffer(b"".join(it[1] for _, it in jpg), dtype=np.uint8).copy()), index) if jpg else None
+    flat = torch.from_numpy(np.concatenate([src.reshape(-1) for _, src in pix])) if pix else torch.empty(0, dtype=torch.uint8)
     xmin = np.zeros((B, 2, OUT), dtype=np.int32)
     kk = np.zeros((B, 2, OUT, K), dtype=np.int32)
     hw = np.zeros((B, 3, 2), dtype=np.int64)   # (rows, cols) of the source, after pass 1, after pass 2
     axis = np.zeros((B, 2), dtype=np.int64)
-    for b, (s, ps) in enumerate(items):
-        shp = list(s.shape[:2])
+    for b, it in enumerate(items):
+        ps = it[-1]
+        shp = list(shapes[b])
         hw[b, 0] = shp
         for p, (ax, xm, xl, k) in enumerate(ps):
             assert len(xm) == OUT
@@ -103,17 +122,129 @@ def pack(items, K=None):
             "geo": torch.from_numpy(np.stack([g1, g2])),     # [2 passes, 6, B] int64
             "mid_off": torch.from_numpy(mid_off), "out_off": torch.arange(B, dtype=torch.int64) * (OUT * OUT * 3),
             "K": int(K), "B": B, "mid_bytes": int(mid_bytes.sum()), "n_i_max": [int(g1[0].max()), int(g2[0].max())],
-            "hw": torch.from_numpy(hw), "axis": torch.from_numpy(axis)}   # for lever E2's per-sample repacking
+            "hw": torch.from_numpy(hw), "axis": torch.from_numpy(axis),   # for lever E2's per-sample repacking
+            "jpeg": jpeg, "pix_bytes": int(pix_bytes), "src_bytes": int(pos)}
+
+
+class Host:
+    """The JPEG files of a batch for nvJPEG, which reads them from host memory: blob (uint8 CPU tensor, the files back to back)
+    and index [(start, length, H, W, r0, r1, offset in the source buffer)]. It has no .to(), so Lightning's device transfer
+    leaves it on the host, and no .pin_memory(), so the DataLoader's pin thread leaves it as it is."""
+
+    def __init__(self, blob, index):
+        self.blob, self.index = blob, index
+
+
+def _decode(datas, dev):
+    """nvJPEG on dev for a list of JPEG files (uint8 CPU tensors) -> [3, H, W] uint8 tensors. A file nvJPEG refuses (none of 8k
+    training files in tools/mfu/jpeg_gpu_bench.py) is decoded by Pillow on the host instead, as the CPU path would."""
+    from torchvision.io import decode_jpeg, ImageReadMode
+    try:
+        return decode_jpeg(datas, device=dev, mode=ImageReadMode.RGB)
+    except RuntimeError as e:
+        import io
+        from PIL import Image
+        out = []
+        for d in datas:
+            try:
+                out.append(decode_jpeg([d], device=dev, mode=ImageReadMode.RGB)[0])
+            except RuntimeError:
+                print(f"[gpu_decode] nvJPEG refused a {d.numel()}-byte file ({e}); Pillow decodes it", flush=True)
+                img = np.asarray(Image.open(io.BytesIO(d.numpy().tobytes())).convert("RGB"))
+                out.append(torch.from_numpy(img).permute(2, 0, 1).to(dev))
+        return out
+
+
+def _sources(job, dev):
+    """The batch's source buffer on dev: the CPU items' bytes, then the JPEG items decoded by nvJPEG (rows r0:r1, HWC)."""
+    jp = job.get("jpeg")
+    if jp is None:
+        return job["src"]
+    src = torch.empty(job["src_bytes"], dtype=torch.uint8, device=dev)
+    if job["pix_bytes"]:
+        src[:job["pix_bytes"]].copy_(job["src"], non_blocking=True)
+    imgs = _decode([jp.blob[s:s + n] for s, n, *_ in jp.index], dev)
+    for img, (_, _, H, W, r0, r1, off) in zip(imgs, jp.index):
+        assert tuple(img.shape) == (3, H, W), (tuple(img.shape), H, W)
+        src[off:off + (r1 - r0) * W * 3].view(r1 - r0, W, 3).copy_(img[:, r0:r1].permute(1, 2, 0))
+    return src
+
+
+def prepare(batch, dev, stream):
+    """GPU decoding a step ahead (GPIC_MFU_GPU_DECODE=2, DecodeAhead's thread): the batch's source buffer built on dev in
+    stream (copy of the CPU items, nvJPEG, row copies); job["src"] becomes it, with an event that run() makes its stream
+    wait for."""
+    job = batch[0]
+    if not isinstance(job, dict) or job.get("jpeg") is None:
+        return batch
+    with torch.cuda.stream(stream):
+        src = _sources(job, dev)
+        ready = torch.cuda.Event()
+        ready.record(stream)
+    out = list(batch)
+    out[0] = dict(job, src=src, jpeg=None, ready=ready)
+    return type(batch)(out)
+
+
+class DecodeAhead:
+    """Wraps the training loader (GPIC_MFU_GPU_DECODE=2): each batch's JPEGs are decoded by one background thread on a side
+    stream while the step before it trains, so the training thread never waits for nvJPEG (decode_jpeg blocks its caller
+    until its stream is done: torchvision 0.22 decode_jpegs_cuda.cpp). The wrapped loader is still pulled on the training
+    thread (the shared bucket's all-reduce stays in order on every rank)."""
+
+    def __init__(self, loader):
+        self.loader, self.pool, self.stream, self.dev = loader, None, None, None
+
+    def __iter__(self):
+        if self.pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            self.dev = torch.device("cuda", torch.cuda.current_device())
+            self.stream = torch.cuda.Stream(self.dev)
+            self.pool = ThreadPoolExecutor(1, thread_name_prefix="gpu_decode", initializer=torch.cuda.set_device, initargs=(self.dev,))
+        return _AheadIter(self)
+
+    def __getattr__(self, name):   # everything else (e.g. the dataset) from the wrapped loader
+        return getattr(self.__dict__["loader"], name)
+
+
+class _AheadIter:
+    def __init__(self, parent):
+        from collections import deque
+        self.p, self.it, self.q, self.done = parent, None, deque(), False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        p = self.p
+        if self.it is None:
+            self.it = iter(p.loader)
+        while not self.done and len(self.q) < 2:   # the batch returned now and the next one, whose decode runs meanwhile
+            try:
+                b = next(self.it)
+            except StopIteration:
+                self.done = True
+                break
+            self.q.append(p.pool.submit(prepare, b, p.dev, p.stream))
+        if not self.q:
+            raise StopIteration
+        return self.q.popleft().result()
 
 
 def run(job):
     """The batch's crops, [B, 256, 256, 3] uint8, on the device of job's tensors."""
-    dev, B = job["src"].device, job["B"]
+    dev, B = job["src_off"].device, job["B"]
+    ready = job.get("ready")
+    if ready is not None:   # built a step ahead on DecodeAhead's stream: wait for it there, and keep its memory until used here
+        cur = torch.cuda.current_stream(dev)
+        cur.wait_event(ready)
+        job["src"].record_stream(cur)
+    src = _sources(job, dev)
     mid = torch.empty(job["mid_bytes"], dtype=torch.uint8, device=dev)
     out = torch.empty(B, OUT, OUT, 3, dtype=torch.uint8, device=dev)
     geo = job["geo"]
     BI, BO = 32, 64
-    for p, (s_ptr, s_off, d_ptr, d_off) in enumerate([(job["src"], job["src_off"], mid, job["mid_off"]),
+    for p, (s_ptr, s_off, d_ptr, d_off) in enumerate([(src, job["src_off"], mid, job["mid_off"]),
                                                       (mid, job["mid_off"], out, job["out_off"])]):
         g = geo[p]
         grid = (B, triton.cdiv(job["n_i_max"][p], BI), OUT // BO)

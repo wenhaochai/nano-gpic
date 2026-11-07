@@ -71,17 +71,17 @@ def run_pass_np(img, axis, xmin, xlen, kk):
     return np.moveaxis(out, 0, axis)
 
 
-def plan_region_crop(pil_image, image_size, min_crop_frac=0.8, max_crop_frac=1.0):
-    """random_crop_arr_region (augmentation.py) up to its two resizes: the same random draws, the same BOX halvings (in
-    Pillow), then the source rows it keeps and its two passes. Returns (src uint8 HxWx3, passes [(axis, xmin, xlen, kk),
-    (axis, xmin, xlen, kk)]); run_passes on src gives random_crop_arr_region's output bit for bit."""
-    from PIL import Image
+def draw_region_crop(W, H, image_size, min_crop_frac=0.8, max_crop_frac=1.0):
+    """plan_region_crop from the source size alone: its random draws in its order and its geometry, no pixels. Returns
+    (n, (W, H) after n BOX halvings, passes, rows): rows is None when pass 1 runs on the whole (halved) image, else the
+    (r0, r1) source rows the passes read. Used by plan_region_crop and by the GPU-decoding path, which decodes later."""
     min_smaller_dim_size = math.ceil(image_size / max_crop_frac)
     max_smaller_dim_size = math.ceil(image_size / min_crop_frac)
     smaller_dim_size = random.randrange(min_smaller_dim_size, max_smaller_dim_size + 1)
-    while min(*pil_image.size) >= 2 * smaller_dim_size:
-        pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
-    W, H = pil_image.size
+    n = 0
+    while min(W, H) >= 2 * smaller_dim_size:   # Pillow's resize(tuple(x // 2 for x in size), BOX), on the sizes
+        W, H = W // 2, H // 2
+        n += 1
     scale = smaller_dim_size / min(W, H)
     out_w, out_h = round(W * scale), round(H * scale)
     crop_y = random.randrange(out_h - image_size + 1)
@@ -89,17 +89,29 @@ def plan_region_crop(pil_image, image_size, min_crop_frac=0.8, max_crop_frac=1.0
     sx, sy = W / out_w, H / out_h
     x0, x1 = crop_x * sx, min(W, (crop_x + image_size) * sx)
     y0, y1 = crop_y * sy, min(H, (crop_y + image_size) * sy)
-    arr = np.asarray(pil_image, dtype=np.uint8)
     if (H - out_h) > 0 and (H - out_h) > (W - out_w) * 2:
         # vertical pass on the whole image (box y0..y1), then horizontal on the 256 rows (box x0..x1)
         v = coeffs(H, y0, y1, image_size)
         h = coeffs(W, x0, x1, image_size)
-        return arr, [(0,) + v, (1,) + h]
+        return n, (W, H), [(0,) + v, (1,) + h], None
     support = 2 * max(1.0, sy)
     r0, r1 = max(0, int(y0 - support) - 1), min(H, int(y1 + support) + 2)
     h = coeffs(W, x0, x1, image_size)
     v = coeffs(r1 - r0, y0 - r0, y1 - r0, image_size)
-    return arr[r0:r1], [(1,) + h, (0,) + v]
+    return n, (W, H), [(1,) + h, (0,) + v], (r0, r1)
+
+
+def plan_region_crop(pil_image, image_size, min_crop_frac=0.8, max_crop_frac=1.0):
+    """random_crop_arr_region (augmentation.py) up to its two resizes: the same random draws, the same BOX halvings (in
+    Pillow), then the source rows it keeps and its two passes. Returns (src uint8 HxWx3, passes [(axis, xmin, xlen, kk),
+    (axis, xmin, xlen, kk)]); run_passes on src gives random_crop_arr_region's output bit for bit."""
+    from PIL import Image
+    n, size, passes, rows = draw_region_crop(*pil_image.size, image_size, min_crop_frac, max_crop_frac)
+    for _ in range(n):
+        pil_image = pil_image.resize(tuple(x // 2 for x in pil_image.size), resample=Image.BOX)
+    assert pil_image.size == size, (pil_image.size, size)
+    arr = np.asarray(pil_image, dtype=np.uint8)
+    return (arr if rows is None else arr[rows[0]:rows[1]]), passes
 
 
 def run_passes_np(src, passes):
