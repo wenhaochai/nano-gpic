@@ -13,6 +13,10 @@ H4 input: to_input equals val_transform's ToTensor + Normalize bit for bit, and 
 H5 tasks: an end-to-end CPU run on fake ms checkpoints (strict load of the EMA and the raw weights from a run config)
    writes one line per (checkpoint, weights) with the asked fields; the task list skips done entries, lists a
    checkpoint with one weights missing, and a second run adds no line; the lockf counter hands out each index once
+H6 train shard: prep --train-shard (its CPU path, with fake shards and a fake text encoder) copies the val part of the
+   default file bit for bit and reads the train part from the given shard and its cache; the data file names carry the
+   shard (00787's name unchanged); the val loss of one fake checkpoint is the same with both files, the lines record
+   the train shard and are keyed by the data file; with REAL=1, also the two real 3072 files (val tensors bit-identical)
 Each test prints PASS or FAIL; the exit code is the number of failed tests."""
 import json
 import math
@@ -323,8 +327,173 @@ def H5():
         assert got == list(range(100)), got
 
 
+def write_tar(path, samples):
+    """A webdataset tar: <key>.jpg and <key>.json (caption, caption_type) per sample."""
+    import tarfile
+    from PIL import Image
+    with tarfile.open(path, "w") as tar:
+        for key, arr, cap in samples:
+            for ext, b in (("jpg", None), ("json", json.dumps(dict(caption=cap, caption_type="x")).encode())):
+                if b is None:
+                    bio = io.BytesIO(); Image.fromarray(arr).save(bio, format="JPEG"); b = bio.getvalue()
+                ti = tarfile.TarInfo(f"{key}.{ext}"); ti.size = len(b)
+                tar.addfile(ti, io.BytesIO(b))
+
+
+def write_cache(emb_dir, name, keys, lens, seed):
+    """A training text cache for one shard: <name>.emb (bf16 rows of EMB_DIM) and <name>.idx.npz (keys, offsets, lengths)."""
+    g = torch.Generator().manual_seed(seed)
+    embs = [torch.randn(L, H.EMB_DIM, generator=g).bfloat16() for L in lens]
+    offs = np.cumsum([0] + list(lens[:-1]))
+    with open(os.path.join(emb_dir, name + ".emb"), "wb") as f:
+        f.write(torch.cat(embs).view(torch.int16).numpy().tobytes())
+    np.savez(os.path.join(emb_dir, name + ".idx.npz"), keys=np.array(keys), offsets=offs, lengths=np.array(lens))
+    return embs
+
+
+class FakeEncoder(torch.nn.Module):
+    """Stands in for Qwen3TextEncoder in prep: the tokenizer gives one token per word; _impl_condition returns the cache's
+    rows (CACHE[caption]) plus 1e-3 noise, so the text check passes and the re-encode differs from the cache."""
+    CACHE = {}
+
+    def __init__(self, *a, **k):
+        super().__init__()
+
+        class Tok:
+            eos_token_id, pad_token_id = 0, 0
+
+            def __call__(self, caps, truncation, max_length):   # captions are unique, so are their ids
+                return {"input_ids": [[(hash(c) + i) % 1000 + 1 for i in range(len(c.split()))][:max_length] for c in caps]}
+        self.tokenizer = Tok()
+        self.model = torch.nn.Identity()   # prep's CPU path turns its compile off
+
+    def _impl_condition(self, y, meta):
+        ids, mask = meta["input_ids"], meta["text_mask"]
+        out = torch.zeros(ids.shape[0], ids.shape[1], H.EMB_DIM, dtype=torch.bfloat16)
+        for r in range(ids.shape[0]):
+            key = tuple(ids[r][mask[r]].tolist())
+            e = FakeEncoder.CACHE[key]
+            out[r, :len(e)] = (e.float() + 1e-3 * torch.randn_like(e.float())).bfloat16()
+        return out
+
+
+@test
+def H6():
+    """--train-shard: the val part is copied bit for bit; the val loss is the same with both files"""
+    import types
+    assert os.path.basename(H.data_path(3072, 3072)) == "data_v1_val3072_train3072_00787.pt"
+    assert os.path.basename(H.data_path(3072, 3072, "gpic_train_00000")) == "data_v1_val3072_train3072_00000.pt"
+    assert H.train_shard_path("gpic_train_00000.tar") == H.train_shard_path("/x/gpic_train_00000") == \
+        os.path.join(H.TRAIN_DIR, "gpic_train_00000.tar")
+    rng = np.random.default_rng(0)
+    words = "a red cat sits on the mat under blue sky with two dogs near old tree".split()
+    with tempfile.TemporaryDirectory() as tmp:
+        tdir, vdir, edir, odir = (os.path.join(tmp, x) for x in ("train", "val", "emb", "out"))
+        for d in (tdir, vdir, edir):
+            os.makedirs(d)
+        n = 5
+
+        def samples(prefix, k):
+            return [(f"{prefix}{i:04d}", rng.integers(0, 256, (40 + 8 * i, 72, 3), dtype=np.uint8),
+                     " ".join(list(rng.choice(words, int(rng.integers(1, 9)))) + [f"{prefix}{i}"])) for i in range(k)]
+        val_s = samples("v", n)
+        write_tar(os.path.join(vdir, "gpic_val_00000.tar"), val_s)
+        enc = FakeEncoder()
+        for shard, seed in (("gpic_train_00787", 1), ("gpic_train_00000", 2)):
+            tr_s = samples(shard[-5:], n + 2)
+            write_tar(os.path.join(tdir, shard + ".tar"), tr_s)
+            ids = enc.tokenizer([c for _, _, c in tr_s], True, 320)["input_ids"]
+            embs = write_cache(edir, shard, [k for k, _, _ in tr_s], [len(i) for i in ids], seed)
+            FakeEncoder.CACHE.update({tuple(i): e for i, e in zip(ids, embs)})
+        ids = enc.tokenizer([c for _, _, c in val_s], True, 320)["input_ids"]
+        FakeEncoder.CACHE.update({tuple(i): torch.randn(len(i), H.EMB_DIM).bfloat16() for i in ids})
+        # prep with the fake shards, cache and encoder (CPU path)
+        saved = (H.TRAIN_DIR, H.TRAIN_EMB, H.VAL_GLOB, H.OUT_DIR, H.IMAGE)
+        fake_mod = types.ModuleType("fake_qwen"); fake_mod.Qwen3TextEncoder = FakeEncoder
+        real_mod = sys.modules.get("src.models.conditioner.qwen3_text_encoder")
+        H.TRAIN_DIR, H.TRAIN_EMB, H.VAL_GLOB, H.OUT_DIR, H.IMAGE = tdir, edir, os.path.join(vdir, "gpic_val_*.tar"), odir, 32
+        sys.modules["src.models.conditioner.qwen3_text_encoder"] = fake_mod
+        try:
+            common = ["--n-val", str(n), "--n-train", str(n), "--procs", "2", "--device", "cpu"]
+            rc, txt = run_main(["prep"] + common)
+            p787 = os.path.join(odir, f"data_v1_val{n}_train{n}_00787.pt")
+            assert os.path.exists(p787), txt
+            # the val copy keeps the source's encode: change the fake encoder's val rows, so a re-encode would differ
+            for i in ids:
+                FakeEncoder.CACHE[tuple(i)] = torch.randn(len(i), H.EMB_DIM).bfloat16()
+            rc, txt = run_main(["prep", "--train-shard", "gpic_train_00000"] + common)
+            p000 = os.path.join(odir, f"data_v1_val{n}_train{n}_00000.pt")
+            assert os.path.exists(p000) and "bit for bit" in txt, txt
+        finally:
+            H.TRAIN_DIR, H.TRAIN_EMB, H.VAL_GLOB, H.OUT_DIR, H.IMAGE = saved
+            if real_mod is not None:
+                sys.modules["src.models.conditioner.qwen3_text_encoder"] = real_mod
+            else:
+                sys.modules.pop("src.models.conditioner.qwen3_text_encoder", None)
+        a, b = (torch.load(p, weights_only=False) for p in (p787, p000))
+        assert os.path.basename(a["train_shard"]) == "gpic_train_00787.tar" and os.path.basename(b["train_shard"]) == "gpic_train_00000.tar"
+        assert b["val_from"] == p787 and a["val_from"] is None
+        for k, v in a["val"].items():
+            assert (torch.equal(v, b["val"][k]) and v.dtype == b["val"][k].dtype) if torch.is_tensor(v) else v == b["val"][k], k
+        assert not torch.equal(a["train"]["img"], b["train"]["img"])
+        assert all(s.startswith("00000") for s in b["train"]["keys"]) and b["train"]["shards"][0] == "gpic_train_00000.tar"
+        # the train part is the 00000 cache's rows, in sample order
+        name = "gpic_train_00000"
+        with np.load(os.path.join(edir, name + ".idx.npz")) as z:
+            raw = np.fromfile(os.path.join(edir, name + ".emb"), dtype=np.int16)
+            rows = torch.from_numpy(raw).view(torch.bfloat16).view(-1, H.EMB_DIM)
+            want = torch.cat([rows[o:o + L] for o, L in zip(z["offsets"][:n], z["lengths"][:n])])
+        assert torch.equal(b["train"]["emb"], want)
+        assert 0 < b["text_check"]["rel_rms"] < 3e-2, b["text_check"]
+        print(f"  prep: val part bit-identical ({len(a['val'])} fields); train from {b['train']['shards'][0]}; "
+              f"text check rel_rms {b['text_check']['rel_rms']:.2e}")
+        # one fake checkpoint on both files: same val loss, different train loss, two lines per file
+        ck = write_run(tmp, "d64", [100], [(21, 22)])
+        out = os.path.join(tmp, "res.jsonl")
+        for p in (p787, p000):
+            d = torch.load(p, weights_only=False)
+            for s_ in ("val", "train", "train_reenc"):   # the tiny net's caption width and image size
+                d[s_]["emb"] = d[s_]["emb"][:, :SMALL["txt_embed_dim"]].float().contiguous()
+                d[s_]["img"] = torch.nn.functional.interpolate(d[s_]["img"].permute(0, 3, 1, 2).float(), size=64).round()\
+                    .clamp(0, 255).to(torch.uint8).permute(0, 2, 3, 1).contiguous()
+                d[s_]["text_max_length"] = SMALL["txt_max_length"]
+            torch.save(d, p)
+        for p, shard in ((p787, "gpic_train_00787"), (p000, "gpic_train_00000")):
+            rc, txt = run_main(["work", "--out", out, "--device", "cpu", "--batch", "3", "--threads", "1", "--n-val", str(n),
+                                "--n-train", str(n), "--data", p, "--train-shard", shard, "--ckpt", ck[0]])
+            assert rc == 0, txt
+            # the list keys on the data file: done for this file only
+            rc, txt = run_main(["list", "--out", out, "--min-age", "0", "--n-val", str(n), "--n-train", str(n), "--data", p,
+                                "--ckpt", ck[0]])
+            assert not [l for l in txt.splitlines() if l.startswith("{")], txt
+        recs = [json.loads(l) for l in open(out)]
+        assert [(r["train_shard"], r["weights"]) for r in recs] == [("gpic_train_00787.tar", "ema"), ("gpic_train_00787.tar", "raw"),
+                                                                    ("gpic_train_00000.tar", "ema"), ("gpic_train_00000.tar", "raw")]
+        assert [r["data"] for r in recs] == [os.path.basename(p787)[:-3]] * 2 + [os.path.basename(p000)[:-3]] * 2
+        for w in ("ema", "raw"):
+            r1, r2 = (r for r in recs if r["weights"] == w)
+            assert r1["loss_val"] == r2["loss_val"] and r1["loss_val_t"] == r2["loss_val_t"], (r1["loss_val"], r2["loss_val"])
+            assert r1["loss_train"] != r2["loss_train"]
+            print(f"  {w}: loss_val {r1['loss_val']:.6f} on both files; loss_train {r1['loss_train']:.6f} (00787) "
+                  f"{r2['loss_train']:.6f} (00000)")
+        # a wrong --train-shard for the file fails
+        try:
+            run_main(["work", "--out", out, "--device", "cpu", "--n-val", str(n), "--n-train", str(n), "--data", p000,
+                      "--train-shard", "gpic_train_00787", "--ckpt", ck[0]])
+            raise RuntimeError("no assert")
+        except AssertionError:
+            pass
+    if os.environ.get("REAL") == "1":   # the two real files
+        a, b = (torch.load(H.data_path(3072, 3072, s), map_location="cpu", mmap=True, weights_only=False)
+                for s in ("gpic_train_00787", "gpic_train_00000"))
+        for k, v in a["val"].items():
+            assert (torch.equal(v, b["val"][k]) and v.dtype == b["val"][k].dtype) if torch.is_tensor(v) else v == b["val"][k], k
+        print(f"  real files: val part bit-identical ({a['val']['img'].shape[0]} images, {a['val']['emb'].shape[0]} tokens); "
+              f"train {os.path.basename(a['train_shard'])} vs {os.path.basename(b['train_shard'])}")
+
+
 def main():
-    tests = [H1, H2, H3, H4, H5]
+    tests = [H1, H2, H3, H4, H5, H6]
     want = set(sys.argv[1:])
     for t in tests:
         if not want or t.__name__ in want:

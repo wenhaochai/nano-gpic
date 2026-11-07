@@ -13,8 +13,10 @@ data, with the definition of FixedValLoss (gpic-wt/muon/baselines/PixelGen/src/c
   SEED * 1_000_003 + j, independent of the batch, the GPU and the number of GPUs; SEED = 0 for both sets, so image j of
   the two sets shares its noise and levels (common random numbers for the train-val gap);
 - data: (a) held-out: the first N_val samples of the GPIC validation shards gpic_val_*.tar (shard order, tar order)
-  with their own captions; (b) train: the first N_train samples of gpic_train_00787.tar (TRAIN_SHARD below); images
-  center-cropped to 256 (val_transform), no caption dropout;
+  with their own captions; (b) train: the first N_train samples of one train shard, --train-shard (default
+  gpic_train_00787, DEFAULT_TRAIN_SHARD below; gpic_train_00000 is the shard that the repetition arms s80 and s8 read
+  too); images center-cropped to 256 (val_transform), no caption dropout. A data file for another train shard copies
+  the val part of the 00787 file bit for bit (--val-from), so the val loss is the same on both files;
 - text: as in training (CachedTextConditioner): Qwen3-1.7B outputs of the real tokens, zeros on padding, a [B, T] mask,
   T = the batch's longest caption rounded up to 8, at most 320. Train captions take their outputs from the training
   cache itself (train_emb_qwen3_1.7b); held-out captions are encoded once with tools/encode_captions.encode_shard, the
@@ -23,7 +25,8 @@ data, with the definition of FixedValLoss (gpic-wt/muon/baselines/PixelGen/src/c
 Images are batched in order of caption length, so a batch pads little; the order changes only rounding.
 
 Subcommands (run from anywhere; the repo's baselines/PixelGen and tools/ go on sys.path):
-  prep  --n-val N --n-train N        reads, crops and encodes the data once -> OUT_DIR/data_v1_val<N>_train<N>_00787.pt
+  prep  --n-val N --n-train N [--train-shard gpic_train_NNNNN]
+                                     reads, crops and encodes the data once -> OUT_DIR/data_v1_val<N>_train<N>_NNNNN.pt
   list  --out results.jsonl [--ckpt ...]   prints the task list (JSON lines): every ms checkpoint of the ladders that
                                      is older than --min-age seconds and lacks a line for some weights in the output
   work  --out results.jsonl --data <prep file> (--tasks file --counter file | --ckpt ...) [--gpu i]
@@ -31,6 +34,7 @@ Subcommands (run from anywhere; the repo's baselines/PixelGen and tools/ go on s
                                      (each takes the next task); appends one JSON line per (checkpoint, weights)
   bench --d 1792 --nb 18 --nt 4      seconds per forward of a random model, and the implied minutes per checkpoint
 Idempotent: a (checkpoint, weights, N_val, N_train, num_t, seed, data file) that has a line in the output is skipped.
+The data file's name carries the train shard, so lines of two data files never mix; each line records train_shard.
 """
 import argparse
 import fcntl
@@ -68,7 +72,10 @@ VAL_GLOB = os.path.join(WC, "data/gpic/val/gpic_val_*.tar")
 # 235 (d1024), 29 (d1280) of 801, and the first ms checkpoint of each Lite run comes after 3.39, 2.15, 1.46, 1.02 and
 # 0.57 epochs (d1280: 454 shards started). Of the 4 Lite shards in Full's first 256 that d1280 starts in its first 256,
 # 00787 comes first for d1280, the Lite run with the fewest epochs.
-TRAIN_SHARD = os.path.join(WC, "data/gpic/train/gpic_train_00787.tar")
+DEFAULT_TRAIN_SHARD = "gpic_train_00787"
+# 00000: in all four new ladders (muon_full, muon_lite, muon_s80 {00000..00079}, muon_s8 {00000..00007}); s80 and s8 never
+# read 00787 (when each ladder starts it: tmp/ladder_prof/heldout_v2_impl.md)
+TRAIN_DIR = os.path.join(WC, "data/gpic/train")
 TRAIN_EMB = os.path.join(WC, "data/gpic/train_emb_qwen3_1.7b")
 OUT_DIR = os.path.join(WC, "tmp", "heldout_loss")
 NUM_T, SEED, BATCH = 16, 0, 128
@@ -150,8 +157,17 @@ def text_batch(split, idx, device):
     return y, mask
 
 
-def data_path(n_val, n_train):
-    return os.path.join(OUT_DIR, f"data_v1_val{n_val}_train{n_train}_{os.path.basename(TRAIN_SHARD)[11:16]}.pt")
+def train_shard_path(name):
+    """gpic_train_NNNNN (a name, with or without .tar, or a path) -> TRAIN_DIR/gpic_train_NNNNN.tar."""
+    base = os.path.basename(name)
+    base = base[:-len(".tar")] if base.endswith(".tar") else base
+    assert re.fullmatch(r"gpic_train_\d{5}", base), f"not a GPIC train shard: {name}"
+    return os.path.join(TRAIN_DIR, base + ".tar")
+
+
+def data_path(n_val, n_train, train_shard=DEFAULT_TRAIN_SHARD):
+    """The data file of a train shard: ..._00787.pt for the default (the name of the first file), ..._00000.pt, ..."""
+    return os.path.join(OUT_DIR, f"data_v1_val{n_val}_train{n_train}_{os.path.basename(train_shard_path(train_shard))[11:16]}.pt")
 
 
 def pack_split(samples_or_none, img, embs, extra):
@@ -173,17 +189,27 @@ def cmd_prep(a):
         return
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     t0 = time.time()
-    val, val_skip = read_samples(sorted(glob.glob(VAL_GLOB)), a.n_val)
-    tr, tr_skip = read_samples([TRAIN_SHARD], a.n_train)
-    print(f"[prep] read {len(val)} val samples ({val_skip} skipped) and {len(tr)} train samples ({tr_skip} skipped) "
-          f"in {time.time() - t0:.0f} s", flush=True)
+    train_shard = train_shard_path(a.train_shard)
+    # another train shard than the default: the val part is copied from the default's file (never re-encoded: an encode
+    # on another GPU differs by about 1% in bf16), so the val loss of a checkpoint is the same on both files
+    val_from = a.val_from
+    if val_from is None and os.path.basename(train_shard) != DEFAULT_TRAIN_SHARD + ".tar":
+        val_from = data_path(a.n_val, a.n_train)
+    if val_from:
+        assert os.path.exists(val_from), f"--val-from {val_from} is missing: build the {DEFAULT_TRAIN_SHARD} file first"
+        val = None
+    else:
+        val, val_skip = read_samples(sorted(glob.glob(VAL_GLOB)), a.n_val)
+    tr, tr_skip = read_samples([train_shard], a.n_train)
+    print(f"[prep] read {len(val) if val else 0} val samples and {len(tr)} train samples ({tr_skip} skipped) from "
+          f"{os.path.basename(train_shard)} in {time.time() - t0:.0f} s", flush=True)
     from concurrent.futures import ProcessPoolExecutor
     with ProcessPoolExecutor(a.procs) as ex:   # before any CUDA call: the pool forks
         imgs = [torch.from_numpy(np.stack(list(ex.map(center_crop_u8, [s["image"] for s in ss], chunksize=16))))
-                for ss in (val, tr)]
+                if ss else None for ss in (val, tr)]
     print(f"[prep] cropped in {time.time() - t0:.0f} s", flush=True)
     # train captions: the training cache's own outputs (what training read for these samples)
-    name = os.path.basename(TRAIN_SHARD)[:-len(".tar")]
+    name = os.path.basename(train_shard)[:-len(".tar")]
     with np.load(os.path.join(TRAIN_EMB, name + ".idx.npz")) as z:
         index = dict(zip(z["keys"].tolist(), zip(z["offsets"].tolist(), z["lengths"].tolist())))
     cached = []
@@ -198,16 +224,27 @@ def cmd_prep(a):
     from src.models.conditioner.qwen3_text_encoder import Qwen3TextEncoder
     torch.set_num_threads(1)
     te = Qwen3TextEncoder("Qwen/Qwen3-1.7B", embed_dim=EMB_DIM, max_length=TEXT_MAX, text_mode="masked",
-                          pad_multiple=PAD_MULTIPLE, attn_implementation="sdpa").to("cuda").eval()
+                          pad_multiple=PAD_MULTIPLE, attn_implementation="sdpa").to(a.device).eval()
+    if a.device == "cpu":   # a vis node without a GPU: the encoder's inputs stay on the CPU, and the model runs eager
+        te._to_cuda = lambda t: t   # (Qwen3TextEncoder compiles it; inductor's CPU path does not build here)
+        te.model._compiled_call_impl = None
+        torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "6")))
+    # on the CPU, encode_shard's CUDA autocast is off and the bf16 weights compute in bf16 (CPU kernels)
     enc = lambda ss: encode_shard(te, te.tokenizer, [s["key"] for s in ss], [s["caption"] for s in ss], 32,
-                                  PAD_MULTIPLE, TEXT_MAX, "cuda")[0]
-    val_emb = enc(val)
+                                  PAD_MULTIPLE, TEXT_MAX, a.device)[0]
+    if val_from:
+        src = torch.load(val_from, map_location="cpu", mmap=True, weights_only=False)
+        assert (src["version"], src["n_val"], src["val_glob"]) == (1, a.n_val, VAL_GLOB), (val_from, src["n_val"])
+        val_part, val_skip = src["val"], src["skipped"]["val"]
+        print(f"[prep] val part copied from {val_from} (no re-encode)", flush=True)
+    else:
+        val_part = pack_split(val, imgs[0], enc(val), dict(text="Qwen3-1.7B, tools/encode_captions.encode_shard"))
     # check of the text path: the same function on the train captions against the training cache
     tr_emb = enc(tr)
     assert [len(e) for e in tr_emb] == [len(e) for e in cached], "token lengths differ from the training cache"
     a32, b32 = torch.cat(tr_emb).float(), torch.cat(cached).float()
     diff = a32 - b32
-    check = dict(tokens=int(a32.shape[0]), frac_equal=float((diff == 0).float().mean()),
+    check = dict(device=a.device, tokens=int(a32.shape[0]), frac_equal=float((diff == 0).float().mean()),
                  rel_rms=float(diff.pow(2).mean().sqrt() / b32.pow(2).mean().sqrt()), max_abs=float(diff.abs().max()),
                  max_abs_cache=float(b32.abs().max()))
     print(f"[prep] train captions re-encoded vs the training cache: {check}", flush=True)
@@ -216,16 +253,21 @@ def cmd_prep(a):
     # outputs alone is 0.17%. A different tokenizer, truncation, padding or mask would give an error of order 1.
     assert check["rel_rms"] < 3e-2, check
     del te
-    out = dict(version=1, n_val=a.n_val, n_train=a.n_train, val_glob=VAL_GLOB, train_shard=TRAIN_SHARD,
+    out = dict(version=1, n_val=a.n_val, n_train=a.n_train, val_glob=VAL_GLOB, train_shard=train_shard,
                train_emb=TRAIN_EMB, text_check=check, skipped=dict(val=val_skip, train=tr_skip),
-               created=time.strftime("%Y-%m-%dT%H:%M:%S"), code=_git_head(),
-               val=pack_split(val, imgs[0], val_emb, dict(text="Qwen3-1.7B, tools/encode_captions.encode_shard")),
+               created=time.strftime("%Y-%m-%dT%H:%M:%S"), code=_git_head(), val_from=val_from,
+               val=val_part,
                train=pack_split(tr, imgs[1], cached, dict(text=f"training cache {TRAIN_EMB}")),
                # the train images with the captions encoded on the held-out path: work --splits train_reenc measures
                # how much the encoding (cache vs this run's encode) moves the loss
-               train_reenc=pack_split(tr, imgs[1], tr_emb, dict(text="Qwen3-1.7B, tools/encode_captions.encode_shard")))
+               train_reenc=pack_split(tr, imgs[1], tr_emb, dict(text=f"Qwen3-1.7B, tools/encode_captions.encode_shard ({a.device})")))
     tmp = path + f".tmp{os.getpid()}"
     torch.save(out, tmp)
+    if val_from:   # the copy is bit for bit
+        new = torch.load(tmp, map_location="cpu", mmap=True, weights_only=False)["val"]
+        for k, v in src["val"].items():
+            assert (torch.equal(new[k], v) and new[k].dtype == v.dtype) if torch.is_tensor(v) else new[k] == v, k
+        print(f"[prep] val part of {tmp} equals {val_from}'s (every field, bit for bit)", flush=True)
     os.replace(tmp, path)
     print(f"[prep] wrote {path} ({os.path.getsize(path) / 2**30:.2f} GiB) in {time.time() - t0:.0f} s; mean tokens "
           f"val {out['val']['lens'].float().mean():.1f} train {out['train']['lens'].float().mean():.1f}", flush=True)
@@ -335,6 +377,8 @@ def evaluate(nets, tr, split, ts, seed=SEED, batch=BATCH, device="cpu", autocast
         it = torch.tensor(idx, device=device)
         x = to_input(split["img"][it])
         y, mask = text_batch(split, idx, device)
+        if not autocast:   # CPU (tests, vis node): the net is fp32 and nothing casts the bf16 caption outputs
+            y = y.float()
         for k in range(num_t):
             for name, net in nets.items():
                 l = level_loss(net, tr, x, y, mask, ts[k], noise[:, k], autocast).double()
@@ -572,6 +616,9 @@ def cmd_work(a):
     torch.set_num_threads(2)
     data = load_data(a.data, device)
     assert (data["n_val"], data["n_train"]) == (a.n_val, a.n_train), (a.data, a.n_val, a.n_train)
+    if a.train_shard is not None:
+        assert os.path.basename(data["train_shard"]) == os.path.basename(train_shard_path(a.train_shard)), \
+            (a.data, data["train_shard"], a.train_shard)
     if a.tasks:
         with open(a.tasks) as f:
             tasks = [json.loads(line) for line in f if line.strip()]
@@ -641,8 +688,14 @@ def main(argv=None):
         p.add_argument("--n-train", type=int, default=3072)
         if name == "prep":
             p.add_argument("--procs", type=int, default=32)
+            p.add_argument("--device", default="cuda", choices=("cuda", "cpu"), help="the caption encoder's device")
+            p.add_argument("--val-from", default=None, help="copy the val part from this data file (default for a "
+                           f"train shard other than {DEFAULT_TRAIN_SHARD}: the {DEFAULT_TRAIN_SHARD} file of the same N)")
         if name in ("prep", "list", "work"):
-            p.add_argument("--data", default=None, help="the prep file (default: OUT_DIR/data_v1_val<N>_train<N>_00787.pt)")
+            p.add_argument("--train-shard", default=None, help=f"gpic_train_NNNNN (default {DEFAULT_TRAIN_SHARD}); "
+                           "names the default --data")
+            p.add_argument("--data", default=None, help="the prep file (default: OUT_DIR/data_v1_val<N>_train<N>_NNNNN.pt "
+                           "of --train-shard)")
         if name in ("list", "work"):
             p.add_argument("--out", required=True)
             p.add_argument("--ckpt", nargs="*", default=None)
@@ -660,10 +713,11 @@ def main(argv=None):
             for k, v in (("d", 1792), ("nb", 18), ("nt", 4), ("T", 56), ("iters", 10), ("gpu", 0), ("batch", BATCH)):
                 p.add_argument(f"--{k}", type=int, default=v)
     a = ap.parse_args(argv)
-    if a.cmd == "prep":
-        return cmd_prep(a)
     if a.cmd in ("prep", "list", "work"):
-        a.data = a.data or data_path(a.n_val, a.n_train)
+        a.data = a.data or data_path(a.n_val, a.n_train, a.train_shard or DEFAULT_TRAIN_SHARD)
+    if a.cmd == "prep":
+        a.train_shard = a.train_shard or DEFAULT_TRAIN_SHARD
+        return cmd_prep(a)
     if a.cmd == "list":
         return cmd_list(a)
     if a.cmd == "work":
