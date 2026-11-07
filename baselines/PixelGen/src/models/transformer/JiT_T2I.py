@@ -31,6 +31,25 @@ if _FUSED_NORM:
 _FUSED_QK = os.environ.get("GPIC_MFU_FUSED_QK", "0") == "1"
 if _FUSED_QK:
     from src.models.layers.fused_qk import qk_prep, qk_prep_packed
+# MFU lever P (docs/mfu.md): GPIC_MFU_PATCHIFY=1 patchifies and unpatchifies with reshape + permute, one copy each, instead of
+# F.unfold / F.fold. The patches do not overlap, so both are pure rearrangements: the same values bit for bit (and the
+# patchified tensor keeps unfold's strides). Outside a compiled graph (FSDP2 compiles block by block) CUDA's unfold
+# launches one im2col kernel per sample: 128 fp32 forward and 128 bf16 backward launches per step, 14.3 ms of a
+# 216 ms d1280 step (w1866); a whole-model compile (DDP) fuses them already.
+_PATCHIFY = os.environ.get("GPIC_MFU_PATCHIFY", "0") == "1"
+
+
+def patchify(x, p):
+    """F.unfold(x, p, stride=p).transpose(1, 2): [B, C, H, W] -> [B, (H/p)(W/p), C p p], the same values and strides."""
+    B, C, H, W = x.shape
+    return x.reshape(B, C, H // p, p, W // p, p).permute(0, 1, 3, 5, 2, 4).reshape(B, C * p * p, (H // p) * (W // p)).transpose(1, 2)
+
+
+def unpatchify(x, H, W, p):
+    """F.fold(x.transpose(1, 2), (H, W), p, stride=p): [N, (H/p)(W/p), C p p] -> [N, C, H, W] (contiguous)."""
+    N, L, D = x.shape
+    C = D // (p * p)
+    return x.reshape(N, H // p, W // p, C, p, p).permute(0, 3, 1, 4, 2, 5).reshape(N, C, H, W)
 
 # MFU lever E (docs/mfu.md): packed captions. With y_pack (a dict, below) the caption tokens of the batch lie back to back,
 # y [S, 2048], S = the sum of the caption lengths: the text blocks and the caption key projections run on the S real tokens
@@ -446,6 +465,8 @@ class JiT_T2I(nn.Module):
         x: (N, T, patch_size**2 * C)
         H, W: original height and width
         """
+        if _PATCHIFY:
+            return unpatchify(x, H, W, self.patch_size)
         x = torch.nn.functional.fold(
             x.transpose(1, 2).contiguous(), 
             output_size=(H, W), 
@@ -458,7 +479,10 @@ class JiT_T2I(nn.Module):
         """y_mask (ladder option B): [B, T] bool, True = a real caption token, T <= txt_max_length; None = the
         official unmasked path (y padded to txt_max_length). y_pack (lever E): packed captions, y [S, txt_embed_dim]."""
         B, _, H, W = x.shape
-        x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
+        if _PATCHIFY:
+            x = patchify(x, self.patch_size)
+        else:
+            x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
         if y_pack is not None:
             t = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
