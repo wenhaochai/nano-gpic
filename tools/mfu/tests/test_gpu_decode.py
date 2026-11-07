@@ -11,6 +11,9 @@ pil_exact_gpu.pack / run). CPU (TRITON_INTERPRET=1) or one GPU.
 4. GPU: DecodeAhead (GPIC_MFU_GPU_DECODE=2: a background thread decodes on a side stream) gives the synchronous path's
    crops bit for bit, over three batches from pinned host tensors as the DataLoader gives them.
 5. GPU: decode_jpeg releases the GIL: a pure-Python loop on the main thread keeps its speed while a thread decodes.
+6. GPU: the allocation race (w1896: GPIC_MFU_GPU_DECODE=1 trained to NaN at step 12). A buffer is freed while a kernel that
+   reads it is still queued behind a GPU sleep, then a batch is decoded: torchvision's own call may hand the freed block to
+   nvJPEG, which overwrites it before the reader runs (reported); the decode on its own stream (_decode_on_side) must not.
 usage: python test_gpu_decode.py"""
 import io, math, os, random, sys, tarfile, threading, time
 import numpy as np
@@ -182,5 +185,28 @@ if DEV == "cuda":
     print(f"5. a pure-Python loop: {1e3 * alone:.0f} ms alone, {1e3 * shared:.0f} ms while a thread decodes {len(datas)}-file "
           f"batches with nvJPEG ({1e3 * n_dec[1] / max(1, n_dec[0]):.1f} ms per batch, {n_dec[0]} batches): "
           f"{'the GIL is released' if shared < 1.3 * alone else 'WARNING: the decode holds the GIL'}", flush=True)
+if DEV == "cuda":
+    # 6. the allocation race
+    def race(on_side):
+        torch.cuda.synchronize()
+        H0, W0 = jp.index[0][2], jp.index[0][3]
+        buf = torch.full((3 * H0 * W0,), 7, dtype=torch.uint8, device=dev)   # the size of the first decoded image
+        torch.cuda._sleep(300_000_000)               # about 0.2 s of GPU time queued before the reader
+        total = buf.sum(dtype=torch.int64)           # the reader, queued behind the sleep
+        del buf                                      # free for the allocator now; its reader has not run
+        if on_side:
+            imgs, done = pil_exact_gpu._decode_on_side(datas, dev)
+            torch.cuda.current_stream().wait_event(done)
+        else:
+            imgs = pil_exact_gpu._decode(datas, dev)
+        torch.cuda.synchronize()
+        return int(total) == 7 * 3 * H0 * W0
+    raw = [race(False) for _ in range(3)]
+    side = [race(True) for _ in range(3)]
+    good6 = all(side)
+    ok &= good6
+    print(f"6. a freed buffer whose reader is still queued: torchvision's call on the current stream kept it intact in "
+          f"{sum(raw)} of 3 tries (False = the race reproduced); on the decode stream in {sum(side)} of 3: {good6}", flush=True)
+
 print("GPU_DECODE_TEST " + ("PASS" if ok else "FAIL"))
 sys.exit(0 if ok else 1)

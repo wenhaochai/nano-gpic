@@ -565,8 +565,48 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   and w12 from their bf16 inputs. Phase 2 (native2): the MLP as one function with the dgrads of w3 and w12 in FP8 (full
   fp32 accumulation; the SwiGLU backward gathers dz's amax while it writes bf16 dz). Measured as pairs on the two GPU
   halves (bf16 or phase 1 on GPUs 0-3, FP8 or phase 2 on 4-7, the same batches): w1888, w1889.
+- Result (E + packed K2 setting), mean step d640..d1792: phase 1 against bf16 -3.6, +0.8, -0.9, -1.9, -2.9, -5.7, -4.8%;
+  phase 2 against phase 1 -6.0, +0.1, -0.9, -1.1, (d1280: the arm died on a truncated .so, below), -3.9, -4.0%. About
+  -9% at d1536 and d1792 and -3% at d1024, well under the GEMMs' x1.6-1.8: the casts cost an estimated 5-13 ms a step at
+  d1536 (each activation is read twice for its amax and its cast; the SwiGLU product's two passes read the 4C-wide z
+  twice; dz is written in bf16 and read again for its FP8 copy; the weights' transposes). w1918 profiles bf16 and phase 2
+  in the shared-bucket setting at d1024 and d1536 to measure them.
 - Next: the amax as a by-product of the producers (K's outputs, the SwiGLU), or delayed scaling, to fold the cast into
   one pass; FP8 weight gradients.
+
+### C2. GPU JPEG decoding (`GPIC_MFU_GPU_DECODE=1|2`, with lever C; owner 2026-11-07: 「可以用GPU解码」)
+- Why: the workers' JPEG decode binds d640 and d768 (96 cores give about 13.4k images/s; d640 median step 61-66 ms, mean
+  72-76). torchvision 0.22's decode_jpeg on the GPU (nvJPEG, hardware decoder) takes 0.06 ms of caller time per image
+  against Pillow's 2.3-2.6 ms on one core (w1892, tools/mfu/jpeg_gpu_bench.py, 8 shards, no file refused).
+- How: a training JPEG in RGB or L whose region crop needs no BOX halving (84 of 96 images in shard 0) leaves the worker
+  undecoded. The worker reads the header only and draws the crop from the size (pil_exact.draw_region_crop: the same
+  random draws as plan_region_crop). The files travel back to back in one shared-memory tensor (pil_exact_gpu.Host, not
+  pickled through the pipe). The step decodes them and runs the same exact resize passes. PNGs, other modes and halved
+  images keep the CPU decode. =1 decodes in the training step; =2 decodes each batch a step ahead in one background
+  thread (DecodeAhead), handed over by an event; decode_jpeg releases the GIL (a Python loop keeps its speed beside it).
+- Changes the data: nvJPEG's pixels differ slightly from libjpeg-turbo's (the final crops: mean |diff| 0.215 of 255,
+  14.0% of values differ, max 50; w1896's test). An FD arm comes before the ladder may adopt it.
+- The allocation race (w1896: =1 trained to NaN from step 12): torchvision allocates the output images on the caller's
+  current stream but writes them on its own stream, without waiting for the caller's stream. In the training step that
+  stream still runs the step before, so a block it freed while its kernels still use it can go to nvJPEG and be
+  overwritten. Fix: the decode allocates on a stream of its own that runs no kernels, the caller's stream waits for an
+  event and copies the rows, and record_stream keeps each image until those copies ran. The test reproduces the race
+  with a buffer freed while its reader waits behind a GPU sleep (tools/mfu/tests/test_gpu_decode.py, step 6).
+- First timing (w1896, before the fix; =2 rarely meets the race and its losses are finite): d640 mean step 72.5 -> 63.4
+  ms (median 66.3 -> 60.4), the same batches.
+
+### P. Patchify and unpatchify by reshape + permute (`GPIC_MFU_PATCHIFY=1`)
+- Under FSDP2 the model compiles block by block, so F.unfold and F.fold run eagerly, and CUDA's unfold launches one
+  im2col kernel per sample: 128 fp32 launches in the forward and 128 bf16 launches in the fold's backward per step, plus
+  a col2im, 14.3 ms of a 216 ms d1280 step (w1866 profile). DDP widths compile the whole model; Inductor fuses them there.
+- The patches do not overlap, so both are pure rearrangements: reshape + permute gives the same values bit for bit with
+  one copy each, and the patchified tensor keeps unfold's strides (tools/mfu/tests/test_patchify.py). Pairs at d1280,
+  d1536, d1792: w1917.
+
+### Paired halves and the compile cache
+- Two halves of a node that compile the same graphs at the same time must not share an Inductor cache: two processes
+  writing one entry left a truncated .so (w1889's d1280 arm: "file too short"). jobs/mfu/pairs.sh gives half B its own
+  Inductor and Triton caches.
 
 ### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
 - Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches

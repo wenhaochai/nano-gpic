@@ -155,18 +155,48 @@ def _decode(datas, dev):
         return out
 
 
+_DECODE_STREAM = {}
+
+
+def _decode_on_side(datas, dev):
+    """nvJPEG with its output buffers allocated on a stream of their own, plus an event after the decode. torchvision
+    (0.22 decode_jpegs_cuda.cpp) allocates the outputs on the caller's current stream but writes them on its own stream
+    without waiting for the caller's stream: a block that the caller's stream freed while its kernels still use it (the
+    step before is still running on the GPU) can be handed to nvJPEG and overwritten. In the training step that trained
+    to NaN at step 12 (w1896, GPIC_MFU_GPU_DECODE=1). This stream runs no kernels of its own, and the caller keeps the
+    images alive for its copies (record_stream), so no block of its pool is in use when nvJPEG gets it."""
+    side = _DECODE_STREAM.get(dev)
+    if side is None:
+        side = _DECODE_STREAM[dev] = torch.cuda.Stream(dev)
+    side.synchronize()   # nothing is pending on it (no kernels run there); a guard
+    with torch.cuda.stream(side):
+        imgs = _decode(datas, dev)
+        done = torch.cuda.Event()
+        done.record(side)
+    return imgs, done
+
+
 def _sources(job, dev):
-    """The batch's source buffer on dev: the CPU items' bytes, then the JPEG items decoded by nvJPEG (rows r0:r1, HWC)."""
+    """The batch's source buffer on dev, built on the caller's current stream: the CPU items' bytes, then the JPEG items
+    decoded by nvJPEG (rows r0:r1, HWC)."""
     jp = job.get("jpeg")
     if jp is None:
         return job["src"]
+    cur = torch.cuda.current_stream(dev) if torch.device(dev).type == "cuda" else None
+    if cur is not None:
+        imgs, done = _decode_on_side([jp.blob[s:s + n] for s, n, *_ in jp.index], dev)
+    else:   # CPU tests
+        imgs, done = _decode([jp.blob[s:s + n] for s, n, *_ in jp.index], dev), None
     src = torch.empty(job["src_bytes"], dtype=torch.uint8, device=dev)
     if job["pix_bytes"]:
         src[:job["pix_bytes"]].copy_(job["src"], non_blocking=True)
-    imgs = _decode([jp.blob[s:s + n] for s, n, *_ in jp.index], dev)
+    if done is not None:
+        cur.wait_event(done)
     for img, (_, _, H, W, r0, r1, off) in zip(imgs, jp.index):
         assert tuple(img.shape) == (3, H, W), (tuple(img.shape), H, W)
         src[off:off + (r1 - r0) * W * 3].view(r1 - r0, W, 3).copy_(img[:, r0:r1].permute(1, 2, 0))
+        if cur is not None:
+            img.record_stream(cur)   # its block goes back to the decode stream's pool only after these copies ran
     return src
 
 

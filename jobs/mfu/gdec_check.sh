@@ -24,7 +24,7 @@ python $WT/tools/gpu_health.py > $OUT/gpu_health.txt 2>&1 || { tail -3 $OUT/gpu_
 export PIXGEN_SRC=$WT/baselines/PixelGen MFU_WT=$WT GPIC_MFU_DET_DATA=1 GPIC_SHARD_SEED=20261106 MFU_LIMIT=1500
 export GPIC_MFU_ATTN=fa3 GPIC_MFU_GPU_RESIZE=1 GPIC_MFU_UINT8=1 GPIC_MFU_FUSED_NORM=1 GPIC_MFU_FUSED_QK=1 GPIC_SHARED_BUCKET=1
 cd $WT
-CUDA_VISIBLE_DEVICES=0 python tools/mfu/tests/test_gpu_decode.py 2>&1 | grep -v -i warn | tail -7 | tee -a $OUT/summary.txt
+CUDA_VISIBLE_DEVICES=0 python tools/mfu/tests/test_gpu_decode.py 2>&1 | grep -v -i warn | tail -9 | tee -a $OUT/summary.txt
 grep -q "GPU_DECODE_TEST PASS" $OUT/summary.txt || { echo "the GPU decoding test failed"; exit 1; }
 MUON=(--config configs_h100/muon_ladder.yaml)
 arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; local rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/summary.txt; }
