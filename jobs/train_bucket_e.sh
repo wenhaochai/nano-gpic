@@ -33,4 +33,4 @@ exec bash $WT/jobs/train_ladder.sh $SIZE $WD $NB $NT $S \
   --config configs_h100/muon_ladder.yaml --model.optimizer.init_args.lr $ALR --model.optimizer.init_args.muon_lr $MLR \
   --data.train_batch_size $MBX --trainer.accumulate_grad_batches 1 --data.train_dataset.init_args.shared_bucket false \
   --data.train_dataset.init_args.group_window $MBX --data.train_dataset.init_args.tar_pattern "$PAT" \
-  --trainer.logger.init_args.name bucket_ab_${TAG}_$SIZE --trainer.logger.init_args.id bucket-ab-$TAG-$SIZE
+  --trainer.logger.init_args.name bucket_ab_${TAG}_$SIZE --trainer.logger.init_args.id bucket-ab-$TAG-$SIZE-v2
