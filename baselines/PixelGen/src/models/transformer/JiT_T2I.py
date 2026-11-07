@@ -25,6 +25,12 @@ if _ATTN == "fa3":
 _FUSED_NORM = os.environ.get("GPIC_MFU_FUSED_NORM", "0") == "1"
 if _FUSED_NORM:
     from src.models.layers.fused_norm import mod_rmsnorm, res_mod_rmsnorm
+# MFU lever K2 (docs/mfu.md): GPIC_MFU_FUSED_QK=1 builds the image blocks' attention inputs (q/k RMSNorm, RoPE, the image
+# and caption keys and values concatenated) in one Triton kernel per token kind, forward and backward
+# (src/models/layers/fused_qk.py; lever A's path); the same ops up to rounding.
+_FUSED_QK = os.environ.get("GPIC_MFU_FUSED_QK", "0") == "1"
+if _FUSED_QK:
+    from src.models.layers.fused_qk import qk_prep
 
 # MFU lever E (docs/mfu.md): packed captions. With y_pack (a dict, below) the caption tokens of the batch lie back to back,
 # y [S, 2048], S = the sum of the caption lengths: the text blocks and the caption key projections run on the S real tokens
@@ -123,6 +129,10 @@ class Attention(nn.Module):
             k = torch.cat([kx, pad(self.k_norm(ky))], dim=1)
             v = torch.cat([vx, pad(vy)], dim=1)
             return self.proj_drop(self.proj(fa3_attention(q, k, v, mask["lens"] + N).reshape(B, N, C)))
+        if mask is not None and mask.dtype == torch.int32 and _FUSED_QK:   # lever K2 on lever A's path
+            q, k, v = qk_prep(self.qkv_x(x), self.kv_y(y), self.q_norm.weight, self.k_norm.weight, pos[0], pos[1],
+                              self.num_heads, self.q_norm.variance_epsilon)
+            return self.proj_drop(self.proj(fa3_attention(q, k, v, mask).reshape(B, N, C)))
         if mask is not None and mask.dtype == torch.int32:   # lever A: mask = valid keys per sample (N + caption length)
             H, Hc = self.num_heads, C // self.num_heads
             q, kx, vx = self.qkv_x(x).view(B, N, 3, H, Hc).unbind(2)
