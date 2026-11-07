@@ -22,12 +22,19 @@ the owner writes O (bf16) into its slot of a flat buffer; one all_gather_into_te
 every update; every rank applies them all, so the weights stay identical across ranks.
 """
 import math
+import os
 
 import torch
 import torch.distributed as dist
 from torch.optim.adam import adam as _adam_fn
 
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
+# MFU lever NS (GPIC_MFU_NS_FUSED=1): each Newton-Schulz step's scalings and sums inside the GEMMs (addmm / baddbmm with beta
+# and alpha), so the step is 3 GEMMs and no element-wise pass: the same polynomial, rounded once per GEMM (fp32 accumulate)
+# instead of after every product and sum. d1536 under FSDP2 spent about 8 ms a step on those passes (w1918's profile:
+# 45 scalar multiplies and 59 adds over the stacked matrices). tools/mfu/tests/test_ns_fused.py: its error against fp32
+# Newton-Schulz is no larger than the reference's.
+_NS_FUSED = os.environ.get("GPIC_MFU_NS_FUSED", "0") == "1"
 FUSED_PARTS = {"attn.qkv_x.weight": 3, "attn.qkv.weight": 3, "attn.kv_y.weight": 2, "mlp.w12.weight": 2,
                "adaLN_modulation.0.weight": 6}
 
@@ -50,7 +57,7 @@ def tag_muon_params(model, prefixes=("blocks.", "text_refine_blocks.")):
 
 
 @torch.no_grad()
-def msign(G, steps=5, dtype=torch.bfloat16):
+def msign(G, steps=5, dtype=torch.bfloat16, fused=None):
     """Orthogonalize each matrix of G ([..., a, b]) with the quintic Newton-Schulz iteration (Keller Jordan), in bf16 by
     default. In bf16 the result moves by up to ~5% of its largest entry with the GEMM algorithm (e.g. batch size), so
     exact comparisons use dtype=torch.float32."""
@@ -60,6 +67,13 @@ def msign(G, steps=5, dtype=torch.bfloat16):
     if tall:
         X = X.mT
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    if _NS_FUSED if fused is None else fused:
+        mm = torch.baddbmm if X.dim() == 3 else torch.addmm
+        for _ in range(steps):
+            A = X @ X.mT
+            B = mm(A, A, A, beta=b, alpha=c)          # b A + c A A
+            X = mm(X, B, X, beta=a, alpha=1.0)        # a X + B X
+        return X.mT if tall else X
     for _ in range(steps):
         A = X @ X.mT
         B = b * A + c * (A @ A)
