@@ -333,6 +333,14 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   tools/mfu/tests/test_async_ckpt_exit.py: old code (no exit wait): file missing, the race reproduced; new: file complete
   and equal, exit 0; writer killed with the write pending: exit 97 after the 10 s check, no hang.
 
+### E and E2: conclusion (w1423, 1024 steps)
+- With the bug fixed, E2 deals exactly E's batches (d1280: the same first-100 divergence profile as E, 3.28e-5), but
+  d1280 A+B+C+D 65.51 -> +R 72.27 ms: the whole step-time distribution moves by 6-7 ms (median 63.7 -> 70.6), fast steps
+  included, and the slow tail stays. So E's cost is the packed path's extra host work inside a forward the host already
+  binds, not the plan's place; and the caption imbalance it removes is small: the slow-step tail (mean minus median) is
+  1.6-2.4 ms at every width (1.5-6% of the step), part of which is not captions.
+- Decision: E and E2 stay off; no further work on them while the FSDP2 step is host-bound.
+
 ### Review fixes (independent review of 5cd3372..e8bfff4, tmp/ladder_prof/review_mfu_head.md; mfu branch only, 6f73a7e)
 - S1: LightningModel.state_dict joins the EMA stream first (ModelParallelStrategy gathers the state dict before the
   callbacks' on_save_checkpoint, so a save could read the EMA before the step's lerp finished).
