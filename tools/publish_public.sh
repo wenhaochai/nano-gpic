@@ -31,6 +31,21 @@ for m in "${MAP[@]}"; do
   git fetch -q --no-tags $SRC "refs/remotes/origin/$src:refs/heads/$dst"
   PUB+=("$dst")
 done
+# The GPIC authors out of the public Contributors (owner 2026-11-07: 「不想看到别人」, 「claude可以有，只是不要那三位原作者」): the
+# GPIC release's 10 commits (b79f925..afa82da, keshik6/gpic's main when this fork started, by its authors) become one import commit
+# by the owner that names the source, grafted under every branch; its metadata is fixed, so the rewrite stays deterministic. LICENSE
+# and the README's credit stay as they are; the Co-Authored-By trailers stay. The checks refuse any other author or committer.
+UP=afa82daab73cfeab4ef9fbd174ff62b68bffc456
+UPS=" $(git rev-list $UP | tr '\n' ' ') "
+IMP=$(GIT_AUTHOR_NAME="Wenhao Chai" GIT_AUTHOR_EMAIL=USER@gmail.com GIT_COMMITTER_NAME="Wenhao Chai" \
+  GIT_COMMITTER_EMAIL=USER@gmail.com GIT_AUTHOR_DATE="$(git log -1 --format=%aI $UP)" GIT_COMMITTER_DATE="$(git log -1 --format=%cI $UP)" \
+  git commit-tree "$UP^{tree}" -m "Import the GPIC code release" \
+  -m "The code of github.com/keshik6/gpic at afa82da (GPIC; Chandrasegaran, Sargent et al., 2026) as one commit. LICENSE and the original README (GPIC_README.md) are kept.")
+git rev-list --parents "${PUB[@]}" --not $UP | while read -r c ps; do
+  np=(); hit=0
+  for p in $ps; do case "$UPS" in *" $p "*) np+=("$IMP"); hit=1;; *) np+=("$p");; esac; done
+  [ $hit = 0 ] || git replace --graft "$c" "${np[@]}"
+done
 SUB='
 import re
 REPL = [(b"/scratch/gpfs/GROUP/USER", b"/scratch/gpfs/GROUP/USER"), (b"USER", b"USER"), (b"GROUP", b"GROUP"),
@@ -60,6 +75,10 @@ done
 if git log --format=%B "${PUB[@]}" | grep -qi h100 || git for-each-ref --format='%(refname)' | grep -qi h100; then
   echo "a commit message or a ref name still names the cluster"; fail=1
 fi
+if git log --format='%an <%ae>%n%cn <%ce>' "${PUB[@]}" | sort -u | grep -vxF 'Wenhao Chai <USER@gmail.com>' | grep -q .; then
+  echo "a commit by someone other than the owner:"; git log --format='%an <%ae>%n%cn <%ce>' "${PUB[@]}" | sort | uniq -c; fail=1
+fi
+for b in "${PUB[@]}"; do [ "$(git rev-list --max-parents=0 $b | wc -l)" = 1 ] && [ "$(git log -1 --format=%s $(git rev-list --max-parents=0 $b))" = "Import the GPIC code release" ] || { echo "$b: the root is not the import commit"; fail=1; }; done
 [ $fail = 0 ] || { echo "not pushing"; exit 1; }
 for b in "${PUB[@]}"; do echo "$b: $(git rev-list --count $b) commits"; done
 if [ "$DRY" = --dry ]; then echo "dry run: nothing pushed"; exit 0; fi
