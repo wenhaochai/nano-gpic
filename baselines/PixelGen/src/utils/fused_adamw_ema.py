@@ -123,22 +123,44 @@ def _local(ts):
 
 class _Tables:
     """Device tables of one parameter group: per tensor its numel and the addresses of param, grad, exp_avg, exp_avg_sq,
-    step and EMA; per program its tensor and offset. Rebuilt when an address changes (FSDP2 hands new gradient tensors)."""
+    step and EMA; per program its tensor and offset. Host cost per step: the gradients' addresses are compared every step
+    (FSDP2 hands new gradient tensors; DDP's bucket views keep theirs), every address every FULL_EVERY steps and after
+    a state load. A changed table goes through a ring of pinned buffers into one persistent device table (the copy is
+    stream-ordered after any kernel still reading it), so no step allocates pinned memory."""
+    FULL_EVERY = 50
+    RING = 4
 
     def __init__(self):
-        self.key, self.n, self.rebuilds = None, None, 0
+        self.n, self.addr, self.gaddr, self.nl, self.rebuilds, self.calls = None, None, None, None, 0, 0
+        self.ring = None
 
     @staticmethod
     def _check(ts, dev):
         for t in ts:
             assert t.dtype == torch.float32 and t.is_contiguous() and t.device == dev, (t.dtype, t.shape)
 
+    def _upload(self, addr, dev):
+        shape = (len(addr), len(addr[0]))
+        if self.ring is None or tuple(self.ring[0].shape) != shape:
+            self.ring = [torch.empty(shape, dtype=torch.int64, pin_memory=True) for _ in range(self.RING)]
+            self.events = [None] * self.RING
+            self.ptr = torch.empty(shape, dtype=torch.int64, device=dev)
+        k = self.rebuilds % self.RING
+        if self.events[k] is not None:   # the copy from this buffer RING uploads ago has long finished
+            self.events[k].synchronize()
+        self.ring[k].copy_(torch.tensor(addr, dtype=torch.int64))
+        self.ptr.copy_(self.ring[k], non_blocking=True)
+        self.events[k] = torch.cuda.Event()
+        self.events[k].record()
+
     def get(self, lists, dev):
-        key = tuple(t.data_ptr() for ts in lists for t in ts)
-        if key == self.key:
+        self.calls += 1
+        # every gradient, and the first and last tensor of every other list (a state load replaces them all)
+        g = [t.data_ptr() for t in lists[1]] + [ts[i].data_ptr() for k, ts in enumerate(lists) if k != 1 for i in (0, -1)]
+        if g == self.gaddr and len(lists) == self.nl and self.calls % self.FULL_EVERY:
             return self
         n = [t.numel() for t in lists[0]]
-        if n != self.n:   # first build (or other tensors): the per-program tables, which depend on the sizes only
+        if n != self.n or len(lists) != self.nl:   # first build (or other tensors): the size-only tables
             for k, ts in enumerate(lists[1:], 1):   # list 4 holds the step counts (one element each)
                 assert [t.numel() for t in ts] == (n if k != 4 else [1] * len(n))
             for ts in lists:
@@ -147,23 +169,24 @@ class _Tables:
             nb = [-(-n[i] // BLOCK) for i in self.keep]
             tid = torch.repeat_interleave(torch.arange(len(self.keep), dtype=torch.int32), torch.tensor(nb, dtype=torch.long))
             toff = torch.cat([torch.arange(b, dtype=torch.int64) * BLOCK for b in nb]) if nb else torch.zeros(0, dtype=torch.int64)
-            self.numel = torch.tensor([n[i] for i in self.keep], dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
-            self.tid = tid.pin_memory().to(dev, non_blocking=True)
-            self.toff = toff.pin_memory().to(dev, non_blocking=True)
+            self.numel = torch.tensor([n[i] for i in self.keep], dtype=torch.int64).to(dev)
+            self.tid = tid.to(dev)
+            self.toff = toff.to(dev)
             self.programs = int(tid.numel())
-            self.n = n
-            self.block = BLOCK
-        else:   # the same sizes, new addresses (FSDP2 hands new gradient tensors each step): the gradients' checks only
-            assert [t.numel() for t in lists[1]] == n
-            self._check(lists[1], dev)
-        # a new device tensor each time: a kernel still queued keeps reading the old table (stream order)
+            self.n, self.nl, self.block, self.addr = n, len(lists), BLOCK, None
         addr = [[ts[i].data_ptr() for i in self.keep] for ts in lists]
-        self.aligned = USE_ALIGNED and all(n[i] % 4 == 0 for i in self.keep) and all(
-            a % 16 == 0 for k, row in enumerate(addr) if k != 4 for a in row)   # list 4 (steps) is read as a scalar
-        ptr = torch.tensor(addr, dtype=torch.int64)
-        self.ptr = ptr.pin_memory().to(dev, non_blocking=True)
-        self.key = key
-        self.rebuilds += 1
+        if addr != self.addr:
+            for row, old, ts in zip(addr, self.addr or [None] * len(addr), lists):
+                if row != old:
+                    assert [t.numel() for t in ts] == ([1] * len(n) if ts is lists[4] else n)
+                    self._check(ts, dev)
+            self.aligned = USE_ALIGNED and all(n[i] % 4 == 0 for i in self.keep) and all(
+                a % 16 == 0 for k, row in enumerate(addr) if k != 4 for a in row)   # list 4 (steps) is read as a scalar
+            if self.keep:
+                self._upload(addr, dev)
+            self.addr = addr
+            self.rebuilds += 1
+        self.gaddr = g
         return self
 
 
@@ -186,6 +209,10 @@ class FusedAdamWEMA(torch.optim.AdamW):
         self.ema_weight = None
         self._tables = {}
         self._hp = {}
+
+    def load_state_dict(self, state_dict):   # new state tensors: rebuild the address tables
+        super().load_state_dict(state_dict)
+        self._tables = {}
 
     def _hyper(self, group, dev):
         lr, (b1, b2), eps, wd = group["lr"], group["betas"], group["eps"], group["weight_decay"]
