@@ -2,7 +2,7 @@
 #SBATCH -J gpic-mfu-probe12
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=01:20:00
+#SBATCH --time=01:35:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
@@ -12,7 +12,8 @@
 #    d1024's and d1792's parameter shapes); step_bench plain / H1 / H2 / plain at d1280, d1024, d640 on the same GPU;
 #    end to end bit for bit at d640 with SDPA's math backend (deterministic): plain twice, H2 once, 30 recorded steps.
 # 2. Production path (jobs/mfu/widths.sh, 8 GPUs, the same batches): d1024 off / ACD / ACDH1 / ACDH2, d640 off / ACD /
-#    ACDH2, 1024 steps.
+#    ACDH2, and ACDP (profiler traces of every rank over steps 500-505 and per-stage CUDA events: the anatomy of the
+#    DDP step: imbalance, exposed communication, host gaps), 1024 steps.
 # usage: probe12.sh <code worktree>
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
@@ -51,5 +52,5 @@ for d in (1280, 1024, 640):
     v = {k: json.load(open(f"{o}/sb_d{d}_{k}.json"))["mean_ms"] for k in ("a1", "h1", "h2", "a2") if os.path.exists(f"{o}/sb_d{d}_{k}.json")}
     print(f"d{d} one GPU mean step ms: {v}")
 PY
-bash $WT/jobs/mfu/widths.sh $WT 1024 1024:ACD,ACDH1,ACDH2 640:ACD,ACDH2
+bash $WT/jobs/mfu/widths.sh $WT 1024 1024:ACD,ACDH1,ACDH2,ACDP 640:ACD,ACDH2,ACDP
 echo "DONE $OUT"
