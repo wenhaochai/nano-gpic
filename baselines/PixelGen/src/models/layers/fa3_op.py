@@ -32,10 +32,16 @@ def _lib():
 
 
 _CU = {}
+# MFU lever X (CUDA graphs): a tensor cached here during a graph's warm-up or capture would live in the graphs' memory
+# pool outside any graph output, which cudagraph trees refuse (w1470: "live storage data ptrs ... not accounted for");
+# under X the offsets are made in every call instead, which the graph replays for free
+_CU_CACHE = os.environ.get("GPIC_MFU_CUDAGRAPH") != "1"
 
 
 def _cu(B, S, device):
     """Uniform offsets 0, S, 2S, ..., BS (int32), cached: the ops run on every block of every step."""
+    if not _CU_CACHE:
+        return torch.arange(0, (B + 1) * S, S, dtype=torch.int32, device=device)
     key = (B, S, device)
     t = _CU.get(key)
     if t is None:
