@@ -1,5 +1,5 @@
 #!/bin/bash
-# Publish the main branch to the public page-linked repo wenhaochai/generating-distributions: fresh clone,
+# Publish the main branch to the public page-linked repo wenhaochai/nano-gpic: fresh clone,
 # cluster paths and user names replaced in every commit (git-filter-repo), every blob scanned for secrets, then pushed.
 # Run on vis1 (the scan runs Python). Prints the old -> new commit map for record links.
 # usage: tools/publish_public.sh [branch=main]
@@ -28,5 +28,5 @@ python3 -I $SRC/tools/pub_scan.py $T/repo $BR | tee $T/scan.txt
 if grep -qE "^== (wandb|hf_token|openai|anthropic|google|github|slack|aws|private_key|overleaf|bearer|cluster_ids)" $T/scan.txt; then
   echo "scan found secrets or cluster ids: not pushing"; exit 1
 fi
-git push -q https://github.com/wenhaochai/generating-distributions.git $BR:$BR
+git push -q https://github.com/wenhaochai/nano-gpic.git $BR:$BR
 tail -5 .git/filter-repo/commit-map
