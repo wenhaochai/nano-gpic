@@ -2,7 +2,7 @@
 
 This repository hosts the GPIC ladder speedrun: the fastest way to train the full compute ladder of PixelGen's JiT-T2I on [GPIC](https://gpic.stanford.edu) with 8 NVIDIA H100 GPUs. The ladder is seven widths, from 109M to 1.68B parameters, each trained to its budget on GPIC Full: 1, 2, 4, 8, 8, 8 and 8 × C0 from width 640 to 1792 (C0 = 1.43e19 FLOPs; 39 C0, about 5.6e20 FLOPs, in all). We run it to measure scaling laws for pixel-space text-to-image before testing new methods against them, so every hour saved is an hour of the ladder.
 
-**Current record: 438 H100-hours** (54.8 hours on one 8×H100 node), 35.7% MFU.
+**Current record: 428 H100-hours** (53.5 hours on one 8×H100 node), 36.5% MFU.
 
 This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026; its README is [GPIC_README.md](GPIC_README.md)). Every run, number and figure is on the experiment page, [wenhaochai.com/exps/gpic-speed.html](https://wenhaochai.com/exps/gpic-speed.html); training logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed).
 
@@ -15,15 +15,18 @@ This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshi
 | 1 | 682 | 22.9% | The official PixelGen code: DDP, masked SDPA, crops resized on the CPU; AdamW, batch 256 | 2026-11-06 | [a1a8681](https://github.com/wenhaochai/nano-gpic/commit/a1a8681e) |
 | 2 | 571 | 27.4% | FlashAttention-3 for the masked attention, the crop's resize on the GPU (bit for bit Pillow's), uint8 batches, FSDP2 from width 1280 | 2026-11-06 | [b8b2c9e](https://github.com/wenhaochai/nano-gpic/commit/b8b2c9e5) |
 | 3 | 530 | 29.5% | Fused Triton kernels for residual + RMSNorm + adaLN modulation and for q/k RMSNorm + RoPE + the k/v concatenation; FSDP2 groups at widths 896 and 1024 | 2026-11-07 | [6f856e3](https://github.com/wenhaochai/nano-gpic/commit/6f856e3c) |
-| 4 | **438** | **35.7%** | Recipe change: Muon (MuP scale) at batch 1024, run as 128 images per GPU with no accumulation; one caption-length bucket per step for all GPUs | 2026-11-07 | [468bc2d](https://github.com/wenhaochai/nano-gpic/commit/468bc2d8) |
+| 4 | 438 | 35.7% | Recipe change: Muon (MuP scale) at batch 1024, run as 128 images per GPU with no accumulation; one caption-length bucket per step for all GPUs | 2026-11-07 | [468bc2d](https://github.com/wenhaochai/nano-gpic/commit/468bc2d8) |
+| 5 | **428** | **36.5%** | Patchify and unpatchify by reshape + permute at the FSDP2 widths, where they ran outside the compiled blocks and CUDA's unfold launched one im2col kernel per image (the same values bit for bit) | 2026-11-07 | [14da7b3](https://github.com/wenhaochai/nano-gpic/commit/14da7b35) |
 
-H100-hours are training time: each width's steps times its mean measured step time times 8 GPUs, summed over the ladder; start-up compiles, checkpoints and evaluations are not counted. Records 1 to 3 run the official AdamW recipe at batch 256 and keep its math. Record 4 changes the recipe, at the same FLOPs per C0: Muon scores 14% to 24% lower FD than AdamW at every point tried.
+H100-hours are training time: each width's steps times its mean measured step time times 8 GPUs, summed over the ladder; start-up compiles, checkpoints and evaluations are not counted. Records 1 to 3 run the official AdamW recipe at batch 256 and keep its math. Record 4 changes the recipe, at the same FLOPs per C0: Muon scores 14% to 24% lower FD than AdamW at every point tried. Record 5 keeps record 4's math; its step times at widths 1280 to 1792 are record 4's minus the saving measured on the same batches on paired GPU halves (12.5, 14.0 and 13.4 ms per step).
 
 ## In progress
 
-- **FP8 GEMMs** (`GPIC_MFU_FP8=native2`): the image blocks' forward GEMMs and the MLP's input gradients in FP8, tensorwise scales, the SwiGLU product cast inside its own kernel. Measured on the same batches: 3% faster at width 1024, 9% at widths 1536 and 1792, loss within 0.2% of bf16. It changes the numerics, so it waits for an FD check.
-- **GPU JPEG decoding**: widths 640 and 768 are bound by the CPU's JPEG decoding, about 13.4k images/s on 96 cores, whatever the model's size (their median step is 61 ms, the mean 76 ms). nvJPEG takes 0.06 ms of CPU per image against Pillow's 2.4 ms; its pixels differ slightly, so it waits for an FD check too.
-- **Packed captions**, with the q/k kernel on the packed layout, mix every caption length in every step at the speed of one bucket per GPU. How captions are batched moves FD by up to 7% at equal held-out loss (6 below), so the shared bucket stays until repeated runs measure FD's spread.
+- **FP8 GEMMs** (`GPIC_MFU_FP8=native2`): the image blocks' forward GEMMs and the MLP's input gradients in FP8, tensorwise scales. In the ladder's setting it is 4.8% faster at width 1024 and 10.4% at 1536. A profile shows where the rest goes: the GEMMs take 10.8 ms less per step at width 1024 and 60.4 ms less at 1536, but the casts to FP8 cost 17.5 and 36.1 ms. The next version (`native3`) casts each activation in one pass with a scale from its last 16 steps; its speed run and an FD check are running. FP8 changes the numerics, so it counts only after that FD check.
+- **GPU JPEG decoding**: widths 640 and 768 are bound by the CPU's JPEG decoding. nvJPEG decodes about 84% of the training images in the training step, one step ahead, and the same exact resize runs on them. On the same batches, width 640 runs 18% faster (77.2 to 63.1 ms per step). Two bugs were found and fixed on the way. (1) torchvision writes the decoded images on its own CUDA stream without waiting for the caller's stream, so in a running step it overwrote memory still in use. (2) A per-image copy loop held Python's lock. nvJPEG's pixels differ slightly from libjpeg-turbo's, so an FD check is running.
+- **Fused Newton-Schulz** (`GPIC_MFU_NS_FUSED=1`): Muon's scalings and sums inside its GEMMs (8 ms per step of element-wise kernels at width 1536), the same polynomial rounded once per GEMM; being timed.
+
+Packed captions are closed: their FD falls inside the shared bucket's seed spread, but they run 1-4% slower than one bucket per step.
 
 ## Rules
 
@@ -52,9 +55,9 @@ Each line trains one width on one 8×H100 node, resumes from its last checkpoint
 | 768 | DDP, 128 × 1 | 83.6 | 25.4% |
 | 896 | DDP, 128 × 1 | 103.9 | 30.2% |
 | 1024 | DDP, 128 × 1 | 128.9 | 34.8% |
-| 1280 | FSDP2, 7 blocks per unit, 128 × 1 | 211.2 | 38.1% |
-| 1536 | FSDP2, 128 × 1 | 324.0 | 40.9% |
-| 1792 | FSDP2, 64 × 2 | 476.7 | 42.2% |
+| 1280 | FSDP2, 7 blocks per unit, 128 × 1, patchify by reshape | 198.7 | 40.5% |
+| 1536 | FSDP2, 128 × 1, patchify by reshape | 310.0 | 42.7% |
+| 1792 | FSDP2, 64 × 2, patchify by reshape | 463.3 | 43.4% |
 
 ## The ladder
 
