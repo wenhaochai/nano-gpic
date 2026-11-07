@@ -386,6 +386,10 @@ class JiT_T2I(nn.Module):
         self.weight_path = weight_path
         self.load_ema = load_ema
 
+    # MFU lever X under DDP (the whole model compiled with CUDA graphs): the tables are cached on first use, so make them
+    # eagerly, in the ordinary memory pool (a table first made inside a graph's warm-up would live in the graphs' pool
+    # outside every graph output, which cudagraph trees refuse)
+    @(torch.compiler.disable if os.environ.get("GPIC_PROF_DEN_COMPILE_MODE") == "reduce-overhead" else (lambda f: f))
     def fetch_pos(self, height, width, device):
         """(cos, sin) of the 2D RoPE angles, [N, Hc/2] float32 each (perf C4: real parts of freqs_cis)."""
         # perf C7: cached on the device. A CPU cache made every forward copy both tables from pageable memory, and a
