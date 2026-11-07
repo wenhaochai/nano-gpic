@@ -529,6 +529,40 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
 - Monitor: NoneRefcount (src/callbacks/none_refcount.py) in every ladder run writes rank 0's count to
   <run>/none_refcount.txt at each launch's first step and every 1000 optimizer steps.
 
+### E with K2 on the packed layout (91b738e; NaN fix f3d78ad), and the bucketing options' gap (owner 2026-11-07)
+- qk_prep_packed writes the packed caption keys and values straight into the image blocks' key layout with the fused
+  norm (no per-block zero buffer and index_copy). Its first version left the caption rows past each caption
+  uninitialised; FA3 masks those keys but loads the last V tile whole, and 0 x NaN is NaN: every EK arm of w1865, w1868,
+  w1869 and w1870 trained to NaN from step 0 (d640, d1024) or 4 (d1280), and the FD arm w1871 too (moved to
+  runs/gpic-speed/muon_bucket_ab_withdrawn). The speed summaries looked only at times. Fix: zero the caption part of k
+  and v; the test now poisons the CUDA cache with NaN and runs FA3 end to end; arm.sh fails an arm whose loss is not
+  finite. Re-timed on 8 GPUs: w1878. FD arm: w1875 (its first checkpoint, step 8352: all 288 tensors finite).
+- The breakdown tool (tools/mfu/gap_breakdown.py) splits a profiled window into GEMM, attention, q/k preparation, norms,
+  index/fill, optimizer, NCCL, memcpy, other, GPU idle, the NCCL straggler wait (a rank's NCCL time minus the smallest),
+  the DataLoader wait and the shared bucket's waits. Inductor's fused_cat kernels compute (the largest is the SwiGLU
+  backward) and count as other. Shared vs per-GPU buckets (valid arms, w1866): the GEMMs carry the padding (d1024 62.4
+  vs 67.4 ms per step), the shared bucket waits on its own all-reduce at d640 (27.1 ms per micro-batch).
+- Equal tokens per GPU for E (lever E's deal, R1 in the step, R2 on the host a step ahead; w1870): no gain (d640 R1
+  77.0, R2 88.5 against 75.5 ms; d1024 R2 121.8 against 120.2), measured on the NaN code, but the deal's cost is host
+  work and does not depend on the values. Dropped.
+
+### F8b. Native FP8 (GPIC_MFU_FP8=native / native2, src/models/layers/fp8_native.py; owner 2026-11-07: 直接做b)
+- Ceiling (w1879, tools/mfu/fp8_gemm_bench.py, one block's GEMMs at M = 128 x 256): FP8 (tensorwise scales) against
+  bf16, forward + dgrad + wgrad: d640 1.33 / 2.11 ms (x1.59), d1024 2.88 / 4.86 (x1.68), d1280 4.13 / 7.50 (x1.82),
+  d1792 8.04 / 14.33 (x1.78). One standalone cast pass costs 0.06-0.09 ms for a C-wide input and 0.32-0.60 ms for the
+  4C-wide SwiGLU product: torchao's per-Linear casts (an amax pass, a cast pass, transposed copies, per GEMM) and our
+  K kernels blocking Inductor's fusion of them explain why lever F8 was slower below d1536.
+- torch 2.7's rowwise-scaled _scaled_mm is slow at our shapes (w1880, forward + dgrad): x0.68 at d640, x0.91 at d1024,
+  x1.01 at d1280, x1.09-1.23 above, against x1.5-1.8 tensorwise. So the scales are tensorwise: an amax pass with an
+  atomic max on the float's bits, then one cast pass (IEEE division: the casts match torch to the bit).
+- Phase 1 (native): the image blocks' qkv_x, proj, w12, w3 forward GEMMs in FP8 (fast accumulation); the SwiGLU product
+  cast by its own kernels (its bf16 output is never stored); the backward in bf16, the weight gradients of qkv_x, proj
+  and w12 from their bf16 inputs. Phase 2 (native2): the MLP as one function with the dgrads of w3 and w12 in FP8 (full
+  fp32 accumulation; the SwiGLU backward gathers dz's amax while it writes bf16 dz). Measured as pairs on the two GPU
+  halves (bf16 or phase 1 on GPUs 0-3, FP8 or phase 2 on 4-7, the same batches): w1888, w1889.
+- Next: the amax as a by-product of the producers (K's outputs, the SwiGLU), or delayed scaling, to fold the cast into
+  one pass; FP8 weight gradients.
+
 ### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
 - Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches
   (13%) make a step wait in about two thirds of the steps (5.9 ms at d640, 6.1 ms at d1280, w1316). A FLOP model of the
