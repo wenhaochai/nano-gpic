@@ -536,7 +536,12 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   w1869 and w1870 trained to NaN from step 0 (d640, d1024) or 4 (d1280), and the FD arm w1871 too (moved to
   runs/gpic-speed/muon_bucket_ab_withdrawn). The speed summaries looked only at times. Fix: zero the caption part of k
   and v; the test now poisons the CUDA cache with NaN and runs FA3 end to end; arm.sh fails an arm whose loss is not
-  finite. Re-timed on 8 GPUs: w1878. FD arm: w1875 (its first checkpoint, step 8352: all 288 tensors finite).
+  finite. FD arm: w1875 (its first checkpoint, step 8352: all 288 tensors finite).
+- Re-timed on 8 GPUs (w1878, finite losses), ms per step: E + K2 76.3, 78.0, 106.2, 134.0, 219.4, 336.2 and (64 x 2)
+  488.6 from d640 to d1792; the shared bucket 76.5, 83.6, 103.9, 128.9, 211.2, 324.0, 476.7 (w1592). So E + K2 runs at
+  per-GPU buckets' speed and 1-4% behind the shared bucket; the packed K2 makes E 4.6% faster at d1024 and 3.5% at d1280.
+  The NaN runs had been 10-15% faster: GEMMs on NaN data draw less power and hold higher clocks. A speed number needs
+  finite values.
 - The breakdown tool (tools/mfu/gap_breakdown.py) splits a profiled window into GEMM, attention, q/k preparation, norms,
   index/fill, optimizer, NCCL, memcpy, other, GPU idle, the NCCL straggler wait (a rank's NCCL time minus the smallest),
   the DataLoader wait and the shared bucket's waits. Inductor's fused_cat kernels compute (the largest is the SwiGLU
