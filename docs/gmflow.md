@@ -530,3 +530,26 @@ owner：「我觉得整张图一个混合不错，是合理的」。原因：逐
     6. M7（以后要改）：`gmflow_b2/jobs/continue_run.sh` 只传 gm_k，不传 gm_scope 和退火参数。gm_scope image 不加参数，所以续训一个整图运行会静默地按逐像素训练。续训 w1402 或这个运行到 2C0 之前，要先让 continue_run.sh 读 scope.txt（以及 spread.txt、lam.txt）。
     7. 运行时要看：r_neff 随 τ 的变化（应该分台阶下降）；mu_spread（应该在 r_neff 下降时上升）；第 15584 步和之后 46752 步精确损失期间的 win_alive 和 w_dead（慢慢减少是 k-means 式的死分量，突然下降是塌缩）；同一步的 gm/nll_exact 和 w1402 比；四个 σ 区间的 s_u。
     8. 如果第 15584 步以后 win_alive 又下降：审查建议的后备是重启死分量（把胜者输出层的行加噪声复制给死分量，像 VQ 码本重置）。它会改变训练动态，所以是一个新的对照臂，要先弹窗。
+
+## 17. GMFlow 上 Full ladder（owner 2026-11-06 21:4x 批准）
+
+队列只剩约 0.5 天时的弹窗：owner 只选了"GMFlow 上 Full ladder"，没有选 K 曲线（K = 2、4）和 K = 1 续训到 2C0。占位图选了"新图，按宽度分 4 栏"。
+
+1. 问题：Lite 上 d640 C0/8 时，8 步的优势（GM-ODE 比点模型低 6.0% 和 9.3%）在不重复的数据（GPIC Full，1.011 亿张唯一图像）和更大的算力上是否还在。
+2. 做法：K = 8 逐像素，方法不变（λ 0.5，每张图一个 s_u）。用点模型 Full ladder 的数据（8000 个分片和全部文本缓存）、分片种子（20261106，所以读同样的排列）、分段（每段从上一个检查点接着训练，预热后学习率不变）和宽度：d640 到 1C0，d768 到 2C0，d896 到 4C0，d1024 到 8C0。
+3. 步数：C0 是满足 S·(1 + r) ≤ 点模型 C0 步数的最大的 800 的倍数（800 是 Full ladder 的分段脚本的要求）。r 同 4.2：头增加的前向 FLOPs / 每张图的前向 FLOPs（`tmp/ladder_prof/gm_full_steps.py` 用同一个 r 复现了 Lite 的 499328、322688、221056、155520 步）。
+   | 宽度 | 点模型 C0 | r | GMFlow C0 | 用掉的预算 |
+   |---|---:|---:|---:|---:|
+   | d640 | 534400 | 0.07008 | 499200 | 99.96% |
+   | d768 | 340000 | 0.05349 | 322400 | 99.90% |
+   | d896 | 230400 | 0.04223 | 220800 | 99.88% |
+   | d1024 | 160800 | 0.03368 | 155200 | 99.77% |
+4. 代码：分支 ladder-full-gmflow = ladder-full@37a77ba 合并 gmflow@986665f。自共同祖先 eb4dd4c 以来两边没有改过同一个文件，所以合并没有冲突。点模型的 ladder_full_run 不动（仍是 5f3c700）：如果把 GMFlow 合并进它，窄宽度后面的段就会换训练代码。新文件：
+   1. `jobs/train_full_gmflow.sh`：一个分段；GMFlow 的配置放在 Full ladder 的数据和 logger 参数前面；运行目录 runs/gpic-speed/full_ladder_gmflow_k8，W&B ladder-full-gmflow-k8-<size>。只接受 d640 到 d1024：d1280 以上，train_ladder.sh 会把运行转到点模型的 MFU worktree，那里没有 GMFlow。
+   2. `tools/submit_full_gmflow.sh`：按分段提交训练和评测，先来后到（prio 0）。
+   3. `tools/test_full_gmflow.py`（CPU，14 种情况）和 `jobs/smoke_full_gmflow.sh`（GPU）。
+   4. 冻结在 gpic-wt/ladder_full_gmflow_run。
+5. 评测：gmflow_run4 的 `evals_gmflow.sh`（点模型 Full ladder 和 Lite GMFlow 用的同一份评测代码）。GM-ODE 8、50、4 次调用和混合均值上的 Euler 50 次；1C0 段在 C0/4、C0/2、C0，之后每段在段末。官方噪声，EMA，CFG = 1，5 万条测试 caption。
+6. 判定：同宽度、同算力和点模型比（点模型用 Full ladder 自己的检查点和同样调用次数下最好的采样器），每种调用次数分开，5%。不做"每个算力取最好的宽度"的比较：GMFlow 只到 d1024，点模型到 d1792，大算力时点模型最好的宽度可能更大。
+7. 成本：训练约 335 GPU-h（每个 C0 的时间取点模型 Full ladder 实测的 1C0 段 × 1.05：d640 4.15 小时，d768 3.31，d896 2.97，d1024 2.65），评测约 100 GPU-h。
+8. 实验页：图 18 "The mixture on GPIC Full"，4 栏，每栏一个宽度，横轴训练算力，纵轴 8 次调用的 FD；点模型（灰）和混合（绿）两条线；50 次调用的结果写在文字里。
