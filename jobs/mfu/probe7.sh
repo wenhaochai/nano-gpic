@@ -2,15 +2,17 @@
 #SBATCH -J gpic-mfu-probe7
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=00:45:00
+#SBATCH --time=01:15:00
 #SBATCH --mem=800G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
 #FETCHABLE
-# MFU lever G0 (docs/mfu.md): Inductor's autotuning of the pointwise and reduction kernels (no GEMM autotuning), on the
-# FA3 step (lever A), GPU-only step time on one GPU each, A / A + max_autotune_pointwise / A + that + coordinate-descent
-# tuning / A again, at four widths; single-GPU tasks from a queue (jobs/mfu/pool.sh). Same math (other block sizes change
-# the order of fp32 reductions only).
+# MFU lever G0 (docs/mfu.md): Inductor's autotuning, on the FA3 step (lever A), GPU-only step time on one GPU each, as
+# plain / tuned / plain on the same GPU: pw = max_autotune_pointwise (block sizes of the element-wise and reduction kernels
+# benchmarked), cd = pw + coordinate-descent tuning, ma = max_autotune (also the GEMMs: cuBLAS or Triton templates, with
+# epilogues fused into them) + coordinate descent, at d1280 and d1024 only. Single-GPU tasks from a queue
+# (jobs/mfu/pool.sh), longest first. pw and cd: same math (other block sizes change the order of fp32 sums only); ma also
+# changes the GEMM kernels' accumulation order, and an epilogue may round once where eager rounds twice.
 # usage: probe7.sh <code worktree>
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
@@ -28,13 +30,13 @@ SB="timeout 1500 python $WT/tools/mfu/step_bench.py"
 {
   # one task per width and variant: plain / variant / plain on the same GPU (A/B/A); separate Inductor caches, so an
   # autotuned kernel is never served to the plain arm or the reverse
-  for d in 1792 1280 1024 640; do
-    for v in pw cd; do
+  for dv in 1792:pw 1792:cd 1280:ma 1024:ma 1280:pw 1280:cd 1024:pw 1024:cd 640:pw 640:cd; do
+    d=${dv%:*} v=${dv#*:}
       C=$WC/cache/inductor/mfu_g0_d${d}_$v
       venv="TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1"
       [ $v = cd ] && venv="$venv TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1"
+      [ $v = ma ] && venv="TORCHINDUCTOR_MAX_AUTOTUNE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1"
       echo "TORCHINDUCTOR_CACHE_DIR=${C}_plain $SB --d $d --steps 80 --out $OUT/d${d}_${v}_a1.json > $OUT/d${d}_${v}_a1.log 2>&1; TORCHINDUCTOR_CACHE_DIR=${C}_tuned $venv $SB --d $d --steps 80 --out $OUT/d${d}_${v}.json > $OUT/d${d}_${v}.log 2>&1; TORCHINDUCTOR_CACHE_DIR=${C}_plain $SB --d $d --steps 80 --out $OUT/d${d}_${v}_a2.json > $OUT/d${d}_${v}_a2.log 2>&1"
-    done
   done
 } > $OUT/tasks.txt
 pool $OUT/tasks.txt $OUT

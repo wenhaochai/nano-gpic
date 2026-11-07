@@ -172,6 +172,20 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
 - Expectation: B pays at d1024 (24% of the full ladder's GPU-h) and maybe d896.
 - Result: pending (GPU, prio 0).
 
+### G0. Inductor's autotuning of the element-wise and reduction kernels (Inductor flags; jobs/mfu/probe7.sh)
+- Hypothesis: the element-wise and reduction kernels (RMSNorm with the residual add, modulation, gates, SwiGLU, RoPE, and
+  in the backward the sums over tokens for the modulation gradients) take about as much GPU time as the GEMMs at d640 and
+  0.8x at d1280 (w1315, w1382), more than their bytes need at 3 TB/s. Inductor picks their block sizes by heuristics,
+  without measuring them.
+- Setup: no code change. pw = TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1 (block sizes measured at compile time); cd = pw +
+  TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1; ma = TORCHINDUCTOR_MAX_AUTOTUNE=1 (the GEMMs too: cuBLAS or Triton templates,
+  epilogues fused into them) + coordinate descent. One GPU per task (step_bench, FA3), plain / tuned / plain on the same
+  GPU, separate Inductor caches.
+- Same math: pw and cd change block sizes, so the order of the fp32 sums in a reduction. ma also changes the GEMM
+  kernels, and a fused epilogue can round once where the unfused graph rounds twice.
+- Expectation: 5-15% off the element-wise time, 2-5% of the step.
+- Result: pending.
+
 ### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
 - Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches
   (13%) make a step wait in about two thirds of the steps (5.9 ms at d640, 6.1 ms at d1280, w1316). A FLOP model of the
