@@ -283,7 +283,8 @@ W_ST = L_HIST + 2     # history, this step's amax, the history's max
 
 
 class _DSState:
-    st = None
+    st = None      # [sites, W_ST] fp32
+    sti = None     # the same memory as int32 (the atomic max on the floats' bits)
     sites = 0
 
 
@@ -291,9 +292,11 @@ DS = _DSState()
 
 
 def ds_state(device):
-    if DS.st is None or DS.st.device != torch.device(device):
+    """(st, sti) on device, made at the first cast (opaque ops run outside the compiled graph, so this is plain Python)."""
+    if DS.st is None or DS.st.device != device:
         DS.st = torch.zeros(max(DS.sites, 1), W_ST, dtype=torch.float32, device=device)
-    return DS.st
+        DS.sti = DS.st.view(torch.int32)
+    return DS.st, DS.sti
 
 
 def ds_reset():
@@ -458,14 +461,13 @@ def _(w):
 @torch.library.custom_op("gpic::fp8_dcast", mutates_args=())
 def dcast(x: torch.Tensor, site: int, roll: bool) -> tuple[torch.Tensor, torch.Tensor]:
     """x -> e4m3 (x's shape) and the dequantization scale [1], with site's delayed scale (its own amax without history)."""
-    st = ds_state(x.device)
-    sti = st.view(torch.int32)
+    st, sti = ds_state(x.device)
     if roll:
         _ds_roll_kernel[(st.shape[0],)](st, sti, L=L_HIST, W=W_ST, num_warps=1)
     xc = x.contiguous()
     n = xc.numel()
     q = torch.empty(x.shape, dtype=E4, device=x.device)
-    s = torch.zeros(1, dtype=torch.float32, device=x.device)
+    s = torch.empty(1, dtype=torch.float32, device=x.device)
     if n:
         g = (triton.cdiv(n, BLOCK),)
         _ds_amax_kernel[g](xc, n, st, sti, site, L=L_HIST, W=W_ST, BLOCK=BLOCK, num_warps=8)
@@ -481,13 +483,12 @@ def _(x, site, roll):
 @torch.library.custom_op("gpic::fp8_swiglu_dcast", mutates_args=())
 def swiglu_dcast(z: torch.Tensor, site: int) -> tuple[torch.Tensor, torch.Tensor]:
     """z [M, 2H] bf16 -> silu(z1) * z2 as e4m3 [M, H] and its dequantization scale [1], with site's delayed scale."""
-    st = ds_state(z.device)
-    sti = st.view(torch.int32)
+    st, sti = ds_state(z.device)
     M, H2 = z.shape
     H = H2 // 2
     zc = z if z.stride(-1) == 1 else z.contiguous()
     q = torch.empty(M, H, dtype=E4, device=z.device)
-    s = torch.zeros(1, dtype=torch.float32, device=z.device)
+    s = torch.empty(1, dtype=torch.float32, device=z.device)
     if M:
         BH = _bh(H)
         grid = (M, triton.cdiv(H, BH))
@@ -506,14 +507,13 @@ def _(z, site):
 @torch.library.custom_op("gpic::fp8_swiglu_bwd_ds", mutates_args=())
 def swiglu_bwd_ds(z: torch.Tensor, da: torch.Tensor, site: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """z [M, 2H], da [M, H] bf16 -> dz [M, 2H] bf16, dz as e4m3 and its dequantization scale [1], with site's delayed scale."""
-    st = ds_state(z.device)
-    sti = st.view(torch.int32)
+    st, sti = ds_state(z.device)
     M, H2 = z.shape
     H = H2 // 2
     zc, dac = z.contiguous(), da.contiguous()
     dz = torch.empty(M, H2, dtype=torch.bfloat16, device=z.device)
     dq = torch.empty(M, H2, dtype=E4, device=z.device)
-    s = torch.zeros(1, dtype=torch.float32, device=z.device)
+    s = torch.empty(1, dtype=torch.float32, device=z.device)
     if M:
         BH = _bh(H)
         _swiglu_bwd_ds_kernel[(M, triton.cdiv(H, BH))](zc, dac, dz, dq, H, zc.stride(0), dac.stride(0), dz.stride(0),
@@ -729,8 +729,7 @@ def _fmt(grad):
 def dcast_t(x: torch.Tensor, site: int, roll: bool, grad: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """x [M, K] -> FP8 [M, K], FP8 [K, M] (its transpose) and the dequantization scale [1], with site's delayed scale;
     grad: a gradient (e5m2 under GPIC_MFU_FP8_GRAD=e5m2)."""
-    st = ds_state(x.device)
-    sti = st.view(torch.int32)
+    st, sti = ds_state(x.device)
     if roll:
         _ds_roll_kernel[(st.shape[0],)](st, sti, L=L_HIST, W=W_ST, num_warps=1)
     dt, fmax, e5 = _fmt(grad)
@@ -738,7 +737,7 @@ def dcast_t(x: torch.Tensor, site: int, roll: bool, grad: bool) -> tuple[torch.T
     M, K = xc.shape
     q = torch.empty(M, K, dtype=dt, device=x.device)
     qt = torch.empty(K, M, dtype=dt, device=x.device)
-    s = torch.zeros(1, dtype=torch.float32, device=x.device)
+    s = torch.empty(1, dtype=torch.float32, device=x.device)
     if xc.numel():
         _ds_amax_kernel[(triton.cdiv(xc.numel(), BLOCK),)](xc, xc.numel(), st, sti, site, L=L_HIST, W=W_ST, BLOCK=BLOCK,
                                                           num_warps=8)
@@ -757,14 +756,13 @@ def _(x, site, roll, grad):
 @torch.library.custom_op("gpic::fp8_swiglu_dcast_t", mutates_args=())
 def swiglu_dcast_t(z: torch.Tensor, site: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """z [M, 2H] bf16 -> silu(z1) * z2 as e4m3 [M, H] and [H, M] (its transpose) and the dequantization scale [1]."""
-    st = ds_state(z.device)
-    sti = st.view(torch.int32)
+    st, sti = ds_state(z.device)
     M, H2 = z.shape
     H = H2 // 2
     zc = z if z.stride(-1) == 1 else z.contiguous()
     q = torch.empty(M, H, dtype=E4, device=z.device)
     qt = torch.empty(H, M, dtype=E4, device=z.device)
-    s = torch.zeros(1, dtype=torch.float32, device=z.device)
+    s = torch.empty(1, dtype=torch.float32, device=z.device)
     if M:
         BH = _bh(H)
         _swiglu_ds_amax_kernel[(M, triton.cdiv(H, BH))](zc, H, zc.stride(0), st, sti, site, L=L_HIST, W=W_ST, BH=BH,
@@ -783,15 +781,14 @@ def _(z, site):
 @torch.library.custom_op("gpic::fp8_swiglu_bwd_dt", mutates_args=())
 def swiglu_bwd_dt(z: torch.Tensor, da: torch.Tensor, site: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """z [M, 2H], da [M, H] bf16 -> dz as FP8 [M, 2H] and [2H, M] (its transpose) and the dequantization scale [1]; no bf16 dz."""
-    st = ds_state(z.device)
-    sti = st.view(torch.int32)
+    st, sti = ds_state(z.device)
     dt, fmax, e5 = _fmt(True)
     M, H2 = z.shape
     H = H2 // 2
     zc, dac = z.contiguous(), da.contiguous()
     dq = torch.empty(M, H2, dtype=dt, device=z.device)
     dqt = torch.empty(H2, M, dtype=dt, device=z.device)
-    s = torch.zeros(1, dtype=torch.float32, device=z.device)
+    s = torch.empty(1, dtype=torch.float32, device=z.device)
     if M:
         g = (triton.cdiv(M, 64), triton.cdiv(H, 64))
         _swiglu_bwd_ds_amax_kernel[g](zc, dac, M, H, zc.stride(0), dac.stride(0), st, sti, site, L=L_HIST, W=W_ST, BM=64,
