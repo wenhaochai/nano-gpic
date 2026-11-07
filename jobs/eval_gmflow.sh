@@ -16,6 +16,7 @@
 # Output: <run>/eval_<step>_<sampler>_calls<calls>[_n<substeps>][_official]/metrics.json (eval_dir below). It never overwrites a finished result; a directory without metrics.json is moved aside.
 # Env: LADDER_RUN_ROOT (run root); EVAL_SIZE, EVAL_D, EVAL_NB, EVAL_NT (run directory exp_ladder_<size>, width and blocks; default d640, 640, 9, 2; jobs/evals_gmflow.sh sets them);
 # EVAL_SPREAD (image | pixel, default image: gm_spread of the model; the checkpoint must hold the per-pixel offset head if and only if it is pixel);
+# EVAL_DEVICES (default 8): the GPUs one evaluation uses, for prediction and for the FD (jobs/evals_gmflow.sh --par runs one evaluation per GPU).
 # EVAL_LIMIT_BATCHES (smoke test only: predict only that many batches per rank, keep the samples, skip the FD).
 # EVAL_NOISE (official | prompt, default official; owner 2026-11-06: the official evaluation setup, except that CFG stays 1): official is the official noise, one
 # noise tensor for all prompts (gpic_jsonl_dataset noise_per_prompt false), and adds _official to the output directory; prompt is each prompt's own noise, the
@@ -110,7 +111,7 @@ echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K spread=$SPREAD sampler=$
 SPREAD_ARGS=(); [ $SPREAD = image ] || SPREAD_ARGS=(--model.denoiser.init_args.gm_spread $SPREAD)   # image: the command line of before this option
 LIMIT=(); [ -z "${EVAL_LIMIT_BATCHES:-}" ] || LIMIT=(--trainer.limit_predict_batches $EVAL_LIMIT_BATCHES)
 t0=$(date +%s)
-WANDB_MODE=disabled python main.py predict --config configs_h100/lite_ladder_sample.yaml "${SARGS[@]}" --trainer.devices 8 \
+WANDB_MODE=disabled python main.py predict --config configs_h100/lite_ladder_sample.yaml "${SARGS[@]}" --trainer.devices ${EVAL_DEVICES:-8} \
   --trainer.default_root_dir "$OUT/pred" --ckpt_path "$CKPT" --model.diffusion_sampler.init_args.num_steps $CALLS \
   --model.denoiser.init_args.hidden_size $WD --model.denoiser.init_args.num_groups $((WD / 64)) \
   --model.denoiser.init_args.num_blocks $NB --model.denoiser.init_args.num_text_blocks $NT --model.denoiser.init_args.gm_k $K "${SPREAD_ARGS[@]}" \
@@ -129,7 +130,7 @@ PY
   echo "{\"predict_s\": $((t1-t0))}" | tee $OUT/phase_times.json
   exit 0
 fi
-python -m torch.distributed.run --standalone --nproc_per_node 8 $WT/tools/fast_eval.py "$NPZ" \
+python -m torch.distributed.run --standalone --nproc_per_node ${EVAL_DEVICES:-8} $WT/tools/fast_eval.py "$NPZ" \
   $WC/data/gpic/reference_stats/test_stats.npz $OUT/metrics.json --workers 11 > $OUT/eval.log 2>&1
 t2=$(date +%s)
 echo "{\"predict_s\": $((t1-t0)), \"eval_s\": $((t2-t1))}" | tee $OUT/phase_times.json

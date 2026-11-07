@@ -11,7 +11,8 @@
 # official noise (--noise below), EMA, no CFG. Finished tasks are skipped, so a rerun does only the rest.
 # K = 0 evaluates a point model. --link <run dir> links that run's ms checkpoints into <root>/exp_ladder_<size>, so nothing is written in its directory (the ladder's
 # own evaluations, official noise and Euler at 50 steps, have no other call counts, so the ladder's checkpoints are evaluated again here).
-# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] <step:sampler:calls[:substeps]> ...
+# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--par] <step:sampler:calls[:substeps]> ...
+# --par: one evaluation per GPU, 8 side by side (EVAL_DEVICES=1), for short evaluations whose sampling is a small part of the time.
 # --noise: official (the default since 2026-11-06, owner: the official evaluation setup except CFG = 1; one noise for all prompts, directories end in _official) or
 # prompt (each prompt's own noise, the protocol of every result before; the old directory names); eval_gmflow.sh EVAL_NOISE.
 # --spread pixel: the run has the per-pixel spread (docs/gmflow.md section 7; eval_gmflow.sh EVAL_SPREAD); default image.
@@ -33,6 +34,8 @@ if [ "$1" = "--table" ]; then TABLE=$2; shift 2; [ -f "$TABLE" ] || { echo "no t
 NOISE=official
 if [ "$1" = "--noise" ]; then NOISE=$2; shift 2; case $NOISE in official|prompt) ;; *) echo "--noise must be official or prompt"; exit 2 ;; esac; fi
 NTAG=""; [ $NOISE = prompt ] || NTAG=official
+PAR=0
+if [ "$1" = "--par" ]; then PAR=1; shift; fi
 [ $# -ge 1 ] || { echo "no tasks"; exit 2; }
 WT=$WC/project/gpic-wt/$WTN
 [ -f "$WT/baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py" ] || { echo "$WT holds old code"; exit 2; }
@@ -55,15 +58,34 @@ for t in "$@"; do
 done
 [ -f $ROOT/commit.txt ] || echo $SHA > $ROOT/commit.txt
 export GMFLOW_WT=$WT LADDER_RUN_ROOT=$ROOT EVAL_SIZE=$SIZE EVAL_D=$WD EVAL_NB=$NB EVAL_NT=$NT EVAL_SPREAD=$SPREAD EVAL_NOISE=$NOISE
-fail=0
-for t in "$@"; do
+run_task() {   # <task>: one evaluation, skipped if it has its metrics.json; returns its exit status
+  local t=$1 STEP rest S C N D LOG
   STEP=${t%%:*} rest=${t#*:}; S=${rest%%:*} C=${rest#*:}
   N=""; case $C in *:*) N=${C#*:}; C=${C%%:*} ;; esac   # step:sampler:calls:substeps
   D=$(eval_dir $(printf %06d $STEP) $S $C "$N" "$TABLE" "$NTAG")
-  if [ -f $RUN/$D/metrics.json ]; then echo "eval $t done before"; continue; fi
-  [ "$(git -C $WT rev-parse HEAD)" = "$SHA" ] || { echo "$WT moved from $SHA"; exit 2; }
+  if [ -f $RUN/$D/metrics.json ]; then echo "eval $t done before"; return 0; fi
+  [ "$(git -C $WT rev-parse HEAD)" = "$SHA" ] || { echo "$WT moved from $SHA"; return 2; }
   LOG=eval_${STEP}_${S}_$C${N:+_n$N}${NTAG:+_$NTAG}; [ $S != gm_ode_cal ] || LOG=eval_${STEP}_${D#eval_*_}   # the old log names (+ _official); a table's hash for gm_ode_cal
-  EVAL_SUBSTEPS=$N bash $WT/jobs/eval_gmflow.sh $K $STEP $S $C > $ROOT/$LOG.log 2>&1 || fail=1
-  echo "eval $t fail=$fail"
-done
-exit $fail
+  EVAL_SUBSTEPS=$N bash $WT/jobs/eval_gmflow.sh $K $STEP $S $C > $ROOT/$LOG.log 2>&1
+}
+fail=0
+if [ $PAR = 0 ]; then
+  for t in "$@"; do run_task $t || fail=1; echo "eval $t fail=$fail"; done
+  exit $fail
+fi
+# --par: one evaluation per GPU, 8 side by side; each worker takes the next task from a shared counter (flock), so no GPU idles
+# while tasks remain. Each evaluation predicts and scores on its own GPU (EVAL_DEVICES=1).
+TASKS=("$@"); CNT=$TMPDIR/evals_counter; FAILS=$TMPDIR/evals_failed; echo 0 > $CNT; : > $FAILS
+worker() {
+  local g=$1 i
+  while :; do
+    i=$(flock $CNT.lock bash -c 'n=$(cat '"$CNT"'); echo $((n + 1)) > '"$CNT"'; echo $n')
+    [ $i -lt ${#TASKS[@]} ] || return 0
+    if CUDA_VISIBLE_DEVICES=$g EVAL_DEVICES=1 run_task ${TASKS[$i]}; then echo "eval ${TASKS[$i]} on GPU $g ok"
+    else echo "eval ${TASKS[$i]} on GPU $g FAILED"; echo ${TASKS[$i]} >> $FAILS; fi
+  done
+}
+for g in 0 1 2 3 4 5 6 7; do worker $g & done
+wait
+[ ! -s $FAILS ] || { echo "failed: $(tr '\n' ' ' < $FAILS)"; exit 1; }
+exit 0
