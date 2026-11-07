@@ -89,6 +89,30 @@ def flatten_unit(unit, keep, names, trainable_only=True):
     return kmap
 
 
+# ---- MFU lever X (GPIC_MFU_CUDAGRAPH=1): the compiled blocks replayed as CUDA graphs ----
+# At d896-d1280 the forward is bound by the host's launches (py-spy, d1280: the main thread is busy for the whole forward
+# while the backward, launched from the autograd thread, keeps the GPU busy). Inductor's CUDA graphs (mode
+# "reduce-overhead") replay each block's kernels with one launch: the same kernels in the same order, the same values. A
+# graph keeps its parameters' addresses, so FSDP2 must keep each unit's unsharded storage between steps (it frees it
+# after the backward and allocates it again before the next forward, at whatever address the allocator gives); the
+# all-gather still writes the new values into it every step. Costs one bf16 copy of the parameters per GPU (0.75 GB at
+# d1024, 1.7 GB at d1792). A new caption length T records a new graph once.
+def _keep_unsharded_storage():
+    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+    orig = FSDPParam.free_unsharded_param
+    if getattr(orig, "_gpic_keep", False):
+        return
+
+    def free_unsharded_param(self):
+        from torch.distributed.fsdp._fully_shard._fsdp_param import compiled_autograd_enabled
+        if compiled_autograd_enabled():
+            return orig(self)
+        # keep the storage: the next all-gather copies the new values into the same addresses
+
+    free_unsharded_param._gpic_keep = True
+    FSDPParam.free_unsharded_param = free_unsharded_param
+
+
 def shard(net, mesh, compute_bf16, compile_blocks, group=None, names=None, trainable_only=True):
     """fully_shard the text and main blocks, then the root. Returns the replicated (ignored) parameters.
     group (GPIC_MFU_FSDP_GROUP, default 1): consecutive blocks per FSDP2 unit (a list of modules is one unit: one
@@ -114,8 +138,11 @@ def shard(net, mesh, compute_bf16, compile_blocks, group=None, names=None, train
             fully_shard(unit if len(unit) > 1 else unit[0], mesh=mesh, mp_policy=mp, reshard_after_forward=False,
                         ignored_params=own)
     if compile_blocks:
+        graphs = os.environ.get("GPIC_MFU_CUDAGRAPH") == "1"
+        if graphs:
+            _keep_unsharded_storage()
         for blk in list(net.text_refine_blocks) + list(net.blocks):
-            blk.compile()
+            blk.compile(**({"mode": "reduce-overhead"} if graphs else {}))
     fully_shard(net, mesh=mesh, mp_policy=mp, reshard_after_forward=False, ignored_params=keep)
     net.__dict__["_b3_kmap"] = kmap
     return [p for p in net.parameters() if p in keep]
