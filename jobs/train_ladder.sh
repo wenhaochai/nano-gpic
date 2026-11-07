@@ -74,7 +74,7 @@ cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
 export GPIC_SHARD_SEED GPIC_SHARD_LOG_DIR=$RUN   # one shard order per run and pass, shared by all ranks (above)
 export GPIC_REGION_CROP=${GPIC_REGION_CROP:-1}   # the crop resizes only the region it keeps: d640 29.5 -> 26.7 ms (w1117); the same random draws; 0.035% of the channel values differ, by at most 2 of 255
-export TORCHINDUCTOR_CPP_WRAPPER=1   # kernels launched from C++: d640 39.3 -> 32.6 ms; the same math up to bf16 rounding (tools/test_cpp_launcher.py)
+export TORCHINDUCTOR_CPP_WRAPPER=${PROBE_CPP_WRAPPER:-1}   # kernels launched from C++: d640 39.3 -> 32.6 ms; the same math up to bf16 rounding (tools/test_cpp_launcher.py)
 # MFU levers (docs/mfu.md, branch mfu): the same math, each behind its own switch, on by default; set one to 0 (A: sdpa) to
 # turn it off (E is off by default). A: FlashAttention-3 for the masked attention of the image blocks. B: FSDP2 per block in place of DDP
 # (bf16 compute parameters, fp32 reduce-scatter, sharded AdamW and EMA; ModelParallelStrategy below). C: the region crop's
