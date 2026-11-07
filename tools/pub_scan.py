@@ -16,7 +16,7 @@ RULES = {
     "password_assign": re.compile(r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)\b\s*[=:]\s*['\"]?([^\s'\"]{8,})"),
     "bearer": re.compile(r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._-]{20,}"),
     "email": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
-    "cluster_ids": re.compile(r"USER|GROUP|group|USER"),
+    "cluster_ids": re.compile(r"USER|GROUP|group|USER|[Dd]ella|H100"),   # the cluster's name too (owner 2026-11-07: 公开仓库不要提及h100)
 }
 objs = subprocess.run(["git", "-C", repo, "rev-list", "--objects", sys.argv[2] if len(sys.argv) > 2 else "--all"], capture_output=True, text=True).stdout.splitlines()
 blobs = {}
