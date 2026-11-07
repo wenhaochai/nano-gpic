@@ -606,10 +606,16 @@ class GPICWebDataset(IterableDataset):
         """New ladders (src/data/shared_bucket_loader.py): one queue per caption-length bucket (the text only: the image
         is decoded after this stage); a queue that reaches group_batch samples leaves as one batch, every sample
         tagged with its bucket's edge, which the collate pads to. A worker holds fewer than group_batch samples per
-        bucket and drops nothing; SharedBucketLoader picks, on every rank alike, which bucket's batch trains next."""
+        bucket and drops nothing; SharedBucketLoader picks, on every rank alike, which bucket's batch trains next.
+        The queues live on the worker's copy of the dataset, so a data pass (one epoch of the persistent workers) hands
+        its unfinished batches to the next pass: dropped at every pass end, they cost the rare buckets most (an s8
+        worker's pass holds about 164 samples of bucket 320, of which about 64 waited in its queue). Only a new process
+        (a resume) starts with empty queues."""
         import bisect
         edges, B = self.bucket_edges, self.group_batch
-        queues = [[] for _ in edges]
+        queues = self.__dict__.get("_shared_queues")
+        if queues is None or len(queues) != len(edges):
+            queues = self._shared_queues = [[] for _ in edges]
         for s in src:
             L = s["text_len"]
             P = min(-(-L // self.pad_multiple) * self.pad_multiple, self.text_max_length)
