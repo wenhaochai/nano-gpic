@@ -402,8 +402,16 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   queues are random walks against the draws and grow without bound (the CPU test dropped thousands of samples).
 - CPU test (tools/mfu/tests/test_shared_bucket.py: 4 ranks x 8 workers, threads, the all-reduce as a barrier): the same
   bucket on every rank in all 3000 micro-batches, every sample in its bucket, shares within 7% of the data, pools at
-  most 37 batches, nothing dropped or repeated. GPU check: w1576 (step time with and without at d640, d1280, d1792;
-  every rank's T compared micro-batch by micro-batch, also after a resume).
+  most 37 batches, nothing dropped or repeated.
+- GPU check (w1576 on 59a13d8, w1591 on 060e69c, w1592; DDP, Muon, A C D K K2, 8 GPUs): with S every rank had the same
+  T in every micro-batch (d640 and d1280 at 32 x 4: 2048 of 2048; d640 and d1024 at 128 x 1: 512 of 512), also after a
+  stop and resume (d640 at 32 x 4: 512 of 512 after a stop at 128; at 128 x 1: 1024 of 1024 after a stop at 2048);
+  without S 1287 of 2048.
+- Speed at 32 x 4 (mean optimizer step, second half of 512): d640 92.5 ms without S, 106.3 with (+15%); d1280 247.0
+  and 246.0 (0%). S lowers the slowest rank's GPU time per micro-batch (d640 26.0 -> 23.1 ms, d1280 62.2 -> 61.9) and
+  raises the data wait (d640 1.7 -> 7.6 ms, d1280 2.1 -> 5.4): its all-reduce is a barrier for every host in every
+  micro-batch, while DDP's no_sync lets the ranks run 3 of 4 micro-batches apart, so their imbalance averages over the
+  4 micro-batches before they wait. At 128 x 1 every step syncs anyway; the control without S is w1596.
 
 ### Muon (src/optim/muon.py, src/optim/muon_fsdp.py; owner 2026-11-07 00:5x, recipe from the popup at 01:0x)
 - The question-5 reference (branch muon a403ed1: MuonAdamW for the blocks' matrices, AdamW for the rest; under DDP one
@@ -431,6 +439,22 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
 - A d1024 micro-batch under DDP with accumulation costs 39.7 ms (w1484, A C D, no K), about FSDP2 + K + K2's 40.2 at
   batch 256. Measurements per width: w1574 (d1280-d1792: DDP + K + K2 against FSDP2 + K + K2 with and without N),
   w1530 (d640-d1024).
+
+### The none_dealloc crash (w1204 after 139 min, w1239; genmodel 2026-11-07): fixed in fdea752
+- "Fatal Python error: none_dealloc" aborts Python 3.11 when None's refcount reaches zero (None is immortal only from
+  3.12). torch 2.7.1's C++ launcher (TORCHINDUCTOR_CPP_WRAPPER=1) builds each compiled call's output list in
+  pack_tensor_handle_list (torch/_inductor/codecache.py, CppWrapperCodeCache.extra_parse_arg) and stores Py_None for
+  each null output with PyList_SET_ITEM, which steals a reference that was never taken: when the list dies, None loses
+  one reference per None output (a backward graph returns None for every input without a gradient).
+- Fix: src/utils/patch_bugs.py, imported first by main.py, rewrites the template to Py_NewRef(Py_None). Each cached
+  wrapper module calls CppWrapperCodeCache.load_pybinding when it loads, which joins the template then, so FX graph
+  cache hits get the fix too: every wrapper compiles once more under a new hash, and nothing else changes.
+- Test (tools/mfu/tests/test_none_refcount.py, CPU): 1000 compiled forward + backward calls with one None output each;
+  the unpatched launcher loses exactly 1000 references to None that the patched one keeps. torch's compiled path also
+  takes about 4 references to None per call that it never releases, with the C++ or the Python launcher (eager 0; no
+  gc-tracked object grows): harmless, and the reason a graph crashes only once its None outputs per call outnumber 4.
+- Monitor: NoneRefcount (src/callbacks/none_refcount.py) in every ladder run writes rank 0's count to
+  <run>/none_refcount.txt at each launch's first step and every 1000 optimizer steps.
 
 ### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
 - Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches

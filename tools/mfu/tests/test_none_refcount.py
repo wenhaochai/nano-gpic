@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """None's refcount under Inductor's C++ wrapper (src/utils/patch_bugs.py, the Py_None fix): a compiled function whose
 backward returns None for an input without a gradient, 1000 forward + backward calls, sys.getrefcount(None) before and
-after, in one fresh process without the fix and one with it. Other caches keep adding None references in both (about 3
-per call here), so the check is the difference: without the fix the count falls one short per call and per None output
-(here one), the leak that crashed w1204 / w1239 once it reached zero; with the fix that difference is gone.
+after, in one fresh process without the fix and one with it. torch's compiled path takes about 4 references to None per
+call that it never releases, with either launcher (eager: 0; no gc-tracked object grows, so it is a count, not memory),
+so the check is the difference: without the fix the count falls one short per call and per None output (here one), the
+leak that crashed w1204 / w1239 once the None outputs per call outnumbered those 4; with the fix that difference is gone.
 usage: python test_none_refcount.py   (CPU is enough: the wrapper template is the same)"""
 import os, subprocess, sys
 SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "baselines", "PixelGen"))
