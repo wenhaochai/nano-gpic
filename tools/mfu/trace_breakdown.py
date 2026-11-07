@@ -12,8 +12,8 @@ import argparse, bisect, collections, json, re
 
 CATS = [
     ("nccl", r"nccl"),
-    ("attn_fwd", r"flash_fwd|fmha.*fwd|attention.*fwd|cutlass.*Fmha.*Fwd|fmha_cutlassF|_efficient_attention_forward|cudnn.*fprop|flex_attention(?!_backward)|triton_tem_fused_flex_attention(?!_backward)|sdpa.*fwd|fwd_kernel"),
-    ("attn_bwd", r"flash_bwd|fmha.*bwd|attention.*bwd|cutlass.*Fmha.*Bwd|fmha_cutlassB|_efficient_attention_backward|cudnn.*dgrad|flex_attention_backward|sdpa.*bwd|bwd_kernel|convert_dq"),
+    ("attn_fwd", r"FlashAttnFwd|flash_fwd|fmha.*fwd|attention.*fwd|cutlass.*Fmha.*Fwd|fmha_cutlassF|_efficient_attention_forward|cudnn.*fprop|flex_attention(?!_backward)|triton_tem_fused_flex_attention(?!_backward)|sdpa.*fwd|fwd_kernel"),
+    ("attn_bwd", r"FlashAttnBwd|flash_bwd|fmha.*bwd|attention.*bwd|cutlass.*Fmha.*Bwd|fmha_cutlassB|_efficient_attention_backward|cudnn.*dgrad|flex_attention_backward|sdpa.*bwd|bwd_kernel|convert_dq"),
     ("gemm", r"nvjet|gemm|sm90_xmma|cutlass|ampere_.*gemm|sm80_xmma|cublas|triton_tem_fused_(?!flex)|_mm_|splitK"),
     ("optim", r"multi_tensor_apply|fused_adam|foreach|_amp_|lerp"),
     ("triton_red", r"triton_red|triton_per"),
@@ -56,8 +56,12 @@ def main():
     ann = [e for e in ev if e.get("cat") == "gpu_user_annotation" and "dur" in e]
     steps = sorted([e for e in ann if e["name"].startswith("ProfilerStep#")], key=lambda e: e["ts"])
     stages = sorted([e for e in ann if e["name"].startswith("stage:")], key=lambda e: e["ts"])
-    if steps:
-        win = [(e["ts"], e["ts"] + e["dur"]) for e in steps]
+    if steps:   # one annotation per stream that ran kernels in the step (the EMA's side stream too): merge them by name
+        sw = {}
+        for e in steps:
+            s0, e0 = sw.get(e["name"], (e["ts"], e["ts"] + e["dur"]))
+            sw[e["name"]] = (min(s0, e["ts"]), max(e0, e["ts"] + e["dur"]))
+        win = sorted(sw.values())
     else:
         t0, t1 = min(e["ts"] for e in gpu), max(e["ts"] + e["dur"] for e in gpu)
         win = [(t0, t1)]
@@ -83,7 +87,7 @@ def main():
         c = cat_of(e["name"])
         by_cat[c] += d
         by_cat_stage[stage_of(s)][c] += d
-        k = re.sub(r"\(.*", "", e["name"])[:90]
+        k = re.sub(r"\(.*", "", e["name"].replace("(anonymous namespace)::", ""))[:110]
         by_name[k][0] += 1
         by_name[k][1] += d
         if c != "nccl":

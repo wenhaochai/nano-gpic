@@ -12,7 +12,8 @@
 # benchmarked), cd = pw + coordinate-descent tuning, ma = max_autotune (also the GEMMs: cuBLAS or Triton templates, with
 # epilogues fused into them) + coordinate descent, at d1280 and d1024 only. Single-GPU tasks from a queue
 # (jobs/mfu/pool.sh), longest first. pw and cd: same math (other block sizes change the order of fp32 sums only); ma also
-# changes the GEMM kernels' accumulation order, and an epilogue may round once where eager rounds twice.
+# changes the GEMM kernels' accumulation order, and an epilogue may round once where eager rounds twice. Then the
+# diagnostics of the plain step at d1280, d1024, d640: every Triton kernel's time, bytes and GB/s, and profiler traces.
 # usage: probe7.sh <code worktree>
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
@@ -38,7 +39,16 @@ SB="timeout 1500 python $WT/tools/mfu/step_bench.py"
       [ $v = ma ] && venv="TORCHINDUCTOR_MAX_AUTOTUNE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1"
       echo "TORCHINDUCTOR_CACHE_DIR=${C}_plain $SB --d $d --steps 80 --out $OUT/d${d}_${v}_a1.json > $OUT/d${d}_${v}_a1.log 2>&1; TORCHINDUCTOR_CACHE_DIR=${C}_tuned $venv $SB --d $d --steps 80 --out $OUT/d${d}_${v}.json > $OUT/d${d}_${v}.log 2>&1; TORCHINDUCTOR_CACHE_DIR=${C}_plain $SB --d $d --steps 80 --out $OUT/d${d}_${v}_a2.json > $OUT/d${d}_${v}_a2.log 2>&1"
   done
+  # diagnostics on the plain step: each Triton kernel's time, bytes and GB/s (Inductor's profile_bandwidth, Python
+  # wrapper, so its own cache), and a torch.profiler trace with the production C++ wrapper
+  for d in 1280 1024 640; do
+    echo "TORCHINDUCTOR_CACHE_DIR=$WC/cache/inductor/mfu_g0_bw_d$d TORCHINDUCTOR_CPP_WRAPPER=0 TORCHINDUCTOR_PROFILE=1 TORCHINDUCTOR_PROFILE_OUTPUT=$OUT/bw_d$d.txt $SB --d $d --steps 3 --warm 2 --out $OUT/bw_d$d.json > $OUT/bw_d$d.log 2>&1"
+  done
+  for d in 1280 1024; do
+    echo "TORCHINDUCTOR_CACHE_DIR=$WC/cache/inductor/mfu_g0_d${d}_pw_plain $SB --d $d --steps 40 --profile 30:33 --out $OUT/prof_d$d.json > $OUT/prof_d$d.log 2>&1"
+  done
 } > $OUT/tasks.txt
 pool $OUT/tasks.txt $OUT
 grep -h "MFU" $OUT/*.log
+for d in 1280 1024; do f=$OUT/prof_d${d}_trace_rank0.json; [ -f $f ] && python $WT/tools/mfu/trace_breakdown.py $f --top 40 > $OUT/breakdown_d$d.txt 2>&1; done
 echo "DONE $OUT"
