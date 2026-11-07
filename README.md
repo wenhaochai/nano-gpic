@@ -1,25 +1,74 @@
-# gpic-baseline
+# gpic-baseline: the GPIC ladder speedrun
 
-A fast, scaled baseline for pixel-space text-to-image flow matching on [GPIC](https://gpic.stanford.edu): the official PixelGen JiT-T2I model, made faster, trained with Muon and laid out as a compute ladder, so that scaling laws are measured before new methods are tested.
+This repository hosts the GPIC ladder speedrun: the fastest way to train the full compute ladder of PixelGen's JiT-T2I on [GPIC](https://gpic.stanford.edu) with 8 NVIDIA H100 GPUs. The ladder is seven widths, from 109M to 1.68B parameters, each trained to its budget on GPIC Full: 1, 2, 4, 8, 8, 8 and 8 × C0 from width 640 to 1792 (C0 = 1.43e19 FLOPs; 39 C0, about 5.6e20 FLOPs, in all). We run it to measure scaling laws for pixel-space text-to-image before testing new methods against them, so every hour saved is an hour of the ladder.
 
-This repository is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026). The original README is [GPIC_README.md](GPIC_README.md). Every run, number and figure is on the experiment page, [wenhaochai.com/exps/gpic-speed.html](https://wenhaochai.com/exps/gpic-speed.html); training logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed).
+**Current record: 438 H100-hours** (54.8 hours on one 8×H100 node), 35.7% MFU.
+
+This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026; its README is [GPIC_README.md](GPIC_README.md)). Every run, number and figure is on the experiment page, [wenhaochai.com/exps/gpic-speed.html](https://wenhaochai.com/exps/gpic-speed.html); training logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed).
 
 *Updated 2026-11-07.*
 
-## Goal
+## Record history
+
+| # | H100-hours | MFU | Description | Date | Code |
+|---|---|---|---|---|---|
+| 1 | 682 | 22.9% | The official PixelGen code: DDP, masked SDPA, crops resized on the CPU; AdamW, batch 256 | 2026-11-06 | [a1a8681](https://github.com/wenhaochai/nano-gpic/commit/a1a8681e) |
+| 2 | 571 | 27.4% | FlashAttention-3 for the masked attention, the crop's resize on the GPU (bit for bit Pillow's), uint8 batches, FSDP2 from width 1280 | 2026-11-06 | [b8b2c9e](https://github.com/wenhaochai/nano-gpic/commit/b8b2c9e5) |
+| 3 | 530 | 29.5% | Fused Triton kernels for residual + RMSNorm + adaLN modulation and for q/k RMSNorm + RoPE + the k/v concatenation; FSDP2 groups at widths 896 and 1024 | 2026-11-07 | [6f856e3](https://github.com/wenhaochai/nano-gpic/commit/6f856e3c) |
+| 4 | **438** | **35.7%** | Recipe change: Muon (MuP scale) at batch 1024, run as 128 images per GPU with no accumulation; one caption-length bucket per step for all GPUs | 2026-11-07 | [468bc2d](https://github.com/wenhaochai/nano-gpic/commit/468bc2d8) |
+
+H100-hours are training time: each width's steps times its mean measured step time times 8 GPUs, summed over the ladder; start-up compiles, checkpoints and evaluations are not counted. Records 1 to 3 run the official AdamW recipe at batch 256 and keep its math. Record 4 changes the recipe, at the same FLOPs per C0: Muon scores 14% to 24% lower FD than AdamW at every point tried.
+
+## In progress
+
+- **FP8 GEMMs** (`GPIC_MFU_FP8=native2`): the image blocks' forward GEMMs and the MLP's input gradients in FP8, tensorwise scales, the SwiGLU product cast inside its own kernel. Measured on the same batches: 3% faster at width 1024, 9% at widths 1536 and 1792, loss within 0.2% of bf16. It changes the numerics, so it waits for an FD check.
+- **GPU JPEG decoding**: widths 640 and 768 are bound by the CPU's JPEG decoding, about 13.4k images/s on 96 cores, whatever the model's size (their median step is 61 ms, the mean 76 ms). nvJPEG takes 0.06 ms of CPU per image against Pillow's 2.4 ms; its pixels differ slightly, so it waits for an FD check too.
+- **Packed captions**, with the q/k kernel on the packed layout, mix every caption length in every step at the speed of one bucket per GPU. How captions are batched moves FD by up to 7% at equal held-out loss (6 below), so the shared bucket stays until repeated runs measure FD's spread.
+
+## Rules
+
+1. The target is fixed: every width trained to its budget on GPIC Full, 8 H100s per width, the evaluation unchanged.
+2. A speed change keeps the math: on the same batches its loss stays within the spread of repeated runs. A change that alters the numerics (FP8, a JPEG decoder, how captions are batched) counts only after an FD check at the official evaluation.
+3. A step time is the mean over the second half of an arm of 1024 steps or more, on the production path, with every loss finite.
+
+## Running the current record
+
+```bash
+# usage: jobs/train_muon_ladder.sh <full|lite> <size> <d> <blocks> <text blocks> <C0 steps> <multiple of C0> <Adam lr> <Muon lr>
+bash jobs/train_muon_ladder.sh full d640  640  9  2 133600 1 6.4e-4 3.4e-3
+bash jobs/train_muon_ladder.sh full d768  768  10 2 85024  2 5.0e-4 3.4e-3
+bash jobs/train_muon_ladder.sh full d896  896  11 2 57600  4 4.1e-4 3.4e-3
+bash jobs/train_muon_ladder.sh full d1024 1024 12 3 40192  8 3.3e-4 3.4e-3
+bash jobs/train_muon_ladder.sh full d1280 1280 14 3 22400  8 2.4e-4 6.8e-3
+bash jobs/train_muon_ladder.sh full d1536 1536 16 4 13600  8 1.8e-4 3.4e-3
+bash jobs/train_muon_ladder.sh full d1792 1792 18 4 8992   8 1.4e-4 3.4e-3
+```
+
+Each line trains one width on one 8×H100 node, resumes from its last checkpoint, and carries the width's speed settings itself. Before the first run: GPIC Full (`tools/download_full.py`) and its Qwen3-1.7B caption features (`jobs/encode_captions.sh`, checked by `tools/check_text_cache.py`). The scripts keep absolute paths and a job-queue wrapper, so set them to yours.
+
+| width | setting | ms per step (1024 images) | MFU |
+|---|---|---|---|
+| 640 | DDP, 128 × 1 | 76.5 | 17.6% |
+| 768 | DDP, 128 × 1 | 83.6 | 25.4% |
+| 896 | DDP, 128 × 1 | 103.9 | 30.2% |
+| 1024 | DDP, 128 × 1 | 128.9 | 34.8% |
+| 1280 | FSDP2, 7 blocks per unit, 128 × 1 | 211.2 | 38.1% |
+| 1536 | FSDP2, 128 × 1 | 324.0 | 40.9% |
+| 1792 | FSDP2, 64 × 2 | 476.7 | 42.2% |
+
+## The ladder
+
+The goal:
 
 1. Measure how image quality scales with model size, training compute and unique images in pixel-space text-to-image, in the units of language-model scaling studies: FLOP budgets, iso-FLOP curves, tokens per parameter, unique and total tokens.
 2. Find how many passes over the data cost nothing, before fitting any optimum.
 3. Only then test new methods, each against the ladder at the same compute.
 
-## The ladder
-
 - **Model.** PixelGen's JiT-T2I: x-prediction flow matching, 16-pixel patches (256 image tokens per 256 × 256 image), Qwen3-1.7B caption features. Widths 640 to 1792, from 109M to 1.68B parameters.
 - **Recipe.** MiniT2I's settings (Adam, batch 1024, β2 0.95), turned into the MuP version of Muon by lr × 0.2√d ([Su, 2025](https://kexue.fm/archives/11416)): Muon at 3.4e-3 for the transformer matrices (6.8e-3 at width 1280, where its own runs prefer it; widths 1536 and 1792 wait for theirs), Adam for the rest, 1000 warmup steps and a constant rate after them, EMA 0.9996 per step, no CFG.
-- **Budgets.** C0 = 1.43e19 FLOPs. Width 640 trains to C0, 768 to 2C0, 896 to 4C0, and 1024 to 1792 to 8C0; one run per width is read at C0/4, C0/2, C0, 2C0, 4C0 and 8C0.
+- **Budgets.** One run per width, read at C0/4, C0/2, C0, 2C0, 4C0 and 8C0.
 - **Data.** GPIC Full (101.1M images) and GPIC Lite (10.1M), plus repetition arms on the first 80 shards (1.01M images) and the first 8 (101K).
 - **Scores.** FD-DINOv2 with the official evaluation (Euler at 50 steps, 50,000 test captions, one noise for all prompts, CFG 1), and the loss on 3072 held-out images at 16 noise levels with fixed noise.
-- **Speed.** Each width keeps its speed levers behind switches: fused residual-norm and q/k kernels, uint8 crops resized on the GPU, one caption-length bucket per step for all GPUs, and FSDP2 from width 1280. The ladder runs at 35.7% MFU on 8 H100s (29.5% with the AdamW recipe at batch 256), and an evaluation runs on one GPU, eight side by side.
 
 ## What we have so far
 
@@ -48,7 +97,7 @@ Every evaluation of every run, against training compute 6ND. Blue is our frontie
 | Branch | Contents |
 |---|---|
 | `main` | the production line: the ladder (per-width speed settings, Muon also under FSDP2, the shared caption bucket), `jobs/train_muon_ladder.sh`, `configs_h100/muon_ladder.yaml`, and the job scripts of the learning-rate, EMA, caption-bucket and batch experiments |
-| `mfu` | speed work: fused kernels, FSDP2, packed captions, FP8 and GPU decoding benchmarks |
+| `mfu` | speed work: fused kernels, FSDP2, packed captions, FP8, GPU decoding; the log is `docs/mfu.md` |
 | `muon-search2` | job scripts of the learning-rate, EMA, caption-bucket and batch experiments |
 | `heldout-loss` | `tools/heldout_loss.py`: held-out and training loss at fixed noise, EMA and raw weights |
 | `eval-par` | `jobs/evals_gmflow.sh --par`: one evaluation per GPU, eight side by side |
@@ -59,5 +108,3 @@ Every evaluation of every run, against training compute 6ND. Blue is our frontie
 | `energy-head` | an energy-score head over the whole image |
 | `ar` | autoregressive sampling of the image tokens |
 | `implicit-nodrop` | a posterior sampler, and the point model without caption dropout |
-
-Every run used nodes of 8 H100 GPUs, launched through a job queue; the scripts keep absolute paths, so set them to yours.
