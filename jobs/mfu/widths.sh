@@ -33,6 +33,8 @@ gpu_checks $WT $OUT || { echo "GPU checks failed"; exit 3; }
 export MFU_WT=$WT MFU_LIMIT=900 GPIC_MFU_DET_DATA=1 GPIC_SHARD_SEED=20261106
 FSDP='{"class_path":"lightning.pytorch.strategies.ModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
 FSDP_FLAT='{"class_path":"src.utils.fsdp_setup.FlatModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
+# letter N (with B): FSDP2 without the gradient sync and the reshard in the micro-batches before an optimizer step
+FSDP_NOSYNC='{"class_path":"src.utils.fsdp_setup.NoSyncModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
 arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }
 geom() { case $1 in 640) echo "9 2" ;; 768) echo "10 2" ;; 896) echo "11 2" ;; 1024) echo "12 3" ;; 1280) echo "14 3" ;; 1536) echo "16 4" ;; 1792) echo "18 4" ;; esac; }
 for spec in "$@"; do
@@ -44,6 +46,7 @@ for spec in "$@"; do
     env=(GPIC_MFU_ATTN=fa3)
     [[ $s == *B* ]] && env+=(GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP)
     [[ $s == *Q* ]] && env+=(GPIC_MFU_FSDP=1 GPIC_MFU_FSDP_FLAT=1 MFU_STRATEGY=$FSDP_FLAT)   # lever B3: flat units
+    [[ $s == *N* ]] && env+=(MFU_STRATEGY=$FSDP_NOSYNC)   # accumulation: no FSDP2 sync before the last micro-batch
     [[ $s == *C* ]] && env+=(GPIC_MFU_GPU_RESIZE=1)
     [[ $s == *D* ]] && env+=(GPIC_MFU_UINT8=1)
     [[ $s == *E* ]] && env+=(GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1)
@@ -62,7 +65,7 @@ for spec in "$@"; do
     # lever G0: Inductor's coordinate-descent tuning of the element-wise and reduction kernels (probe7: -2 to -3% at
     # d1024-d1280 on one GPU); its compile takes minutes longer, so the arm gets more time
     [[ $s == *T* ]] && env+=(TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 MFU_LIMIT=2400)
-    ( export "${env[@]}"; arm d${d}_$s $d $nb $nt $STEPS )
+    ( export "${env[@]}"; arm d${d}_$s $d $nb $nt $STEPS ${WIDTHS_ARGS:-} )   # WIDTHS_ARGS: main.py arguments for every arm
   done
 done
 cd $WT

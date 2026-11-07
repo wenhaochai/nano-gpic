@@ -219,14 +219,47 @@ def _flat_strategy():
     return FlatModelParallelStrategy
 
 
+def _nosync_strategy():
+    from contextlib import contextmanager
+    from lightning.pytorch.strategies import ModelParallelStrategy
+
+    class NoSyncModelParallelStrategy(ModelParallelStrategy):
+        """ModelParallelStrategy with gradient accumulation as DDP has it (new ladders: global batch 1024 = 8 x 32 x 4;
+        Lightning blocks the gradient sync only for DDP): in the micro-batches before the last of an optimizer step,
+        FSDP2 neither reduce-scatters (it sums the unsharded gradients in its fp32 reduce dtype) nor reshards after the
+        backward (the next micro-batch needs no all-gather); the last micro-batch reduce-scatters the sum. The same
+        gradient up to fp32 summation order."""
+
+        @contextmanager
+        def block_backward_sync(self):
+            from torch.distributed.fsdp import FSDPModule
+            mods = [m for m in self.model.modules() if isinstance(m, FSDPModule)]
+            for m in mods:
+                m.set_requires_gradient_sync(False, recurse=False)
+                m.set_reshard_after_backward(False, recurse=False)
+            try:
+                yield None
+            finally:
+                for m in mods:
+                    m.set_requires_gradient_sync(True, recurse=False)
+                    m.set_reshard_after_backward(True, recurse=False)
+
+    return NoSyncModelParallelStrategy
+
+
 _FLAT_STRATEGY = []
+_NOSYNC_STRATEGY = []
 
 
-def __getattr__(name):   # `src.utils.fsdp_setup.FlatModelParallelStrategy` for the trainer's strategy JSON, built once
+def __getattr__(name):   # `src.utils.fsdp_setup.<Strategy>` for the trainer's strategy JSON, built once
     if name == "FlatModelParallelStrategy":
         if not _FLAT_STRATEGY:
             _FLAT_STRATEGY.append(_flat_strategy())
         return _FLAT_STRATEGY[0]
+    if name == "NoSyncModelParallelStrategy":
+        if not _NOSYNC_STRATEGY:
+            _NOSYNC_STRATEGY.append(_nosync_strategy())
+        return _NOSYNC_STRATEGY[0]
     raise AttributeError(name)
 
 

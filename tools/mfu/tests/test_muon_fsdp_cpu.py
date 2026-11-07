@@ -75,7 +75,34 @@ def run(rank, world, port):
                 else:
                     da = max(da, float((a - b).abs().max() / a.abs().max().clamp_min(1e-12)))
             keys_ok = all(set(o_ref.state[pr[n]]) == set(o_fs.state[pf[n]]) for n in names)
-            good = same_m and da < 1e-6 and keys_ok
+            # checkpoint round trip as Lightning's ModelParallelStrategy does it (full state dicts), then one more step
+            # with the same gradients on the original and on the restored copy: the same bits
+            from torch.distributed.checkpoint.state_dict import (StateDictOptions, get_model_state_dict,
+                                                                 get_optimizer_state_dict, set_model_state_dict,
+                                                                 set_optimizer_state_dict)
+            full_opt = StateDictOptions(full_state_dict=True)
+            msd = get_model_state_dict(fs, options=full_opt)
+            osd = get_optimizer_state_dict(fs, o_fs, options=full_opt)
+            fs2 = copy.deepcopy(base)
+            shard(fs2, mesh, compute_bf16=False, compile_blocks=False, group=2)
+            tag_muon_params(fs2)
+            o_fs2 = ShardMuonAdamW([{"params": [p for p in fs2.parameters() if p.requires_grad]}], **kw)
+            # a checkpoint holds copies (the full state dict here still refers to the live step tensors, which two
+            # optimizers in one process would then share and both advance)
+            set_model_state_dict(fs2, copy.deepcopy(msd), options=full_opt)
+            set_optimizer_state_dict(fs2, o_fs2, copy.deepcopy(osd), options=full_opt)
+            pf2 = dict(fs2.named_parameters())
+            g = torch.Generator().manual_seed(77)
+            for n in names:
+                full = torch.randn(pr[n].shape, generator=g) * 1e-2
+                for d in (pf, pf2):
+                    q = d[n]
+                    q.grad = distribute_tensor(full.clone(), mesh, [Shard(0)]) if isinstance(q, DTensor) else full.clone()
+            o_fs.step(); o_fs2.step()
+            rt = all(torch.equal(full_t(pf[n].detach()), full_t(pf2[n].detach())) for n in names)
+            if rank == 0:
+                print(f"   checkpoint round trip (full state dicts), one more step: the same bits {rt}", flush=True)
+            good = same_m and da < 1e-6 and keys_ok and rt
             ok &= good
             if rank == 0:
                 print(f"ns={ns} split={split} scale={scale}: Muon matrices and momentum bit for bit {same_m} (max |diff| {dm:.1e}); "
