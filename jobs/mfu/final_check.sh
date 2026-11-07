@@ -1,0 +1,64 @@
+#!/bin/bash
+#SBATCH -J gpic-mfu-final
+#SBATCH --gres=gpu:8
+#SBATCH -c 96
+#SBATCH --time=01:20:00
+#SBATCH --mem=800G
+#SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
+#SBATCH --comment=fetchable
+#FETCHABLE
+# The new ladders' settings per width on 8 GPUs (owner 2026-11-07 02:0x: no gradient accumulation wherever it fits):
+# Muon overlay, the shared caption bucket (S), levers A C D K K2, global batch 1024 as micro-batch 128 x 1 where it fits
+# (64 x 2 where not); peak memory per arm; d640 also stops at 2048 and resumes (every rank's T compared, also after
+# the resume). Fewer, longer arms (the startup idles the GPUs): about 4 min of training each.
+# usage: final_check.sh <code worktree>
+set -o pipefail
+source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
+WT=${1:?code worktree}
+OUT=$WC/runs/gpic-speed/mfu/final_$(date +%m%d_%H%M)
+mkdir -p $OUT
+git -C $WT rev-parse HEAD > $OUT/commit.txt
+python $WT/tools/gpu_health.py > $OUT/gpu_health.txt 2>&1 || { tail -3 $OUT/gpu_health.txt; echo "unhealthy GPU on $(hostname); exit 98"; exit 98; }
+export PIXGEN_SRC=$WT/baselines/PixelGen MFU_WT=$WT GPIC_MFU_DET_DATA=1 GPIC_SHARD_SEED=20261106 MFU_LIMIT=1500
+export GPIC_MFU_ATTN=fa3 GPIC_MFU_GPU_RESIZE=1 GPIC_MFU_UINT8=1 GPIC_MFU_FUSED_NORM=1 GPIC_MFU_FUSED_QK=1 GPIC_SHARED_BUCKET=1
+cd $WT
+MUON=(--config configs_h100/muon_ladder.yaml)
+FS='{"class_path":"src.utils.fsdp_setup.NoSyncModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
+arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }
+MFU_MICRO=128 MFU_SAVE_EVERY=2048 MFU_KEEP_CKPT=1 arm d640_ddp_m128_to2048 640 9 2 2048 "${MUON[@]}"
+CK=$(ls $OUT/d640_ddp_m128_to2048/exp_mfu_d640_ddp_m128_to2048/last*.ckpt $OUT/d640_ddp_m128_to2048/last*.ckpt 2>/dev/null | head -1)
+echo "resume from: $CK" | tee -a $OUT/summary.txt
+MFU_MICRO=128 MFU_RESUME=$CK arm d640_ddp_m128_resumed 640 9 2 3072 "${MUON[@]}"
+MFU_MICRO=128 arm d768_ddp_m128 768 10 2 3072 "${MUON[@]}"
+MFU_MICRO=128 arm d896_ddp_m128 896 11 2 2048 "${MUON[@]}"
+MFU_MICRO=128 arm d1024_ddp_m128 1024 12 3 2048 "${MUON[@]}"
+MFU_MICRO=128 arm d1280_ddp_m128 1280 14 3 1024 "${MUON[@]}"
+GPIC_MFU_FSDP=1 GPIC_MFU_FSDP_GROUP=7 MFU_STRATEGY=$FS MFU_MICRO=128 arm d1280_fsdp_m128 1280 14 3 1024 "${MUON[@]}"
+GPIC_MFU_FSDP=1 MFU_STRATEGY=$FS MFU_MICRO=128 arm d1536_fsdp_m128 1536 16 4 768 "${MUON[@]}"
+GPIC_MFU_FSDP=1 MFU_STRATEGY=$FS MFU_MICRO=64 arm d1536_fsdp_m64 1536 16 4 768 "${MUON[@]}"
+GPIC_MFU_FSDP=1 MFU_STRATEGY=$FS MFU_MICRO=64 arm d1792_fsdp_m64 1792 18 4 768 "${MUON[@]}"
+python - $OUT <<'PY' | tee -a $OUT/summary.txt
+import json, os, statistics as st, sys, glob
+out = sys.argv[1]
+GF = {640: 104.1, 768: 163.8, 896: 242.1, 1024: 346.9, 1280: 622.4, 1536: 1024.9, 1792: 1554.8}
+for d in sorted(glob.glob(os.path.join(out, "d*")), key=lambda p: (int(os.path.basename(p).split("_")[0][1:]), p)):
+    tag = os.path.basename(d)
+    fs = sorted(glob.glob(os.path.join(d, "bench", "steps_rank*.json")))
+    if not fs:
+        print(f"{tag}: no timer rows (failed: see train.log)"); continue
+    rows = [json.load(open(f))["rows"] for f in fs]
+    T = [[r.get("T") for r in rr] for rr in rows]
+    n = min(len(t) for t in T)
+    agree = sum(all(t[i] == T[0][i] for t in T) for i in range(n))
+    micro = 128 if "m128" in tag else 64
+    acc = 1024 // 8 // micro
+    ms = [x.get("step_ms", 1000 * (x["t_end"] - x["t_start"])) for x in rows[0]][n // 2:]
+    w = int(tag.split("_")[0][1:])
+    opt_ms = acc * st.mean(ms)
+    mem = max(max(r.get("max_reserved_gb", 0) for r in rr) for rr in rows)
+    print(f"{tag}: micro {micro} x {acc}; optimizer step {opt_ms:.1f} ms (mean, second half), "
+          f"MFU {GF[w] * 1e9 * 1024 / 8 / (opt_ms / 1e3) / 989.4e12:.1%}; peak reserved {mem:.1f} GiB; "
+          f"{len(fs)} ranks the same T in {agree} of {n} micro-batches; mean T {st.mean([t for t in T[0][:n] if t]):.1f}")
+PY
+grep -h "OutOfMemoryError\|CUDA out of memory\|Traceback" $OUT/*/train.log | sort | uniq -c | head -5
+echo "DONE $OUT"
