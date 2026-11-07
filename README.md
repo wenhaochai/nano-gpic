@@ -40,8 +40,8 @@ bash jobs/train_muon_ladder.sh full d768  768  10 2 85024  2 5.0e-4 3.4e-3
 bash jobs/train_muon_ladder.sh full d896  896  11 2 57600  4 4.1e-4 3.4e-3
 bash jobs/train_muon_ladder.sh full d1024 1024 12 3 40192  8 3.3e-4 3.4e-3
 bash jobs/train_muon_ladder.sh full d1280 1280 14 3 22400  8 2.4e-4 6.8e-3
-bash jobs/train_muon_ladder.sh full d1536 1536 16 4 13600  8 1.8e-4 3.4e-3
-bash jobs/train_muon_ladder.sh full d1792 1792 18 4 8992   8 1.4e-4 3.4e-3
+bash jobs/train_muon_ladder.sh full d1536 1536 16 4 13600  8 1.8e-4 6.8e-3
+bash jobs/train_muon_ladder.sh full d1792 1792 18 4 8992   8 1.4e-4 6.8e-3
 ```
 
 Each line trains one width on one 8×H100 node, resumes from its last checkpoint, and carries the width's speed settings itself. Before the first run: GPIC Full (`tools/download_full.py`) and its Qwen3-1.7B caption features (`jobs/encode_captions.sh`, checked by `tools/check_text_cache.py`). The scripts keep absolute paths and a job-queue wrapper, so set them to yours.
@@ -65,16 +65,16 @@ The goal:
 3. Only then test new methods, each against the ladder at the same compute.
 
 - **Model.** PixelGen's JiT-T2I: x-prediction flow matching, 16-pixel patches (256 image tokens per 256 × 256 image), Qwen3-1.7B caption features. Widths 640 to 1792, from 109M to 1.68B parameters.
-- **Recipe.** MiniT2I's settings (Adam, batch 1024, β2 0.95), turned into the MuP version of Muon by lr × 0.2√d ([Su, 2025](https://kexue.fm/archives/11416)): Muon at 3.4e-3 for the transformer matrices (6.8e-3 at width 1280, where its own runs prefer it; widths 1536 and 1792 wait for theirs), Adam for the rest, 1000 warmup steps and a constant rate after them, EMA 0.9996 per step, no CFG.
+- **Recipe.** MiniT2I's settings (Adam, batch 1024, β2 0.95), turned into the MuP version of Muon by lr × 0.2√d ([Su, 2025](https://kexue.fm/archives/11416)): Muon at 3.4e-3 for the transformer matrices (6.8e-3 from width 1280: width 1280's own runs prefer it, width 1792's tie in FD and favour it in held-out loss, and width 1536 lies between them), Adam for the rest, 1000 warmup steps and a constant rate after them, EMA 0.9996 per step, no CFG.
 - **Budgets.** One run per width, read at C0/4, C0/2, C0, 2C0, 4C0 and 8C0.
 - **Data.** GPIC Full (101.1M images) and GPIC Lite (10.1M), plus repetition arms on the first 80 shards (1.01M images) and the first 8 (101K).
 - **Scores.** FD-DINOv2 with the official evaluation (Euler at 50 steps, 50,000 test captions, one noise for all prompts, CFG 1), and the loss on 3072 held-out images at 16 noise levels with fixed noise.
 
 ## What we have so far
 
-<img src="docs/readme/readme_all_points.png" width="560" alt="FD of every evaluation against training compute 6ND: our frontier and the official recipe's frontier">
+<img src="docs/readme/readme_all_points.png" width="560" alt="FD of every evaluation against training compute 6ND: the main-line ladder and the released model">
 
-Every evaluation of every run, against training compute 6ND. Blue is our frontier, the lowest FD reached at or below each compute in the standard evaluation; red is the same frontier for the official AdamW recipe on GPIC Full, its ladder and the released model; grey is every other evaluation, whatever its sampler.
+Every evaluation of every run, against training compute 6ND. Blue is the main line, the Muon ladder on GPIC Full, and the light-blue line follows the lowest FD of each of its budgets; red is the released GPIC model; both in the standard evaluation (Euler 50, the official noise, CFG 1). Grey is every other evaluation.
 
 <img src="docs/readme/readme_muon_adamw.png" width="560" alt="FD at 1.4e19 FLOPs by parameters, Muon against AdamW">
 
@@ -89,7 +89,7 @@ Every evaluation of every run, against training compute 6ND. Blue is our frontie
 
 4. **The EMA lags in short runs.** The EMA starts at the initial weights and keeps 0.9996^step of them. Above a 1% share its held-out loss is 4.5% to 590% above the raw weights'; below 0.2% it is 0.3% to 0.8% lower. Short runs and the first budgets of the widest models are read from the raw weights or need a later EMA; a sweep of the EMA decay is running.
 5. **Repetition.** On the AdamW ladders, GPIC Lite costs nothing up to 17 passes over its 10.1M images: its held-out loss is within −0.12% to +0.07% of Full's at the same width and step. The 1.01M and 101K arms (135 to 1350 passes) are running.
-6. **FD needs care.** Seven runs at width 640 whose held-out loss agrees to 0.07% differ by up to 7% in FD, depending on how captions are batched: one caption-length bucket per step scores 1006 and 1017, eight buckets 983, packed captions that mix every length in every step 975, and thirty-two buckets 949 to 959. Two repeats with a second seed measure FD's spread between runs; until they report, small FD gaps between single runs are read from the held-out loss.
+6. **FD needs care.** Nine runs at width 640 whose held-out loss agrees to 0.07% span FD 949 to 1017. With one caption-length bucket per step, FD depends on the seed (966.6 to 1016.6) and averages 4% above runs with thirty-two buckets per step, which repeat within 0.3%. The ladder keeps the one-bucket setting, the fastest, and reads small FD gaps between single runs from the held-out loss.
 7. **Fixes.** A torch 2.7.1 Inductor C++-wrapper template dropped a reference to `None` on every compiled call and crashed long runs (`src/utils/patch_bugs.py`). The shared caption bucket hung at the end of a data pass and dropped unfinished batches there (`src/data/shared_bucket_loader.py`, `src/data/dataset/gpic_dataset.py`).
 
 ## Where the code is
