@@ -485,7 +485,7 @@ owner：「我觉得整张图一个混合不错，是合理的」。原因：逐
    3. 整图的训练损失和 w1173 的逐像素损失不是同一个量（只有 K = 1 时相同）。两个运行只按 FD 比。
    4. 这个运行目录只用 gpic-wt/gmflow_run6 或更新的代码评测：旧代码不读 scope.txt，会把整图检查点当逐像素模型评测，而且不报错。
    5. 其他已改：win_stats 不再用 bincount（CUDA 上会同步主机）；train_gmflow.sh 在训练前检查评测任务（scope 不能用的采样器、选项顺序错、字段数错都在训练前拒绝）。
-9. 实验页：问题 10 的图 15 是这个实验的占位图（site 56dad19；两栏：8 步和 50 步；点模型最好的采样器、逐像素 K = 8 的 GM-ODE 和 gm_draw、整张图 K = 8 的 gm_draw）。
+9. 实验页：问题 10 的 fig-dist-image 是这个实验的占位图（2026-11-06 23:2x 时是第 17 张图；site 56dad19；两栏：8 步和 50 步；点模型最好的采样器、逐像素 K = 8 的 GM-ODE 和 gm_draw、整张图 K = 8 的 gm_draw）。
 10. 冒烟测试 w1401（2026-11-06 18:24，通过，runs/gpic-speed/image_mix_smoke_1106_181140）：GPU 上的赢者通吃一开始就出现。数字来自每个 rank 自己的 32 张图，每 50 步一次，8 个 rank 的 80 行全部可读（tmp/ladder_prof/win_ranges.py；审计时更正：最初只看了抽样的几行）。
     1. 第 50 步：3–5 个分量赢至少一张图；赢得最多的分量赢 63%–81%。
     2. 从第 200 步起，每个 rank 最多 3 个分量在赢；第 400 步 1–2 个，最多的赢 97%–100%。续训后第 450–500 步：1–3 个，最多的赢 91%–100%。
@@ -553,7 +553,7 @@ owner：「我觉得整张图一个混合不错，是合理的」。原因：逐
 5. 评测：gmflow_run4 的 `evals_gmflow.sh`（点模型 Full ladder 和 Lite GMFlow 用的同一份评测代码）。GM-ODE 8、50、4 次调用和混合均值上的 Euler 50 次；1C0 段在 C0/4、C0/2、C0，之后每段在段末。官方噪声，EMA，CFG = 1，5 万条测试 caption。
 6. 判定：同宽度、同算力和点模型比（点模型用 Full ladder 自己的检查点和同样调用次数下最好的采样器），每种调用次数分开，5%。不做"每个算力取最好的宽度"的比较：GMFlow 只到 d1024，点模型到 d1792，大算力时点模型最好的宽度可能更大。
 7. 成本：训练约 335 GPU-h（每个 C0 的时间取点模型 Full ladder 实测的 1C0 段 × 1.05：d640 4.15 小时，d768 3.31，d896 2.97，d1024 2.65），评测约 100 GPU-h。
-8. 实验页：图 22（页面上的编号） "The mixture on GPIC Full"，4 栏，每栏一个宽度，横轴训练算力，纵轴 8 次调用的 FD；点模型（灰）和混合（绿）两条线；50 次调用的结果写在文字里。
+8. 实验页：fig-dist-full（2026-11-06 23:2x 时是第 24 张图）"The mixture on GPIC Full"，4 栏，每栏一个宽度，横轴训练算力，纵轴 8 次调用的 FD；点模型（灰）和混合（绿）两条线；50 次调用的结果写在文字里。
 9. 门控和提交（2026-11-06 22:5x）：
    1. CPU 测试：合并后的代码上 test_gmflow T1–T33、test_dispatch、test_ladder、test_shard_resume 全部通过；test_full_gmflow 14 种情况通过。
    2. 冒烟 w1430（22:44，通过，runs/gpic-speed/full_gmflow_smoke_1106_2237）：两段都 rc=0；第 800 和 1600 步的 ms 和 last.ckpt 完整，输出层 8192 行；第 2 段从 last.ckpt 续训（调用计数最大 800，有 "Restored all states"），保留 256 行分片日志；配置里有 gm_k 8、GMFlowTrainer、lam 0.5、宽度 640、8000 个分片和 W&B id ladder-full-gmflow-k8-d640；分片种子 20261106；[gmflow] 行全部有限，预热后没有重新编译；3 种错误参数都被拒绝；gmflow_run4 的 GM-ODE 8 和均值 Euler 8 都能加载检查点并写出样本。
