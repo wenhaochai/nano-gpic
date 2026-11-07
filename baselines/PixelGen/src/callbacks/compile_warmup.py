@@ -22,7 +22,8 @@ class CompileWarmup(Callback):
         self.batch_size, self.lengths, self.image_size = batch_size, tuple(lengths), image_size
 
     def on_train_start(self, trainer, pl_module):
-        B, dev = self.batch_size, pl_module.device
+        # the data's per-GPU batch when the DataModule has one (new ladders: micro-batches of 64 or 128 for global 1024)
+        B, dev = getattr(getattr(trainer, "datamodule", None), "train_batch_size", None) or self.batch_size, pl_module.device
         cached = not hasattr(pl_module.conditioner, "tokenizer")   # outputs read from the batch (cached_text.py)
         for T in self.lengths:
             t0 = time.time()

@@ -48,6 +48,7 @@ for spec in "$@"; do
     [[ $s == *Q* ]] && env+=(GPIC_MFU_FSDP=1 GPIC_MFU_FSDP_FLAT=1 MFU_STRATEGY=$FSDP_FLAT)   # lever B3: flat units
     [[ $s == *N* ]] && env+=(MFU_STRATEGY=$FSDP_NOSYNC)   # accumulation: no FSDP2 sync before the last micro-batch
     [[ $s == *S* ]] && env+=(GPIC_SHARED_BUCKET=1)   # the same caption-length bucket on every rank (new ladders)
+    [[ $s =~ M([0-9]+) ]] && env+=(MFU_MICRO=${BASH_REMATCH[1]})   # micro-batch per GPU at global batch 1024
     [[ $s == *C* ]] && env+=(GPIC_MFU_GPU_RESIZE=1)
     [[ $s == *D* ]] && env+=(GPIC_MFU_UINT8=1)
     [[ $s == *E* ]] && env+=(GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1)

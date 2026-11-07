@@ -6,7 +6,8 @@
 #   env: MFU_WT (code worktree, default this script's worktree), BENCH_PROFILE / BENCH_STAGES (bench.py), MFU_LIMIT (s,
 #   MFU_STRATEGY (a trainer.strategy JSON, e.g. FSDP2's ModelParallelStrategy for GPIC_MFU_FSDP=1), MFU_SAVE_EVERY (last.ckpt
 #   every N steps), MFU_RESUME (a checkpoint to resume from), MFU_KEEP_CKPT (keep the arm's checkpoints),
-#   default 1200), anything else the arm changes (NCCL_*, GPIC_* switches), set by the caller.
+#   default 1200), MFU_MICRO (per-GPU micro-batch for global batch 1024 on 8 GPUs: accumulation 1024 / 8 / MFU_MICRO,
+#   after the caller's arguments), anything else the arm changes (NCCL_*, GPIC_* switches), set by the caller.
 set -o pipefail
 OUT=$1 TAG=$2 D=$3 NB=$4 NT=$5 STEPS=$6; shift 6
 WT=${MFU_WT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
@@ -32,7 +33,8 @@ timeout -k 60 ${MFU_LIMIT:-1200} python main.py fit --config configs_h100/lite_l
   --model.denoiser.init_args.hidden_size $D --model.denoiser.init_args.num_groups $((D / 64)) \
   --model.denoiser.init_args.num_blocks $NB --model.denoiser.init_args.num_text_blocks $NT \
   "${CKPT_ARGS[@]}" --tags.exp mfu_$TAG --trainer.logger.init_args.name mfu_$TAG \
-  ${MFU_STRATEGY:+--trainer.strategy "$MFU_STRATEGY"} "$@" > $OUT/$TAG/train.log 2>&1
+  ${MFU_STRATEGY:+--trainer.strategy "$MFU_STRATEGY"} "$@" \
+  ${MFU_MICRO:+--data.train_batch_size $MFU_MICRO --trainer.accumulate_grad_batches $((1024 / 8 / ${MFU_MICRO:-32}))} > $OUT/$TAG/train.log 2>&1
 rc=$?
 [ -n "${MFU_KEEP_CKPT:-}" ] || rm -f $OUT/$TAG/exp_mfu_$TAG/*.ckpt $OUT/$TAG/*.ckpt
 echo "$(date -u +%FT%TZ) tag=$TAG rc=$rc" >> $OUT/arms.txt
