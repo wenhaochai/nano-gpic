@@ -20,6 +20,11 @@ _ATTN = os.environ.get("GPIC_MFU_ATTN", "sdpa")
 _TEXT_ATTN = os.environ.get("GPIC_MFU_TEXT_ATTN", "sdpa")
 if _ATTN == "fa3":
     from src.models.layers.fa3_op import fa3_attention, fa3_varlen
+# MFU lever K (docs/mfu.md): GPIC_MFU_FUSED_NORM=1 runs the image blocks' residual add, RMSNorm and adaLN modulation as
+# one Triton kernel per site, forward and backward (src/models/layers/fused_norm.py); the same ops up to rounding.
+_FUSED_NORM = os.environ.get("GPIC_MFU_FUSED_NORM", "0") == "1"
+if _FUSED_NORM:
+    from src.models.layers.fused_norm import mod_rmsnorm, res_mod_rmsnorm
 
 # MFU lever E (docs/mfu.md): packed captions. With y_pack (a dict, below) the caption tokens of the batch lie back to back,
 # y [S, 2048], S = the sum of the caption lengths: the text blocks and the caption key projections run on the S real tokens
@@ -162,6 +167,11 @@ class FlattenDiTBlock(nn.Module):
 
     def forward(self, x, y, c, pos, mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
+        if _FUSED_NORM:   # lever K: norm1 + modulation; the first residual add + norm2 + modulation
+            h = mod_rmsnorm(x, self.norm1.weight, shift_msa, scale_msa, self.norm1.variance_epsilon)
+            x, h = res_mod_rmsnorm(x, self.attn(h, y, pos, mask), gate_msa, self.norm2.weight, shift_mlp, scale_mlp,
+                                   self.norm2.variance_epsilon)
+            return x + gate_mlp * self.mlp(h)
         x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), y, pos, mask)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
