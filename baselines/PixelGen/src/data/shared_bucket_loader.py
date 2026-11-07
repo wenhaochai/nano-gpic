@@ -11,6 +11,13 @@ argmax on every rank (ties to the shorter bucket). So every rank trains micro-ba
 stay bounded (the bucket with the largest supply everywhere goes first), the buckets come at their share of the data,
 and nothing is dropped. The decision depends only on the pools, which the DataLoader fills in its fixed order, so a run
 is deterministic. A resume starts with empty pools on every rank.
+Data passes (the hang of 2026-11-07, w1718 w1722 w1724): one data pass is one epoch of the wrapped DataLoader (its
+persistent workers call iter() once per epoch), and the ranks end their passes at different micro-batches. This loader
+therefore never ends: when the wrapped loader ends a pass on a rank, the rank starts the next pass inside the same
+iterator, and its pools carry over. Ending the iterator would end Lightning's epoch on that rank alone, and the new
+iterator would create its gloo group while the other ranks wait in the old group's all-reduce (creating a group is a
+collective of every rank): the s8 and s80 arms hung at their first pass end that way. The gloo group is also made once per
+loader, not once per iterator. Lightning stops at max_steps (max_epochs is null), so the whole run is one epoch.
 Every 1000 micro-batches rank 0 prints the pools' largest size, the decision rounds per micro-batch and the time spent
 waiting for the DataLoader and in the all-reduce (the d640 data wait at 128 x 1, docs/mfu.md; the pools' bound in the
 repetition arms).
@@ -37,6 +44,8 @@ class SharedBucketLoader:
         self.pool_min = pool_min or 2 * len(self.edges)
         self._allreduce_min = allreduce_min   # tests: a stand-in for the gloo all-reduce
         self.taken = [0] * len(self.edges)
+        self.group = None   # the gloo group, made at the first decision of the run, on every rank at once
+        self.passes = 0     # data passes this rank finished (restarts of the wrapped loader)
 
     def __iter__(self):
         return _Iter(self)
@@ -47,7 +56,7 @@ class SharedBucketLoader:
 
 class _Iter:
     def __init__(self, parent):
-        self.p, self.it, self.group = parent, None, None   # started at the first next(): Lightning's iter() check
+        self.p, self.it = parent, None   # started at the first next(): Lightning's iter() check
         self.pools = [deque() for _ in parent.edges]          # drops an iterator without calling next()
         self.st = dict(n=0, rounds=0, pulls=0, pull_s=0.0, ar_s=0.0, pool_max=0)
 
@@ -57,7 +66,18 @@ class _Iter:
 
     def _pull(self):
         t = time.perf_counter()
-        b = next(self.it)
+        try:
+            b = next(self.it)
+        except StopIteration:   # this rank's data pass ended: the next pass starts here, in the same epoch (module docstring)
+            self.p.passes += 1
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            print(f"[shared_bucket] rank {rank}: data pass {self.p.passes} ended after micro-batch {self.st['n']}; "
+                  f"the next pass starts with {sum(len(q) for q in self.pools)} batches pooled", flush=True)
+            self.it = iter(self.p.loader)
+            try:
+                b = next(self.it)
+            except StopIteration:   # a StopIteration out of __next__ would end the epoch on this rank alone: fail instead
+                raise RuntimeError("the training loader gave no batch in a whole data pass") from None
         self.st["pull_s"] += time.perf_counter() - t
         self.st["pulls"] += 1
         self.pools[self._bucket(b)].append(b)
@@ -68,10 +88,10 @@ class _Iter:
             return self.p._allreduce_min(counts)
         if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
             return counts
-        if self.group is None:
-            self.group = dist.new_group(backend="gloo")
+        if self.p.group is None:
+            self.p.group = dist.new_group(backend="gloo")
         t = torch.tensor(counts, dtype=torch.int64)
-        dist.all_reduce(t, op=dist.ReduceOp.MIN, group=self.group)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN, group=self.p.group)
         return t.tolist()
 
     def __iter__(self):
