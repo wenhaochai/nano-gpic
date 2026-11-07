@@ -1,5 +1,5 @@
 #!/bin/bash
-# Publish the project to the public page-linked repo wenhaochai/nano-gpic (owner 2026-11-07: 「commit为什么不全啊，然后main要
+# Publish the project to the public page-linked repo wenhaochai/nano-gpic (a fresh repo since 2026-11-07, owner: 「wenhaochai/nano-gpic吧」; before it gpic-baseline; owner 2026-11-07: 「commit为什么不全啊，然后main要
 # 创建一个吧，然后要全吧」, 「公开仓库不要提及h100」, 「说H100就行」): every branch at once, each with its whole history; the
 # production line prod (main with ladder, mfu and muon-search2 merged) becomes the public main. In every commit, file name
 # and message: cluster paths and user names replaced, the cluster's name replaced by H100 (configs_h100 -> configs_h100,
@@ -48,7 +48,7 @@ git rev-list --parents "${PUB[@]}" --not $UP | while read -r c ps; do
 done
 SUB='
 import re
-REPL = [(b"/scratch/gpfs/GROUP/USER", b"/scratch/gpfs/GROUP/USER"), (b"USER", b"USER"), (b"GROUP", b"GROUP"),
+REPL = [(b"wenhaochai/nano-gpic", b"wenhaochai/nano-gpic"), (b"/scratch/gpfs/GROUP/USER", b"/scratch/gpfs/GROUP/USER"), (b"USER", b"USER"), (b"GROUP", b"GROUP"),
         (b"group", b"group"), (b"USER", b"USER"),
         (b"configs_h100", b"configs_h100"), (b"main", b"main"), (b"vis1", b"vis1"), (b"vis2", b"vis2"),
         (b"proxy", b"proxy"), (b"login2", b"login2"), (b"login1", b"login1")]
@@ -59,7 +59,10 @@ def sub(b):
     return b.replace(b"H100", b"H100").replace(b"H100", b"H100").replace(b"h100", b"h100")
 '
 "$FR" --force --refs "${PUB[@]}" --message-callback "$SUB
-return sub(message)" --filename-callback "$SUB
+m = sub(message).replace(b'; links moved to the rewritten public hashes', b'')
+if m.startswith(b'publish_public: the GPIC release'):   # the owner's quotes stay private (owner 2026-11-07)
+    m = b'publish_public: the code release as one import commit; refuse any author or committer other than the owner' + m[m.index(b'\n'):]
+return m" --filename-callback "$SUB
 return sub(filename)" --blob-callback "$SUB
 d = blob.data
 if b'\x00' not in d[:8000]:

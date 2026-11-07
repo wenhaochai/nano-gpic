@@ -1,4 +1,4 @@
-# gpic-baseline: the GPIC ladder speedrun
+# nano-gpic: the GPIC ladder speedrun
 
 This repository hosts the GPIC ladder speedrun: the fastest way to train the full compute ladder of PixelGen's JiT-T2I on [GPIC](https://gpic.stanford.edu) with 8 NVIDIA H100 GPUs. The ladder is seven widths, from 109M to 1.68B parameters, each trained to its budget on GPIC Full: 1, 2, 4, 8, 8, 8 and 8 × C0 from width 640 to 1792 (C0 = 1.43e19 FLOPs; 39 C0, about 5.6e20 FLOPs, in all). We run it to measure scaling laws for pixel-space text-to-image before testing new methods against them, so every hour saved is an hour of the ladder.
 
