@@ -26,7 +26,7 @@ case $LAD in full) PAT='gpic_train_{00000..07999}.tar' SEED=20261106 ;; lite) PA
 case $M in 1|2|4|8) ;; *) echo "multiple must be 1, 2, 4 or 8"; exit 2 ;; esac
 [ $((S % 32)) -eq 0 ] || { echo "C0 steps must be a multiple of 32"; exit 2; }
 [ "$SIZE" = "d$WD" ] || { echo "size $SIZE does not match d $WD"; exit 2; }
-WT=${LADDER_CODE_WT:-$WC/project/gpic-wt/muon_ladder_run2}   # 3338a8c plus lever P (branch ladder-p; owner 2026-11-07: adopt P before the FSDP2 widths start)
+WT=${LADDER_CODE_WT:-$WC/project/gpic-wt/muon_ladder_run3}   # 3338a8c plus levers P and NS (branch ladder-pns; owner 2026-11-07)
 [ -e "$WT/.git" ] || { echo "no worktree $WT"; exit 2; }
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }
 grep -q "update_scale: mup" $WT/baselines/PixelGen/configs_h100/muon_ladder.yaml || { echo "$WT has no Muon ladder config"; exit 2; }
@@ -44,7 +44,7 @@ case $WD in
   1792)             MB=64 FS=1 G=1 ;;
   *) echo "no speed settings for d$WD"; exit 2 ;;
 esac
-export GPIC_MFU_FSDP=$FS GPIC_MFU_FSDP_GROUP=$G GPIC_MFU_FSDP_NOSYNC=1 GPIC_MFU_FUSED_NORM=1 GPIC_MFU_FUSED_QK=1 GPIC_MFU_PATCHIFY=$FS   # lever P at the FSDP2 widths (bit for bit)
+export GPIC_MFU_FSDP=$FS GPIC_MFU_FSDP_GROUP=$G GPIC_MFU_FSDP_NOSYNC=1 GPIC_MFU_FUSED_NORM=1 GPIC_MFU_FUSED_QK=1 GPIC_MFU_PATCHIFY=$FS GPIC_MFU_NS_FUSED=1   # lever P at the FSDP2 widths (bit for bit); lever NS everywhere
 export LADDER_WT=$WT LADDER_RUN_ROOT=$WC/runs/gpic-speed/muon_$LAD LADDER_LAST_EVERY=$((S / 8))
 mkdir -p $LADDER_RUN_ROOT/exp_ladder_$SIZE
 [ -s $LADDER_RUN_ROOT/exp_ladder_$SIZE/shard_seed.txt ] || echo $SEED > $LADDER_RUN_ROOT/exp_ladder_$SIZE/shard_seed.txt
