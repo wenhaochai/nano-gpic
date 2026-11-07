@@ -55,7 +55,7 @@ def ref64(x, a, gate, w, shift, scale, has_res):
     with torch.no_grad():   # the fp32 rounding scale of the kernel's unrounded intermediates
         noise_h = 4e-7 * ((n_r * (1 + SC)).abs() + SH.abs())
         noise_x = 4e-7 * (X.abs() + (G * A).abs()) if has_res else None
-    return (X, A, G, Wt, SH, SC), xn_r, h, noise_x, noise_h
+    return (X, A, G, Wt, SH, SC), xn_r, h, noise_x, noise_h, n_r.detach()
 
 
 def check(B, N, C, has_res, use_dxn, seed):
@@ -68,13 +68,12 @@ def check(B, N, C, has_res, use_dxn, seed):
         xn, h = res_mod_rmsnorm(X, A, G, Wt, SH, SC, EPS)
     else:
         h = mod_rmsnorm(X, Wt, SH, SC, EPS); xn = None
-    L64, xn64, h64, noise_x, noise_h = ref64(x, a, gate, w, shift, scale, has_res)
+    L64, xn64, h64, noise_x, noise_h, n64 = ref64(x, a, gate, w, shift, scale, has_res)
     r_h = rounding_ratio(h.detach(), h64.detach(), noise_h)
     if DEV == "cuda":   # the GPU's rsqrt (libdevice, as Inductor and torch use) is approximate: n may flip by one bf16 ulp
         with torch.no_grad():
             ulp = lambda v: torch.pow(2.0, torch.floor(torch.log2(v.abs().clamp_min(2.0 ** -126))) - 7)
-            sh64, sc64 = L64[4].detach(), L64[5].detach()
-            n64 = (h64.detach() - sh64) / (1 + sc64)
+            sc64 = L64[5].detach()
             strict = 0.5 * ulp(h64.detach()) + noise_h
             flips = float(((h.detach().double() - h64.detach()).abs() > strict).float().mean())
             r_h = rounding_ratio(h.detach(), h64.detach(), noise_h + ulp(n64) * (1 + sc64).abs())

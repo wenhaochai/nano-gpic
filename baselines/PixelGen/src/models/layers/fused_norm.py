@@ -32,7 +32,9 @@ except ImportError:
 INTERP = os.environ.get("TRITON_INTERPRET") == "1"            # CPU tests: no libdevice in the interpreter
 _launch = (lambda k: k) if INTERP else wrap_triton            # (the interpreter's kernels are not JITFunctions)
 ROWS_F = int(os.environ.get("GPIC_MFU_FUSED_NORM_ROWS_F", "4"))    # rows per forward program
-ROWS_B = int(os.environ.get("GPIC_MFU_FUSED_NORM_ROWS_B", "16"))   # rows per backward program (all of one sample)
+ROWS_B = int(os.environ.get("GPIC_MFU_FUSED_NORM_ROWS_B", "0"))    # rows per backward program (all of one sample); 0:
+# 16 up to C = 1024, else 32 (w1468, profiler GPU time of site 2: d1024 0.144 ms at 16 rows against 0.160 at 32; d1280
+# 0.186 at 32 against 0.204 at 16; d1792 0.227 against 0.244)
 
 
 def _warps(block_c):
@@ -182,7 +184,8 @@ def res_mod_rmsnorm_bwd(dh: torch.Tensor, dxn: torch.Tensor, xn: torch.Tensor, a
     """Returns dx, da, and the fp32 column sums: d_gate [B, C], d_w [C], d_shift [B, C], d_scale [B, C] (empty da and
     d_gate without the residual)."""
     B, N, C = xn.shape
-    tiles = triton.cdiv(N, ROWS_B)
+    rows_b = ROWS_B or (16 if C <= 1024 else 32)
+    tiles = triton.cdiv(N, rows_b)
     P = B * tiles
     dhc = dh.contiguous()
     xnc = xn.contiguous()
@@ -200,7 +203,7 @@ def res_mod_rmsnorm_bwd(dh: torch.Tensor, dxn: torch.Tensor, xn: torch.Tensor, a
     BC = triton.next_power_of_2(C)
     _launch(_bwd_kernel)[(P,)](
         dhc, dxn.contiguous() if has_dxn else dhc, xnc, ac, g, w, sc, rstd, dx, da, psh, psc, pg, pw, N, C, tiles, s_g, s_sc,
-        HAS_RES=has_res, HAS_DXN=has_dxn, BLOCK_C=BC, ROWS=ROWS_B, INTERP=INTERP, num_warps=_warps(BC))
+        HAS_RES=has_res, HAS_DXN=has_dxn, BLOCK_C=BC, ROWS=rows_b, INTERP=INTERP, num_warps=_warps(BC))
     dsh = psh.view(B, tiles, C).sum(1)
     dsc = psc.view(B, tiles, C).sum(1)
     dw = pw.sum(0)

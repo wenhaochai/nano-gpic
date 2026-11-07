@@ -98,7 +98,7 @@ def main():
                     print(f"   rows {rows} warps {warps}: {type(e).__name__}"); continue
                 best = min(best or (9e9, 0, 0), (tk, rows, warps))
                 print(f"   site 2 GPU time, backward rows per program {rows}, warps {warps}: {tk:.3f} ms")
-        fn.ROWS_B = 16
+        fn.ROWS_B = 0
         os.environ.pop("GPIC_MFU_FUSED_NORM_WARPS", None)
         print(f"d{C} best site-2 setting: rows {best[1]}, warps {best[2]}: {best[0]:.3f} ms GPU time")
 
