@@ -26,6 +26,10 @@ export GPIC_MFU_ATTN=fa3 GPIC_MFU_GPU_RESIZE=1 GPIC_MFU_UINT8=1 GPIC_MFU_FUSED_N
 cd $WT
 CUDA_VISIBLE_DEVICES=0 python tools/mfu/tests/test_gpu_decode.py 2>&1 | grep -v -i warn | tail -9 | tee -a $OUT/summary.txt
 grep -q "GPU_DECODE_TEST PASS" $OUT/summary.txt || { echo "the GPU decoding test failed"; exit 1; }
+# lever C's axis-split resize kernels against the generic one (bit for bit, timed), and FP8 phase 3's GPU test: recorded,
+# not gating the decoding arms
+CUDA_VISIBLE_DEVICES=0 python tools/mfu/resize_bench.py 0 128 2>&1 | grep -v -i warn | tail -2 | tee -a $OUT/summary.txt
+CUDA_VISIBLE_DEVICES=0 python tools/mfu/tests/test_fp8_native.py 2>&1 | grep -v -i warn | tail -12 | tee -a $OUT/summary.txt
 MUON=(--config configs_h100/muon_ladder.yaml)
 arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; local rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/summary.txt; }
 for W in "640 9 2" "768 10 2"; do
