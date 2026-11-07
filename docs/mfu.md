@@ -52,18 +52,21 @@ Mean step over 1024-1216 steps (jobs/mfu/v1_parity.sh, probe11, widths.sh; mean 
 | d896 | 41.58 (18.8%) | - | 37.75 (20.7%) | 50.09 | - | w1396 |
 | d1024 | 52.14 (21.5%) | 47.65 (23.5%) | 48.20 (23.3%) | 54.87 | - | w1394 |
 | d1280 | 83.18 / 83.37 (24.2%) | 76.02 (26.5%) | - | 64.86 / 64.98 (31.0%) | 67.04 (A+B+C+D+E) | w1390, w1397 |
-| d1536 | (136.5 median, 5cd3372 smoke w1322) | | | 102.9 median (A+B+C+D+F, smoke w1391) | | |
-| d1792 | (193.0 median, w1322) | | | 145.2 median (w1391) | | |
+| d1536 | 126.00 (26.3%) | - | - | 95.93 (34.6%) | - | w1398 |
+| d1792 | 178.94 (28.1%) | - | - | 136.16 (36.9%) | - | w1398 |
 
 - B (FSDP2) needs a GPU-bound step: it adds host work per block (hooks, per-block graphs), which costs where the host binds
   (d640, d1024) and is hidden from d1280 on. Default: on from d1280.
 - C + D pay where the data path's CPUs bind (d640: -7.6%); E costs more than it saves at d640 even with bucketed rows
   (its per-step gloo plan and two all_to_all calls add host work to a host-bound step). E stays off by default.
+- d1536 and d1792 (w1398): A+B+C+D -23.9% at both. Parity: mean |loss diff| over the last 200 steps 2.27e-3 and 3.35e-3;
+  mean loss over the last 500 steps +0.77% and -0.38% against levers off (other widths: at most 0.31%); the floor (a
+  levers-off repeat at these widths) is w1415.
 - Saves (lever F, w1391): a save step adds up to 15.3 s at d1536 and 21.9 s at d1792 (36.6 s and 57.8 s before).
 
 Full ladder (ladder_full_run: C0 steps 534400 ... 36000, the same FLOPs per C0 at every width; trained to 1, 2, 4, 8, 8, 8,
-8 x C0 from d640 to d1792), GPU-h-weighted MFU (total FLOPs / total time): levers off 22.3%, head defaults 26.8% (d1536
-and d1792 from the smoke medians). GPU-h shares at the head: d640 5%, d768 8%, d896 13%, d1024 24%, d1280 18%, d1536 17%,
+8 x C0 from d640 to d1792), GPU-h-weighted MFU (total FLOPs / total time): levers off 22.9%, head defaults 27.4%; the
+ladder as it runs (d640-d1024 on the frozen code, d1280-d1792 with A+B+C+D+F) 26.2%. GPU-h shares at the head: d640 5%, d768 8%, d896 13%, d1024 24%, d1280 18%, d1536 17%,
 d1792 16%; d1024 is the largest share and the one with the most left (A+C+D 48.2 ms against 38.6 ms on one GPU).
 
 B's checks besides the loss (2026-11-06): the EMA (tools/mfu/check_ema.py; on the tensors whose initial value is fixed,
