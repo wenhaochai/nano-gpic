@@ -8,9 +8,10 @@ at our shapes (tools/mfu/fp8_gemm_bench.py, w1879). Here:
   amax, no state carried across steps, so resumes and FSDP2 see nothing new); weights get one scale per output channel;
 - the SwiGLU's silu(z1) * z2 is written straight as FP8 rows for w3 (its bf16 output, 4C wide, is never stored);
 - the forward GEMMs run in FP8 (torch._scaled_mm, e4m3, fast accumulation, bf16 output); the backward stays in bf16
-  (phase 1): dgrad from the bf16 weight, wgrad from the saved FP8 activations dequantized (the values the forward used).
+  (phase 1): dgrad from the bf16 weight, wgrad from the bf16 input (qkv_x, proj, w12: their producers write it anyway) or
+  from the saved FP8 product dequantized (w3: the SwiGLU product is never stored in bf16).
 Changes the numerics: the forward GEMM inputs are rounded to e4m3 (3 mantissa bits) per row; the master weights stay as
-they are (fp32 under DDP, the FSDP2 bf16 compute copy). Activation memory of the four GEMM inputs halves.
+they are (fp32 under DDP, the FSDP2 bf16 compute copy). The SwiGLU product is kept in FP8 (half its bf16 memory).
 """
 import torch
 import triton
@@ -129,17 +130,18 @@ class _Fp8Linear(torch.autograd.Function):
         y = _mm(xq, sx, wq, sw)
         if b is not None:
             y = y + b.to(y.dtype)
-        ctx.save_for_backward(xq, sx, w)
+        # the bf16 input itself for the weight gradient: its producer (K, FA3) writes it anyway, so keeping it costs the
+        # memory the bf16 path keeps and no dequantization pass
+        ctx.save_for_backward(x2, w)
         ctx.has_b, ctx.shape, ctx.wdt = b is not None, shape, w.dtype
         return y.view(*shape[:-1], w.shape[0])
 
     @staticmethod
     def backward(ctx, dy):
-        xq, sx, w = ctx.saved_tensors
+        x2, w = ctx.saved_tensors
         dy2 = dy.reshape(-1, dy.shape[-1]).to(torch.bfloat16)
         dx = (dy2 @ w.to(torch.bfloat16)).view(ctx.shape)
-        xd = (xq.to(torch.float32) * sx).to(torch.bfloat16)
-        dw = (dy2.t() @ xd).to(ctx.wdt)
+        dw = (dy2.t() @ x2).to(ctx.wdt)
         db = dy2.sum(0).to(ctx.wdt) if ctx.has_b else None
         return dx, dw, db
 
