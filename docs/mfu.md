@@ -580,7 +580,13 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   transposes come from one pass in the forward (bit for bit tcast's), so the backward makes no transposed copy.
   Expected: the amax passes, the second read of z and of dz, and the backward's weight transposes, about 2 GB a block at
   d1536.
-- Next: FP8 weight gradients; the casts fused into K's outputs.
+- Phase 3 result (w1944, pairs, ladder setting, against phase 2): d1024 -2.9%, d1280 -0.6%, d1536 -0.5%, d1792 -0.6%.
+  The opaque custom ops cost about 0.1 ms of host time a call; 107fb33 makes them triton ops with the state as an explicit
+  mutated argument (compiled = eager with and without the C++ wrapper). Phase 4 (native4, FP8 weight gradients and
+  attention dgrads): w1952.
+- A pitfall: equal early losses do not show that a numerics change is inactive. bf16 against FP8 phase 2 is bit-identical
+  for the first 18-23 steps (w1918), because adaLN-zero gates keep the blocks out of the loss at first.
+- Next: the casts fused into K's outputs.
 
 ### C2. GPU JPEG decoding (`GPIC_MFU_GPU_DECODE=1|2`, with lever C; owner 2026-11-07: 「可以用GPU解码」)
 - Why: the workers' JPEG decode binds d640 and d768 (96 cores give about 13.4k images/s; d640 median step 61-66 ms, mean
