@@ -41,23 +41,24 @@ backward 115.5, optimizer 27.8. The backward is 2.7-2.85 x the forward: it inclu
 NCCL picks NVLS + Simple for the 1000 MiB buckets; a 1 GB bucket takes 13-15 ms while the backward runs beside it and 5.6
 ms alone (334 GB/s), so the all-reduce and the backward kernels slow each other.
 
-## Best measured configuration per width (2026-11-06 evening; production path, 8 H100, the same batches)
+## Best measured configuration per width (2026-11-07 00:1x; production path, 8 H100, the same batches)
 
 | width | switches (jobs/train_ladder.sh) | step | MFU | levers off | job |
 |---|---|---|---|---|---|
 | d640 | A C D (defaults) | 24.4 ms | 13.8% | 26.3 ms, 12.8% | w1394 |
 | d768 | A C D | 29.1 ms | 18.2% | 31.6 ms, 16.8% | w1396 |
 | d896 | A B C D + L + G11 | 35.6 ms | 22.0% | 41.4 ms, 18.9% | w1422 |
-| d1024 | A B C D + L + G6 | 41.3 ms | 27.1% | 52.1 ms, 21.5% | w1418, w1422 |
-| d1280 | A B C D + L + G7, T | 64.3 ms (G7); T -1.9% | 31.3% (32%) | 83.9 ms, 24.0% | w1422, w1421 |
-| d1536 | A B C D | 95.9 ms | 34.6% | 126.0 ms, 26.3% | w1398, w1416 |
-| d1792 | A B C D | 136.2 ms | 36.9% | 178.9 ms, 28.1% | w1398, w1416 |
+| d1024 | A B C D + L + G6 + K + K2 | 40.2 ms | 27.9% | 52.1 ms, 21.5% | w1471 |
+| d1280 | A B C D + L + G7 + K + K2 (T untested on top) | 61.0 ms | 33.0% | 83.9 ms, 24.0% | w1471 |
+| d1536 | A B C D + K + K2 | 91.7 ms | 36.1% | 126.0 ms, 26.3% | w1471 |
+| d1792 | A B C D + K + K2 | 131.0 ms | 38.4% | 178.9 ms, 28.1% | w1471 |
 
 A: GPIC_MFU_ATTN=fa3; B: GPIC_MFU_FSDP=1 (ModelParallelStrategy); C: GPIC_MFU_GPU_RESIZE=1; D: GPIC_MFU_UINT8=1; L:
-GPIC_MFU_LOCAL_OPT=1; G<k>: GPIC_MFU_FSDP_GROUP=k; T: TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
-TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1; F (GPIC_MFU_ASYNC_CKPT=1) for the checkpoints. GPU-h-weighted over the full
-ladder: 22.9% with levers off, 28.4% with this table. The running ladder (d1280-d1792 on f6713be with A+B+C+D+F,
-d640-d1024 on the frozen code): 26.2%. Next: B3 (flat FSDP2 units) for d896-d1280, w1427.
+GPIC_MFU_LOCAL_OPT=1; G<k>: GPIC_MFU_FSDP_GROUP=k; K: GPIC_MFU_FUSED_NORM=1; K2: GPIC_MFU_FUSED_QK=1; T:
+TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 (d1280 -1.9% before K); F
+(GPIC_MFU_ASYNC_CKPT=1) for the checkpoints. GPU-h-weighted over the full ladder: 22.9% with levers off, 28.4% before
+K + K2, 29.5% with this table. The running ladder (d1280-d1792 on f6713be with A+B+C+D+F, d640-d1024 on the frozen
+code): 26.2%. In test: X (CUDA graphs, w1474), F8 (FP8 GEMMs, a numerics change the owner asked for, w1478).
 
 ## Production path (Lightning, real GPIC Lite batches, 8 GPUs, the same batches in every arm), 2026-11-06
 
@@ -333,7 +334,17 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
 ### K and K2 on one GPU (w1468, step_bench, compiled, C++ launcher, FA3; mean step A / A+K / A+K+K2)
 - d1024 38.86 / 37.78 / 36.73 ms (-5.5%); d1280 63.53 / 62.71 / 61.04 (-3.9%); d1536 98.75 / 95.83 / 93.27 (-5.5%);
   d1792 142.32 / 140.42 / 135.76 (-4.6%). Loss relative difference to A about 1e-6 over the first 100 steps (rounding;
-  B's onset was 1e-5). Production test: w1471.
+  B's onset was 1e-5).
+
+### K and K2 on the production path (w1471, 8 GPUs, 2048 steps; mean step without -> with K + K2)
+- d1024 (+L+G6) 41.34 -> 40.21 ms (-2.7%), MFU 27.1% -> 27.9%; d1280 (+L+G7) 63.90 -> 61.01 (-4.5%), 31.5% -> 33.0%;
+  d1536 95.80 -> 91.74 (-4.2%), 34.6% -> 36.1%; d1792 136.80 -> 130.96 (-4.3%), 36.8% -> 38.4%. d1024 gains least:
+  its forward is host-bound, and K and K2 save GPU time.
+- Loss over the last 500 steps, without / with: d1024 0.122221 / 0.121937, d1280 0.117095 / 0.116834, d1536 0.112095 /
+  0.112119, d1792 0.110006 / 0.109274 (-0.67%, at the edge of the 0.60-0.65% spread of three same-math repeats there).
+  The relative loss difference averages 0.5-2e-4 over the first 100 steps (A 1e-8, B 1e-5): K and K2 change the
+  rounding inside every block. (The job's "PARITY PASS" lines test nothing: with two arms the second is the floor.)
+- Decision: K + K2 on for runs not yet started (defaults unchanged until genmodel's OK).
 
 ### X. The compiled blocks as CUDA graphs (`GPIC_MFU_CUDAGRAPH=1`)
 - Hypothesis: the FSDP2 widths' forward is bound by the host (previous section). Inductor's CUDA graphs (mode
