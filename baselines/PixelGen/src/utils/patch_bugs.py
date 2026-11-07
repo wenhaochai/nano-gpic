@@ -36,3 +36,18 @@ if hasattr(_TEL, "_broadcast_sigterm_tensor"):
             _broadcast_sigterm_every_step(self)
 
     _TEL._broadcast_sigterm_tensor = _broadcast_sigterm_sometimes
+
+# Crash fix (genmodel 2026-11-07: Python aborted in none_dealloc in w1204 after 139 min and in w1239, both with
+# TORCHINDUCTOR_CPP_WRAPPER=1, the main thread inside the training step). torch 2.7.1's C++ wrapper
+# (torch/_inductor/codecache.py, CppWrapperCodeCache.extra_parse_arg, pack_tensor_handle_list) puts Py_None into the
+# list of a graph's outputs with PyList_SET_ITEM, which steals a reference that was never taken: every None output of
+# every compiled call (a backward graph returns None for each input without a gradient) drops None's refcount by one,
+# and in Python 3.11 None is not immortal, so at zero the interpreter aborts. Take the reference (Py_NewRef). The
+# template joins the C++ source when a wrapper is loaded (load_pybinding_async), also from the FX graph cache, so the
+# fixed source gets its own hash and compiles once; nothing else changes (tools/mfu/tests/test_none_refcount.py).
+try:
+    from torch._inductor.codecache import CppWrapperCodeCache as _CWC
+    if "? Py_None" in _CWC.extra_parse_arg:
+        _CWC.extra_parse_arg = _CWC.extra_parse_arg.replace("? Py_None", "? Py_NewRef(Py_None)")
+except Exception as _e:   # a newer torch without the template: nothing to fix here
+    print(f"[patch] the Py_None fix of the C++ wrapper was not applied: {_e!r}", flush=True)
