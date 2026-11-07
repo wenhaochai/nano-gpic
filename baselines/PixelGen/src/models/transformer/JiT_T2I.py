@@ -30,7 +30,7 @@ if _FUSED_NORM:
 # (src/models/layers/fused_qk.py; lever A's path); the same ops up to rounding.
 _FUSED_QK = os.environ.get("GPIC_MFU_FUSED_QK", "0") == "1"
 if _FUSED_QK:
-    from src.models.layers.fused_qk import qk_prep
+    from src.models.layers.fused_qk import qk_prep, qk_prep_packed
 
 # MFU lever E (docs/mfu.md): packed captions. With y_pack (a dict, below) the caption tokens of the batch lie back to back,
 # y [S, 2048], S = the sum of the caption lengths: the text blocks and the caption key projections run on the S real tokens
@@ -119,6 +119,10 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, y, pos, mask=None) -> torch.Tensor:
         B, N, C = x.shape
+        if isinstance(mask, dict) and _FUSED_QK:   # lever E with K2: the packed caption keys placed by the kernel
+            q, k, v = qk_prep_packed(self.qkv_x(x), self.kv_y(y), mask["pidx"], mask["kmask"].shape[1], self.q_norm.weight,
+                                     self.k_norm.weight, pos[0], pos[1], self.num_heads, self.q_norm.variance_epsilon)
+            return self.proj_drop(self.proj(fa3_attention(q, k, v, mask["lens"] + N).reshape(B, N, C)))
         if isinstance(mask, dict):   # lever E: packed captions, y [S, C]
             H, Hc, Tp = self.num_heads, C // self.num_heads, mask["kmask"].shape[1]
             q, kx, vx = self.qkv_x(x).view(B, N, 3, H, Hc).unbind(2)
