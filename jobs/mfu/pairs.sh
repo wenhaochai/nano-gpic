@@ -10,7 +10,9 @@
 # Two settings as pairs on the two GPU halves, in the ladder's setting (shared bucket, Muon, A C D K K2, 128 per GPU; d1792
 # 64 x 2): GPUs 0-3 run setting A and GPUs 4-7 setting B at the same widths, 4 GPUs each (global batch 512), the same
 # batches, so each pair compares like for like. Half B starts 150 s later, so each half's cold compile (GPUs idle)
-# overlaps the other half's training. The named tests run on GPU 0 first and must print "<NAME>_TEST PASS". Everything
+# overlaps the other half's training. Half B compiles into its own Inductor and Triton caches: the halves compile the same
+# graphs at the same time, and two processes writing one cache entry left a truncated .so ("file too short", w1889's
+# d1280 arm). The named tests run on GPU 0 first and must print "<NAME>_TEST PASS". Everything
 # comes in as arguments: wq runs a job in a clean environment.
 # usage: pairs.sh <code worktree> <name> <env of A or none> <env of B or none> <tests or none> <width spec>...
 #   env: space-separated VAR=value pairs, e.g. "GPIC_MFU_PATCHIFY=1"; tests: space-separated scripts in tools/mfu/tests,
@@ -55,7 +57,7 @@ half() {   # <gpus> <master port> <env or none> <tag suffix>
 }
 half 0,1,2,3 29521 "$EA" A > $OUT/halfA.log 2>&1 &
 sleep 150
-half 4,5,6,7 29522 "$EB" B > $OUT/halfB.log 2>&1 &
+TORCHINDUCTOR_CACHE_DIR=$WC/cache/inductor/gpic_pairB TRITON_CACHE_DIR=$WC/cache/triton/gpic_pairB half 4,5,6,7 29522 "$EB" B > $OUT/halfB.log 2>&1 &
 wait
 echo "half A: $EA; half B: $EB" | tee -a $OUT/summary.txt
 python - $OUT <<'PY' | tee -a $OUT/summary.txt
