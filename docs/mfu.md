@@ -282,7 +282,11 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   The step builds y_pack without any exchange. The same deal as E, so the same math (a sample keeps its position).
 - Test (CPU, 8 gloo ranks, tools/mfu/tests/test_rebalance_loader.py): exact round trip of the batch format; every
   sample once per step, at its position, with its bytes; busiest rank's caption tokens 1.15-2.16x the mean -> 1.006-1.013x.
-- Result: pending (w1420: d1280 A+B+C+D vs +R, d1024 A+B+C+D+L+G3 vs +R, d640 A+C+D vs +R).
+- First production test (w1420) was invalid: Lightning calls iter() on the training loader once to check that it is
+  iterable and drops the result; the thread started there kept taking every other batch from the shared, persistent
+  worker iterator, so the steps saw other samples than the reference arm (global loss 0.2% off at step 0) and the
+  workers loaded twice as much (d640 waited 6.5 ms per step for data; d1280 +6.1, d1024 +10.4, d640 +8.4 ms). Fix: the
+  thread starts at the first next() (6f73a7e); the CPU test now drops an iterator first. Retest: w1423 (1024 steps).
 
 ### D. uint8 crops (`GPIC_MFU_UINT8=1`)
 - The workers keep the crop as uint8 HWC; the training step maps it with a 256-entry table that train_transform's own
@@ -307,6 +311,18 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   ends its daemon children), never waits forever on a dead writer (exit 97 instead of a silent exit 0).
   tools/mfu/tests/test_async_ckpt_exit.py: old code (no exit wait): file missing, the race reproduced; new: file complete
   and equal, exit 0; writer killed with the write pending: exit 97 after the 10 s check, no hang.
+
+### Review fixes (independent review of 5cd3372..e8bfff4, tmp/ladder_prof/review_mfu_head.md; mfu branch only, 6f73a7e)
+- S1: LightningModel.state_dict joins the EMA stream first (ModelParallelStrategy gathers the state dict before the
+  callbacks' on_save_checkpoint, so a save could read the EMA before the step's lerp finished).
+- S3: the checkpoint writer ignores SIGTERM and SIGINT (a signal no longer cuts a write short and leaves a 13-27 GB
+  .tmp<pid>), exits by itself when its parent is gone, and is killed on the exit-97 path; the first save of a launch
+  removes .tmp<pid> files older than 30 minutes whose writer is dead.
+- M1: the writer saves each tensor on a storage slice of the shared buffer instead of a copy (27 GB less host memory at
+  d1792); torch.save writes the same bytes (checked), and empty tensors get their own storage.
+- M3: the conditioners check on the device (torch._assert_async, no host sync) that every caption mask is
+  left-aligned, as FA3's per-sample key counts assume. (Inductor removes asserts inside compiled graphs.)
+- Tests: tools/mfu/tests/test_async_ckpt.py and test_async_ckpt_exit.py (old / new / dead) pass.
 
 ### C. Data path at the small widths (planned)
 - d640 is bound by the node's CPUs (7.3 ms of worker CPU per image on vis1: decode 2.79, crop and resize 2.25, ToTensor
