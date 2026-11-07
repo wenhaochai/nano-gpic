@@ -49,7 +49,7 @@ for spec in "$@"; do
       --trainer.enable_checkpointing false --model.denoiser.init_args.hidden_size $d --model.denoiser.init_args.num_groups $((d / 64)) \
       --model.denoiser.init_args.num_blocks $nb --model.denoiser.init_args.num_text_blocks $nt \
       --tags.exp mfu_$TAG --trainer.logger.init_args.name mfu_$TAG "${STRAT[@]}" > $OUT/$TAG/train.log 2>&1 )
-  echo "[$(date +%T)] $TAG rc=$?" | tee -a $OUT/summary.txt
+  rc=$?; echo "[$(date +%T)] $TAG rc=$rc" | tee -a $OUT/summary.txt
 done
 python - $OUT $ACC $MICRO <<'PY' | tee -a $OUT/summary.txt
 import json, os, glob, statistics as st, sys

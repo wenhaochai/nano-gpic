@@ -24,7 +24,7 @@ export PIXGEN_SRC=$WT/baselines/PixelGen
 source $WT/jobs/mfu/gpu_checks.sh
 gpu_checks $WT $OUT || { echo "GPU checks failed"; exit 3; }
 bash $WT/jobs/smoke_full.sh $WT all > $OUT/smoke_full.log 2>&1
-echo "[$(date +%T)] smoke_full rc=$?" | tee -a $OUT/summary.txt
+rc=$?; echo "[$(date +%T)] smoke_full rc=$rc" | tee -a $OUT/summary.txt
 grep -h "DONE\|ok\|FAIL\|fail" $OUT/smoke_full.log | tail -15 | tee -a $OUT/summary.txt
 # 3. checkpoint layout against the frozen code's smoke (5cd3372, full_smoke_1106_1433): ms (evaluation) and last (resume)
 SMK=$(ls -dt $WC/runs/gpic-speed/full_smoke_* | head -1)
@@ -44,7 +44,7 @@ echo "[$(date +%T)] eval path rc=$rc sample_check: $chk" | tee -a $OUT/summary.t
 LADDER_WT=$WT LADDER_RUN_ROOT=$OUT/full LADDER_PARTIAL_OK=1 BENCH_OUT=$OUT/full/bench GPIC_SHARD_SEED=20261106 \
   bash $WT/jobs/train_ladder.sh d640 640 9 2 6400 --data.train_dataset.init_args.tar_pattern 'gpic_train_{00000..07999}.tar' \
   --trainer.max_steps 320 --trainer.logger.init_args.name mfu_v2_full --trainer.logger.init_args.id mfu-v2-full-$(date +%s) > $OUT/full.log 2>&1
-echo "[$(date +%T)] full data rc=$?" | tee -a $OUT/summary.txt
+rc=$?; echo "[$(date +%T)] full data rc=$rc" | tee -a $OUT/summary.txt
 python $WT/tools/mfu/bench_summary.py $OUT/full/bench --skip 50 | tee -a $OUT/summary.txt
 rm -f $OUT/full/exp_ladder_d640/*.ckpt
 echo "DONE $OUT"

@@ -25,7 +25,7 @@ export PIXGEN_SRC=$WT/baselines/PixelGen MFU_WT=$WT GPIC_MFU_DET_DATA=1 GPIC_SHA
 export GPIC_MFU_ATTN=fa3 GPIC_MFU_GPU_RESIZE=1 GPIC_MFU_UINT8=1 GPIC_MFU_FUSED_NORM=1 GPIC_MFU_FUSED_QK=1
 cd $WT
 MUON=(--config configs_h100/muon_ladder.yaml)
-arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }
+arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; local rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/summary.txt; }
 GPIC_SHARED_BUCKET=1 MFU_SAVE_EVERY=128 MFU_KEEP_CKPT=1 arm d640_S_to128 640 9 2 128 "${MUON[@]}"
 CK=$(ls $OUT/d640_S_to128/exp_mfu_d640_S_to128/last*.ckpt $OUT/d640_S_to128/last*.ckpt 2>/dev/null | head -1)
 echo "resume from: $CK" | tee -a $OUT/summary.txt

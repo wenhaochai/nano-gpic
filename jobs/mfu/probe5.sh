@@ -26,7 +26,7 @@ export PIXGEN_SRC=$WT/baselines/PixelGen
 ( cd $WT && CUDA_VISIBLE_DEVICES=${G[0]} timeout 300 python tools/mfu/fa3_check.py > $OUT/fa3_check.log 2>&1 ) || { tail -20 $OUT/fa3_check.log; echo "FA3 check failed"; exit 3; }
 export MFU_WT=$WT MFU_LIMIT=720
 FSDP='{"class_path":"lightning.pytorch.strategies.ModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
-arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/phases.txt; }
+arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/phases.txt; }
 arm base1 ${A[@]} 300
 GPIC_MFU_ATTN=fa3 arm A ${A[@]} 300
 GPIC_MFU_ATTN=fa3 GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP arm AB ${A[@]} 300

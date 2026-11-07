@@ -32,7 +32,7 @@ wait
 cd $WT
 MUON=(--config configs_h100/muon_ladder.yaml)
 ADAMW=(--trainer.accumulate_grad_batches 4 --model.ema_tracker.init_args.decay 0.9996)
-arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }
+arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; local rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/summary.txt; }
 L640=(--model.optimizer.init_args.lr 6.4e-4 --model.optimizer.init_args.muon_lr 1.7e-3)
 arm d640_muon 640 9 2 256 "${MUON[@]}" "${L640[@]}"
 MFU_SAVE_EVERY=128 MFU_KEEP_CKPT=1 arm d640_muon_to128 640 9 2 128 "${MUON[@]}" "${L640[@]}"
