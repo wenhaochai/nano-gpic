@@ -12,7 +12,7 @@ import os
 
 import torch
 
-from src.diffusion.flow_matching.gmflow import EPS, forward_transition, image_scope, transition_nll, transition_resp, transition_wins
+from src.diffusion.flow_matching.gmflow import EPS, bridge_mixture, forward_transition, gm_component_ll, image_scope, transition_nll
 from src.diffusion.flow_matching.training_JiT import JiTTrainer, time_shift_fn
 
 SIGMA_BINS = (0.0, 0.25, 0.5, 0.75, 1.0 + 1e-6)
@@ -73,6 +73,7 @@ class GMFlowTrainer(JiTTrainer):
                     pix += f" win_max {ws['gm/win_max'].item():.3f} win_alive {int(ws['gm/win_alive'].item())} w_dead {ws['gm/w_dead'].item():.4f}"
                     if self.anneal_steps:
                         pix += f" step {self.step} tau {tau:.6g} r_neff {ws['gm/r_neff'].item():.3f}"
+                    pix += f" mu_spread {ws['gm/mu_spread'].item():.4g} nll_exact {ws['gm/nll_exact'].item():.5f}"
                 print(f"[gmflow] call {self._calls}: loss {out['loss'].item():.5f} s_u {d['gm/s_u'].item():.4f} n_eff {d['gm/n_eff'].item():.3f} max_w {d['gm/max_w'].item():.3f}{pix}", flush=True)
         return out
 
@@ -82,15 +83,24 @@ class GMFlowTrainer(JiTTrainer):
         """One mixture per image (section 15): in this batch (one rank's images), the largest share of images that one component wins (gets the gradient of its mean),
         the number of components that win at least one image, and w_dead, the mean weight A on the components that win none: a component that never wins is never
         trained, and its weight still sends draws to its untrained candidate (review_image_mix S1). n_eff and max_w do not show this. one_hot, not bincount: bincount
-        on CUDA syncs the host. The winners are those of the exact posterior at every tau. Also tau and r_neff (section 16): exp(entropy) of the responsibilities that
-        weight the gradient at this tau, averaged over the images (1: one candidate gets it all; K: shared equally)."""
-        wins = transition_wins(gm, x_low, x_high, sigma_high, sigma_low)
-        share = torch.nn.functional.one_hot(wins, gm["means"].shape[1]).float().mean(0)                  # (K,)
+        on CUDA syncs the host. The winners are those of the exact posterior at every tau: argmax of log A_k + ll_k, which the temperature does not change.
+        Section 16 (review_image_anneal S1, S2): tau; r_neff, exp(entropy) of the responsibilities that weight the gradient at this tau, averaged over the images
+        (1: one candidate gets it all; K: shared equally); nll_exact, the transition loss at tau = 1 on the scale of gm/nll (the logged loss is the tempered one);
+        mu_spread, the RMS distance of the candidates from their mean in the transition's own std, per value (sqrt of mean_(K,C,H,W) (b_k - mean_k b_k)^2 / s^2 with
+        b_k = c1 x_high + c2 mu_k, averaged over the images), and mu_spread_x, the same for the x-means in pixel units. Candidates that coincide give 0; a split shows
+        as mu_spread rising while r_neff falls. One pass over the component log-likelihoods."""
+        means, logstd = bridge_mixture(gm, x_high, sigma_high, sigma_low)                                 # (B, K, C, H, W), (B, 1, 1, 1, 1)
+        z = gm_component_ll(x_low, means, logstd).sum((-2, -1)) + gm["logweights"].flatten(1)              # (B, K): log A_k + ll_k
+        K, n_pix = z.shape[1], x_low.shape[-2] * x_low.shape[-1]
+        share = torch.nn.functional.one_hot(z.argmax(1), K).float().mean(0)                              # (K,)
         A = gm["logweights"].exp().flatten(1).mean(0)                                                     # (K,)
-        r = transition_resp(gm, x_low, x_high, sigma_high, sigma_low, tau)                                # (B, K)
+        r = (z / tau).softmax(1)                                                                          # (B, K)
         r_neff = torch.exp(-(r * torch.log(r.clamp(min=1e-30))).sum(1)).mean()
+        spread = lambda m: (m - m.mean(1, keepdim=True)).square().flatten(1).mean(1)                      # (B,): mean over (K, C, H, W)
         return {"gm/win_max": share.max(), "gm/win_alive": (share > 0).sum().float(), "gm/w_dead": (A * (share == 0)).sum(),
-                "gm/tau": r.new_full((), tau), "gm/r_neff": r_neff}   # new_full: a fill kernel; torch.tensor(float, device) is a pageable copy (a host sync, perf C7)
+                "gm/tau": r.new_full((), tau), "gm/r_neff": r_neff,   # new_full: a fill kernel; torch.tensor(float, device) is a pageable copy (a host sync, perf C7)
+                "gm/nll_exact": (-torch.logsumexp(z, dim=1) / n_pix).mean(),
+                "gm/mu_spread": (spread(means) / torch.exp(2 * logstd).flatten()).sqrt().mean(), "gm/mu_spread_x": spread(gm["means"]).sqrt().mean()}
 
     @staticmethod
     @torch.no_grad()
