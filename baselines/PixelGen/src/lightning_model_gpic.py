@@ -108,6 +108,9 @@ class LightningModel(pl.LightningModule):
         # no_grad(self.diffusion_sampler)
         no_grad(self.ema_denoiser)
 
+        if os.environ.get("GPIC_MFU_FP8"):   # MFU lever F8: FP8 GEMMs in the blocks (src/utils/fp8.py; changes the numerics)
+            from src.utils.fp8 import convert_fp8
+            convert_fp8(self.denoiser, os.environ["GPIC_MFU_FP8"])
         if os.environ.get("GPIC_MFU_FSDP") == "1":   # MFU lever B: FSDP2 per block, same math (src/utils/fsdp_setup.py)
             from src.utils.fsdp_setup import shard
             mesh = self.trainer.strategy.device_mesh["data_parallel"]
