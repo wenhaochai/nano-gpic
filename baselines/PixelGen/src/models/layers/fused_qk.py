@@ -84,10 +84,11 @@ def _fwd_image(QKV, WQ, WK, COS, SIN, Q, K, V, RQ, RK, n_rows, N, T, H, C, eps,
         _store_pairs(V + kv_row * C, e, o, BH, HC, H, ok, INTERP)
 
 
+# The caption row's sample b and position t, and whether it is a real token. Padded layout: row = b * T + t. Packed
+# layout (lever E): row s of y [S, 2C] goes to padded row PIDX[s] = b * T + t; a dummy row has PIDX[s] = B * T.
+# (No docstring inside a jit function: Inductor's C++ launcher copies the source into a string, and the quotes break it.)
 @triton.jit
 def _text_row(PIDX, row, n_rows, T, BT, PACKED: tl.constexpr):
-    """The caption row's sample b and position t, and whether it is a real token. Padded layout: row = b * T + t.
-    Packed layout (lever E): row s of y [S, 2C] goes to padded row PIDX[s] = b * T + t; a dummy row has PIDX[s] = B * T."""
     inr = row < n_rows
     if PACKED:
         p = tl.load(PIDX + row, mask=inr, other=BT)
