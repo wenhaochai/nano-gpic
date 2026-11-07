@@ -249,6 +249,30 @@ def _decode_on_side(datas, dev):
     return imgs, done
 
 
+# The decoded JPEGs' crop rows (planar RGB from nvJPEG) into the source buffer as interleaved RGB, all images in one launch:
+# a row of the table holds the address of the image's row r0, its plane stride H x W, W, the rows r1 - r0 and the byte
+# offset in the source buffer. (Per-image torch copies cost 4 Python calls each, about 4 ms of the GIL a batch in
+# DecodeAhead's thread, while the training thread needs it: w1896's d768 arm ran 2.8% slower with the GPU decode.)
+@triton.jit
+def _gather_kernel(TAB, DST, BR: tl.constexpr, BW: tl.constexpr):
+    k = tl.program_id(0)
+    rb = tl.program_id(1)
+    wb = tl.program_id(2)
+    W = tl.load(TAB + k * 5 + 2).to(tl.int32)
+    R = tl.load(TAB + k * 5 + 3).to(tl.int32)
+    if (rb * BR < R) & (wb * BW < W):
+        src = tl.load(TAB + k * 5).to(tl.pointer_type(tl.uint8))
+        plane = tl.load(TAB + k * 5 + 1)
+        dst = DST + tl.load(TAB + k * 5 + 4)
+        r = rb * BR + tl.arange(0, BR)
+        x = wb * BW + tl.arange(0, BW)
+        m = (r < R)[:, None] & (x < W)[None, :]
+        pix = r.to(tl.int64)[:, None] * W + x[None, :]
+        for c in tl.static_range(3):
+            v = tl.load(src + c * plane + pix, mask=m, other=0)
+            tl.store(dst + pix * 3 + c, v, mask=m)
+
+
 def _sources(job, dev):
     """The batch's source buffer on dev, built on the caller's current stream: the CPU items' bytes, then the JPEG items
     decoded by nvJPEG (rows r0:r1, HWC)."""
@@ -263,13 +287,22 @@ def _sources(job, dev):
     src = torch.empty(job["src_bytes"], dtype=torch.uint8, device=dev)
     if job["pix_bytes"]:
         src[:job["pix_bytes"]].copy_(job["src"], non_blocking=True)
-    if done is not None:
-        cur.wait_event(done)
+    if cur is None:
+        for img, (_, _, H, W, r0, r1, off) in zip(imgs, jp.index):
+            assert tuple(img.shape) == (3, H, W), (tuple(img.shape), H, W)
+            src[off:off + (r1 - r0) * W * 3].view(r1 - r0, W, 3).copy_(img[:, r0:r1].permute(1, 2, 0))
+        return src
+    rows = []
     for img, (_, _, H, W, r0, r1, off) in zip(imgs, jp.index):
-        assert tuple(img.shape) == (3, H, W), (tuple(img.shape), H, W)
-        src[off:off + (r1 - r0) * W * 3].view(r1 - r0, W, 3).copy_(img[:, r0:r1].permute(1, 2, 0))
-        if cur is not None:
-            img.record_stream(cur)   # its block goes back to the decode stream's pool only after these copies ran
+        assert img.shape == (3, H, W) and img.is_contiguous(), (tuple(img.shape), H, W)
+        rows.append((img.data_ptr() + r0 * W, H * W, W, r1 - r0, off))
+    tab = torch.tensor(rows, dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
+    cur.wait_event(done)
+    BR, BW = 4, 256
+    grid = (len(rows), triton.cdiv(max(r[3] for r in rows), BR), triton.cdiv(max(r[2] for r in rows), BW))
+    _gather_kernel[grid](tab, src, BR=BR, BW=BW, num_warps=4)
+    for img in imgs:
+        img.record_stream(cur)   # its block goes back to the decode stream's pool only after the gather ran
     return src
 
 
