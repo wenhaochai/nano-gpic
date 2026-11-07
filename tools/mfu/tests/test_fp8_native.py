@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Native rowwise FP8 (src/models/layers/fp8_native.py), one GPU.
-1. rowcast: e4m3 values and row scales bit for bit the plain-torch quantization (reference()'s).
+"""Native tensorwise FP8 (src/models/layers/fp8_native.py), one GPU.
+1. tcast: e4m3 values and the tensor's scale bit for bit the plain-torch quantization (reference()'s).
 2. fp8_linear forward against the dequantized-GEMM reference (fp32 accumulation): relative error at fp32/bf16 level; and
    against the bf16 GEMM: the size of the FP8 rounding (reported).
 3. Its backward: dx = dy W and dw = dy^T x (the bf16 input), bf16 GEMMs, against fp32 references.
 4. SwiGLU + w3: forward against the reference on the model's bf16 product, backward dz against autograd of the bf16
    SwiGLU at the same w3, dw3 against dy^T a_q.
-5. Phase 2, the fused MLP (FP8 dgrads): the forward bit for bit phase 1's; the SwiGLU backward kernel's FP8 rows bit for
-   bit the row cast of its own bf16 dz; dx, dw12 and dw3 against fp32 autograd of the bf16 MLP (FP8 dgrad error reported).
+5. Phase 2, the fused MLP (FP8 dgrads): the forward bit for bit phase 1's; the SwiGLU backward's FP8 copy bit for bit the
+   tensorwise cast of its own bf16 dz; dx, dw12 and dw3 against fp32 autograd of the bf16 MLP (FP8 dgrad error reported).
 usage: python test_fp8_native.py"""
 import os, sys
 import torch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "baselines", "PixelGen")))
-from src.models.layers.fp8_native import rowcast, fp8_linear, fp8_swiglu_w3, fp8_mlp, reference, swiglu_rowcast, swiglu_bwd, FMAX, E4  # noqa
+from src.models.layers.fp8_native import tcast, fp8_linear, fp8_swiglu_w3, fp8_mlp, reference, swiglu_tcast, swiglu_bwd, FMAX, E4  # noqa
 
 dev, BF = "cuda", torch.bfloat16
 torch.manual_seed(0)
@@ -28,10 +28,10 @@ for M, K, N in ((4096, 640, 1920), (2048, 1280, 5120), (1000, 1792, 1792)):
     x[3] = 0
     w = torch.randn(N, K, device=dev) * 0.02
     b = torch.randn(N, device=dev) * 0.1
-    q, s = rowcast(x)
-    a = x.float().abs().amax(1, keepdim=True).clamp_min(1e-12)
+    q, s = tcast(x)
+    a = x.float().abs().amax().clamp_min(1e-12)
     rq = (x.float() * (FMAX / a)).clamp(-FMAX, FMAX).to(E4)
-    same = torch.equal(q.view(torch.uint8), rq.view(torch.uint8)) and torch.allclose(s, a / FMAX, rtol=0, atol=0)
+    same = torch.equal(q.view(torch.uint8), rq.view(torch.uint8)) and torch.equal(s, (a / FMAX).view(1))
     y = fp8_linear(x, w, b)
     yr = reference(x, w, b)
     yb = (x.float() @ w.float().t() + b).to(BF)
@@ -44,7 +44,7 @@ for M, K, N in ((4096, 640, 1920), (2048, 1280, 5120), (1000, 1792, 1792)):
     e_dx, e_dw, e_db = rel(xl.grad, dx_r), rel(wl.grad, dw_r), rel(bl.grad, dy.float().sum(0))
     good = same and e_ref < 5e-3 and e_dx < 6e-3 and e_dw < 6e-3 and e_db < 6e-3 and torch.isfinite(y).all()
     ok &= bool(good)
-    print(f"linear M={M} K={K} N={N}: rowcast bit for bit {same}; y vs dequantized reference {e_ref:.1e}, vs bf16 GEMM {e_bf:.1e} "
+    print(f"linear M={M} K={K} N={N}: tcast bit for bit {same}; y vs dequantized reference {e_ref:.1e}, vs bf16 GEMM {e_bf:.1e} "
           f"(FP8 rounding); dx {e_dx:.1e} dw {e_dw:.1e} db {e_db:.1e}" + ("" if good else "  FAIL"))
 
 for M, C in ((2048, 640), (1024, 1280)):
@@ -57,7 +57,7 @@ for M, C in ((2048, 640), (1024, 1280)):
     a = torch.nn.functional.silu(z1) * z2            # the model's bf16 product
     yr = reference(a, w3)
     yb = (a.float() @ w3.float().t()).to(BF)
-    aq, sa = swiglu_rowcast(z)
+    aq, sa = swiglu_tcast(z)
     dy = torch.randn(M, C, device=dev).to(BF)
     y.backward(dy)
     zr = z.clone().float().requires_grad_()
@@ -87,12 +87,12 @@ for M, C in ((2048, 640), (1024, 1280)):
     z = (x.float() @ w12.float().t()).to(BF)   # close to the FP8 forward's z; only for the kernel check below
     da = torch.randn(M, H, device=dev).to(BF)
     dz, dzq, sdz = swiglu_bwd(z, da)
-    q2, s2 = rowcast(dz)
+    q2, s2 = tcast(dz)
     kern = torch.equal(dzq.view(torch.uint8), q2.view(torch.uint8)) and torch.equal(sdz, s2)
     e_dx, e_w12, e_w3 = rel(L[0].grad, R[0].grad), rel(L[1].grad, R[1].grad), rel(L[2].grad, R[2].grad)
     good = same_fwd and kern and e_dx < 8e-2 and e_w12 < 8e-2 and e_w3 < 8e-2 and torch.isfinite(L[0].grad).all()
     ok &= bool(good)
-    print(f"mlp phase 2 M={M} C={C}: forward bit for bit phase 1 {same_fwd}; SwiGLU backward FP8 rows bit for bit {kern}; "
+    print(f"mlp phase 2 M={M} C={C}: forward bit for bit phase 1 {same_fwd}; SwiGLU backward FP8 copy bit for bit {kern}; "
           f"vs fp32 autograd: dx {e_dx:.1e} dw12 {e_w12:.1e} dw3 {e_w3:.1e}" + ("" if good else "  FAIL"))
 print("FP8_NATIVE_TEST " + ("PASS" if ok else "FAIL"))
 sys.exit(0 if ok else 1)
