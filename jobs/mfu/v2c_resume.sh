@@ -31,7 +31,7 @@ for mode in ${V2_MODES:-fsdp}; do
   # flat parameters into the original keys on save and rebuilds them on load
   [ $mode = flat ] && export GPIC_MFU_FSDP=1 GPIC_MFU_FSDP_FLAT=1 GPIC_MFU_LOCAL_OPT=1 GPIC_MFU_FSDP_GROUP=3
   bash $WT/jobs/smoke_full.sh $WT resume > $OUT/smoke_$mode.log 2>&1
-  echo "[$(date +%T)] smoke resume ($mode) rc=$?" | tee -a $OUT/summary.txt
+  rc=$?; echo "[$(date +%T)] smoke resume ($mode) rc=$rc" | tee -a $OUT/summary.txt
   SMK=$(ls -dt $WC/runs/gpic-speed/full_smoke_* | head -1)
   grep -h " ok\| FAIL\|CHECKS" $SMK/phases.log | tee -a $OUT/summary.txt
   N=$SMK/resume/exp_ladder_d640

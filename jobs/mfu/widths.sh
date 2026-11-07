@@ -35,7 +35,7 @@ FSDP='{"class_path":"lightning.pytorch.strategies.ModelParallelStrategy","init_a
 FSDP_FLAT='{"class_path":"src.utils.fsdp_setup.FlatModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
 # letter N (with B): FSDP2 without the gradient sync and the reshard in the micro-batches before an optimizer step
 FSDP_NOSYNC='{"class_path":"src.utils.fsdp_setup.NoSyncModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
-arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }
+arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; local rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/summary.txt; }
 geom() { case $1 in 640) echo "9 2" ;; 768) echo "10 2" ;; 896) echo "11 2" ;; 1024) echo "12 3" ;; 1280) echo "14 3" ;; 1536) echo "16 4" ;; 1792) echo "18 4" ;; esac; }
 for spec in "$@"; do
   d=${spec%%:*}; sets=${spec#*:}

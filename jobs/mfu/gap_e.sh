@@ -26,7 +26,7 @@ for t in test_fused_qk_packed test_fused_qk; do python tools/mfu/tests/$t.py 2>&
 grep -q "FUSED_QK_PACKED_TEST PASS" $OUT/summary.txt || { echo "packed K2 test failed on the GPU"; exit 1; }
 MUON=(--config configs_h100/muon_ladder.yaml)
 FS='{"class_path":"src.utils.fsdp_setup.NoSyncModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
-arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }
+arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; local rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/summary.txt; }
 GPIC_MFU_PACK=1 BENCH_PROFILE=600:606 MFU_MICRO=128 arm d640_ddp_m128_EK 640 9 2 2048 "${MUON[@]}" --data.train_dataset.init_args.group_window 128
 GPIC_MFU_PACK=1 BENCH_PROFILE=300:306 MFU_MICRO=128 arm d1024_ddp_m128_EK 1024 12 3 1024 "${MUON[@]}" --data.train_dataset.init_args.group_window 128
 GPIC_MFU_PACK=1 GPIC_MFU_FSDP=1 GPIC_MFU_FSDP_GROUP=7 MFU_STRATEGY=$FS BENCH_PROFILE=300:306 MFU_MICRO=128 arm d1280_fsdp_m128_EK 1280 14 3 1024 "${MUON[@]}" --data.train_dataset.init_args.group_window 128

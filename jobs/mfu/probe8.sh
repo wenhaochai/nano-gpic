@@ -22,7 +22,7 @@ git -C $WT rev-parse HEAD > $OUT/commit.txt
 python $WT/tools/gpu_health.py > $OUT/gpu_health.txt 2>&1 || { tail -3 $OUT/gpu_health.txt; echo "unhealthy GPU on $(hostname); exit 98"; exit 98; }
 export PIXGEN_SRC=$WT/baselines/PixelGen MFU_WT=$WT MFU_LIMIT=600 MFU_KEEP_CKPT=1 MFU_SAVE_EVERY=100
 FSDP='{"class_path":"lightning.pytorch.strategies.ModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
-arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }
+arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; local rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/summary.txt; }
 last() { ls -t $OUT/$1/last*.ckpt $OUT/$1/exp_mfu_$1/last*.ckpt 2>/dev/null | head -1; }
 GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP GPIC_MFU_ASYNC_CKPT=1 arm fsdp_a 640 9 2 200
 GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP GPIC_MFU_ASYNC_CKPT=1 MFU_RESUME=$(last fsdp_a) arm fsdp_b 640 9 2 300

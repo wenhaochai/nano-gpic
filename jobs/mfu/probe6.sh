@@ -34,7 +34,7 @@ run loss_ddp_a --d 640 --steps 200 --record
 run loss_ddp_b --d 640 --steps 200 --record
 run loss_fsdp --d 640 --steps 200 --record --fsdp
 export MFU_WT=$WT MFU_LIMIT=780
-arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }
+arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; local rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/summary.txt; }
 MFU_SAVE_EVERY=100 arm save_sync 1792 18 4 300
 MFU_SAVE_EVERY=100 GPIC_MFU_ASYNC_CKPT=1 arm save_async 1792 18 4 300
 python tools/mfu/bench_summary.py $OUT/save_sync $OUT/save_async --skip 20 | tee -a $OUT/summary.txt

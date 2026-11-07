@@ -26,7 +26,7 @@ export GPIC_MFU_ATTN=fa3 GPIC_MFU_GPU_RESIZE=1 GPIC_MFU_UINT8=1 GPIC_MFU_FUSED_N
 cd $WT
 MUON=(--config configs_h100/muon_ladder.yaml --data.train_dataset.init_args.group_window 128)
 FS='{"class_path":"src.utils.fsdp_setup.NoSyncModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
-arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }
+arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; local rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/summary.txt; }
 MFU_MICRO=128 arm d640_ddp_m128_E 640 9 2 2048 "${MUON[@]}"
 MFU_MICRO=128 arm d1024_ddp_m128_E 1024 12 3 1024 "${MUON[@]}"
 GPIC_MFU_FSDP=1 GPIC_MFU_FSDP_GROUP=7 MFU_STRATEGY=$FS MFU_MICRO=128 arm d1280_fsdp_m128_E 1280 14 3 1024 "${MUON[@]}"

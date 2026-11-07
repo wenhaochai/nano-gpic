@@ -27,7 +27,7 @@ EWT=$WC/project/gpic-wt/gmflow_run4
 for mode in default fsdp; do
   [ $mode = fsdp ] && export GPIC_MFU_FSDP=1
   bash $WT/jobs/smoke_full.sh $WT resume > $OUT/smoke_$mode.log 2>&1
-  echo "[$(date +%T)] smoke resume ($mode) rc=$?" | tee -a $OUT/summary.txt
+  rc=$?; echo "[$(date +%T)] smoke resume ($mode) rc=$rc" | tee -a $OUT/summary.txt
   SMK=$(ls -dt $WC/runs/gpic-speed/full_smoke_* | head -1)
   grep -h " ok\| FAIL\|CHECKS" $SMK/phases.log | tee -a $OUT/summary.txt
   N=$SMK/resume/exp_ladder_d640

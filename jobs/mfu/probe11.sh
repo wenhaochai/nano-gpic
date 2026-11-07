@@ -25,7 +25,7 @@ source $WT/jobs/mfu/gpu_checks.sh
 gpu_checks $WT $OUT || { echo "GPU checks failed"; exit 3; }
 export MFU_WT=$WT MFU_LIMIT=720 GPIC_MFU_DET_DATA=1 GPIC_SHARD_SEED=20261106
 FSDP='{"class_path":"lightning.pytorch.strategies.ModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
-arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }
+arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; local rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/summary.txt; }
 arm d640_off 640 9 2 1024
 GPIC_MFU_ATTN=fa3 GPIC_MFU_UINT8=1 GPIC_MFU_GPU_RESIZE=1 arm d640_ACD 640 9 2 1024
 GPIC_MFU_ATTN=fa3 GPIC_MFU_UINT8=1 GPIC_MFU_GPU_RESIZE=1 GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1 arm d640_ACDE 640 9 2 1024
