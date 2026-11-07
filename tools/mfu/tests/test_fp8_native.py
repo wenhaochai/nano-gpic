@@ -3,7 +3,7 @@
 1. rowcast: e4m3 values and row scales bit for bit the plain-torch quantization (reference()'s).
 2. fp8_linear forward against the dequantized-GEMM reference (fp32 accumulation): relative error at fp32/bf16 level; and
    against the bf16 GEMM: the size of the FP8 rounding (reported).
-3. Its backward: dx = dy W and dw = dy^T x_q (the values the forward used), bf16 GEMMs, against fp32 references.
+3. Its backward: dx = dy W and dw = dy^T x (the bf16 input), bf16 GEMMs, against fp32 references.
 4. SwiGLU + w3: forward against the reference on the model's bf16 product, backward dz against autograd of the bf16
    SwiGLU at the same w3, dw3 against dy^T a_q.
 usage: python test_fp8_native.py"""
@@ -38,7 +38,7 @@ for M, K, N in ((4096, 640, 1920), (2048, 1280, 5120), (1000, 1792, 1792)):
     dy = torch.randn(M, N, device=dev).to(BF)
     fp8_linear(xl, wl, bl).backward(dy)
     dx_r = dy.float() @ w.float()
-    dw_r = dy.float().t() @ (q.float() * s)
+    dw_r = dy.float().t() @ x.float()          # the bf16 input (fp8_linear keeps it for the weight gradient)
     e_dx, e_dw, e_db = rel(xl.grad, dx_r), rel(wl.grad, dw_r), rel(bl.grad, dy.float().sum(0))
     good = same and e_ref < 5e-3 and e_dx < 6e-3 and e_dw < 6e-3 and e_db < 6e-3 and torch.isfinite(y).all()
     ok &= bool(good)
