@@ -39,7 +39,7 @@ def stream(seed):
 
 def rank_loader(ds, r, emitted):
     """The rank's DataLoader stream: worker k % W's next batch of 32, as (imgs, caps, meta, samples)."""
-    gens = [ds._group_shared(stream(1000 * r + w)) for w in range(W)]
+    gens = [make_ds()._group_shared(stream(1000 * r + w)) for w in range(W)]   # one dataset copy per worker, as in the worker processes
     k = 0
     while True:
         b = [next(gens[k % W]) for _ in range(32)]
