@@ -1,0 +1,5 @@
+# Overlay on lite_ladder_sample.yaml: the energy head on the official Euler sampler (docs/energy_head.md, section 11).
+model:
+  denoiser:
+    init_args:
+      head_width: 352

@@ -1,0 +1,4 @@
+# Overlay on lite_ladder_sample.yaml: the autoregressive model. predict_step calls its ar_sample; x_T is not used, and each image's randomness comes from the draws.
+model:
+  denoiser:
+    class_path: src.models.transformer.AR_JiT.ARJiT

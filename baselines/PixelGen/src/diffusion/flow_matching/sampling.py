@@ -121,6 +121,8 @@ class EulerSamplerJiT(BaseSampler):
             step_fn: Callable = ode_step_fn,
             last_step=None,
             last_step_fn: Callable = ode_step_fn,
+            eta: float = 0.0,
+            land: bool = False,
             *args,
             **kwargs
     ):
@@ -147,6 +149,20 @@ class EulerSamplerJiT(BaseSampler):
             if self.step_fn == ode_step_fn:
                 logger.warning("current sampler is ODE sampler, but w_scheduler is enabled")
         self.t_eps = 5e-2
+        self.eta, self.land = eta, land   # docs/distribution_step.md 5.7: both off is the official sampler
+        assert not ((eta or land) and float(self.guidance) != 1.0), "eta and land are for CFG 1.0"
+        assert 0 <= eta <= 1, eta
+        self._rank_seeded = False
+
+    def _stochastic_step(self, x, hat, t, t_next):
+        """One draw from q(x_t' | x_t, x = x_hat) on the path x_t = t x + (1 - t) eps: the DDPM posterior at eta = 1, DDIM (which is Euler without the t_eps clamp) at eta = 0.
+        rho^2 = lambda(t) / lambda(t'), lambda(s) = (s / (1 - s))^2; the fresh share of the noise is eta^2 (1 - rho^2), so the noise keeps its size for any eta."""
+        if t_next >= 1:
+            return hat
+        eps = (x - t * hat) / (1 - t)
+        lam = lambda s: (s / (1 - s)) ** 2
+        fresh = self.eta ** 2 * (1 - lam(t) / lam(t_next))
+        return t_next * hat + (1 - t_next) * ((1 - fresh) ** 0.5 * eps + fresh ** 0.5 * torch.randn_like(x))
 
     def _impl_sampling(self, net, noise, condition, uncondition):
         """
@@ -158,6 +174,9 @@ class EulerSamplerJiT(BaseSampler):
         # CFG 1.0 (owner, 2026-11-01): the guided velocity is the conditional one, so skip the unconditional half
         cfg_on = float(self.guidance) != 1.0
         cfg_condition = torch.cat([uncondition, condition], dim=0) if cfg_on else None
+        if self.eta and not self._rank_seeded:   # seed_everything gives all ranks one RNG state, so their fresh noise would repeat
+            torch.manual_seed(1000 + int(os.environ.get("LOCAL_RANK", 0)))
+            self._rank_seeded = True
         x = noise
         x_trajs = [noise,]
         v_trajs = []
@@ -187,11 +206,15 @@ class EulerSamplerJiT(BaseSampler):
                 else:
                     out = self.guidance_fn(out, 1.0)
             else:
-                out = net(x, t_cur, condition)
-                out = (out - x)/(1.0-t_cur.view(-1, 1, 1, 1)).clamp_min(self.t_eps) # pred v (conditional only)
+                hat = net(x, t_cur, condition).float()   # under bf16 autocast; x is fp32, so the official path's values do not change
+                out = (hat - x)/(1.0-t_cur.view(-1, 1, 1, 1)).clamp_min(self.t_eps) # pred v (conditional only)
             v = out
             s = ((1/dalpha_over_alpha)*v - x)/(sigma**2 - (1/dalpha_over_alpha)*dsigma_mul_sigma)
-            if i < self.num_steps -1 :
+            if self.eta:
+                x = self._stochastic_step(x, hat, t_cur[0], t_next)
+            elif self.land and i == self.num_steps - 1:   # the official clamp leaves noise after the last step (0.0144 of the [-1, 1] range on an image the model knows)
+                x = hat
+            elif i < self.num_steps -1 :
                 x = self.step_fn(x, v, dt, s=s, w=w)
             else:
                 x = self.last_step_fn(x, v, dt, s=s, w=w)
