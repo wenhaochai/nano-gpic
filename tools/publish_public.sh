@@ -8,6 +8,10 @@ BR=${1:-main}
 T=/scratch/gpfs/GROUP/USER/tmp/gd_public
 SRC=/scratch/gpfs/GROUP/USER/project/gpic
 FR=/scratch/gpfs/GROUP/USER/tmp/pls_blog/.venv/bin/git-filter-repo
+# The public README is rewritten at every publish (owner 2026-11-07: 「readme每次commit都重写一下说明一下我们的ladder搭建和目标 和已经实现的东西
+# 也要适当配图」): refuse unless README.md on main (the default branch) was committed today; publish main with every branch.
+RD=$(git -C $SRC log -1 --format=%cs main -- README.md)
+[ "$RD" = "$(date +%F)" ] || { echo "README.md on main was last rewritten on $RD: rewrite it (the ladder, the goals, what works, figures) first"; exit 1; }
 mkdir -p $T && cd $T
 case "$T/repo" in */tmp/gd_public/repo) rm -rf -- "$T/repo";; esac
 git clone -q --no-local --single-branch -b $BR $SRC repo && cd repo
