@@ -78,10 +78,13 @@ fi
 TASKS=("$@"); CNT=$TMPDIR/evals_counter; FAILS=$TMPDIR/evals_failed; echo 0 > $CNT; : > $FAILS
 worker() {
   local g=$1 i
+  # one fixed port per GPU worker: 8 predictions that each look for a free port can race for the same one (w1581: EADDRINUSE)
+  export MASTER_PORT=$((29511 + 17 * g))
   while :; do
     i=$(flock $CNT.lock bash -c 'n=$(cat '"$CNT"'); echo $((n + 1)) > '"$CNT"'; echo $n')
     [ $i -lt ${#TASKS[@]} ] || return 0
     if CUDA_VISIBLE_DEVICES=$g EVAL_DEVICES=1 run_task ${TASKS[$i]}; then echo "eval ${TASKS[$i]} on GPU $g ok"
+    elif sleep 10 && CUDA_VISIBLE_DEVICES=$g EVAL_DEVICES=1 run_task ${TASKS[$i]}; then echo "eval ${TASKS[$i]} on GPU $g ok on the second try"
     else echo "eval ${TASKS[$i]} on GPU $g FAILED"; echo ${TASKS[$i]} >> $FAILS; fi
   done
 }
