@@ -277,7 +277,7 @@ class _Fp8MLP(torch.autograd.Function):
 # [sites, W_ST] fp32 on the device: the history, this step's amax (its int32 bits, an atomic max) and the history's max (0
 # without history); each cast derives its scale from that max with its own format's largest value. The casts are triton
 # ops that take the state as an argument they mutate, so Inductor launches their kernels itself (as opaque Python custom
-# ops they cost about 0.1 ms of host time a call, which the host-bound FSDP2 steps paid: w1944, native3 -0.5% there), and
+# ops they cost about 0.1 ms of host time a call, a likely part of why native3 gained only 0.5% at the host-bound FSDP2 widths, w1944), and
 # their order is the data's (each site's input depends on the sites before it).
 L_HIST = 16
 W_ST = L_HIST + 2     # history, this step's amax, the history's max
