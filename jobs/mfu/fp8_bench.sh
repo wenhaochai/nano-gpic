@@ -19,5 +19,5 @@ for C in 640 768 896 1024 1280 1536 1792 2048; do
   i=$((i + 1))
 done
 wait
-cat $OUT/c*.txt | grep "block total\|Error" | sort -t= -k2 -n | tee $OUT/summary.txt
+cat $OUT/c*.txt | grep "block total\|forward + dgrad\|Error" | sort -t= -k2 -n | tee $OUT/summary.txt
 echo "DONE $OUT"
