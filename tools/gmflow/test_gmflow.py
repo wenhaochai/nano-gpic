@@ -1761,6 +1761,20 @@ def T33():
     bm, bl = G.bridge_mixture(gm, x_high, sh, sl)
     assert torch.equal(G.transition_nll(gm, x_low, x_high, sh, sl, 40.0), G.gm_nll(x_low, bm, gm["logweights"], bl, 40.0))
     assert torch.equal(G.transition_resp(gm, x_low, x_high, sh, sl).argmax(1), G.transition_wins(gm, x_low, x_high, sh, sl))
+    # the logged statistics (review_image_anneal S1, S2, M1): one pass gives the exact winners, nll_exact = the loss at tau = 1, r_neff at tau, and the spread
+    for tau in (1.0, 40.0):
+        ws = GMFlowTrainer.win_stats(gm, x_low, x_high, sh, sl, tau)
+        w = G.transition_wins(gm, x_low, x_high, sh, sl)
+        assert ws["gm/win_alive"].item() == len(set(w.tolist())) and abs(ws["gm/win_max"].item() - torch.bincount(w).max().item() / 6) < 1e-6, (tau, ws, w)
+        assert torch.allclose(ws["gm/nll_exact"], G.transition_nll(gm, x_low, x_high, sh, sl).mean(), rtol=1e-6), (ws["gm/nll_exact"],)
+        rr = G.transition_resp(gm, x_low, x_high, sh, sl, tau)
+        assert torch.allclose(ws["gm/r_neff"], torch.exp(-(rr * rr.clamp(min=1e-30).log()).sum(1)).mean(), rtol=1e-5) and ws["gm/tau"].item() == tau
+        sp_x = (gm["means"] - gm["means"].mean(1, keepdim=True)).square().flatten(1).mean(1).sqrt().mean()
+        sp_b = ((bm - bm.mean(1, keepdim=True)).square().flatten(1).mean(1) / torch.exp(2 * bl).flatten()).sqrt().mean()
+        assert torch.allclose(ws["gm/mu_spread_x"], sp_x, rtol=1e-6) and torch.allclose(ws["gm/mu_spread"], sp_b, rtol=1e-6) and sp_b > 0
+    same = dict(gm, means=gm["means"][:, :1].expand(-1, 8, -1, -1, -1).contiguous())
+    ws = GMFlowTrainer.win_stats(same, x_low, x_high, sh, sl, 40.0)
+    assert ws["gm/mu_spread"].item() < 1e-5 and ws["gm/mu_spread_x"].item() < 1e-5, ws   # 8 copies of one candidate: no spread (float32 rounding of the mean, 1e-7)
     # 3. the trainer: the schedule, the refusals, the exact loss from anneal_steps on, the logged tau and r_neff
     tr = gm_trainer(anneal_tau0=196608, anneal_steps=300)
     assert tr.tau(0) == 196608.0 and abs(tr.tau(150) / math.sqrt(196608) - 1) < 1e-12 and tr.tau(300) == 1.0 and tr.tau(10 ** 6) == 1.0
@@ -1785,6 +1799,7 @@ def T33():
     res["loss"].backward()
     assert torch.isfinite(res["loss"]) and not torch.equal(res["loss"].detach(), l_exact) and res["gm/tau"].item() == 196608.0, (res["loss"], l_exact, res["gm/tau"])
     assert 1 <= res["gm/r_neff"].item() <= 8 and mi.final_layer.linear.weight.grad is not None and torch.isfinite(mi.final_layer.linear.weight.grad).all()
+    assert {"gm/nll_exact", "gm/mu_spread", "gm/mu_spread_x"} <= set(res) and not torch.isclose(res["gm/nll_exact"], res["gm/nll"]), (res["gm/nll_exact"], res["gm/nll"])
     tr.step = 0
     try:
         tr._impl_trainstep(mp, None, None, x1, y, {"y_mask": mask})
@@ -1793,6 +1808,8 @@ def T33():
         assert "needs gm_scope image" in str(e), e
     src = open(os.path.join(REPO, "baselines/PixelGen/src/lightning_model_gpic.py")).read()
     assert "self.diffusion_trainer.step = self.global_step" in src   # the step comes from Lightning's global step, which a resume restores
+    print("  win_stats: one pass; the winners of the exact posterior at tau 1 and 40; nll_exact = the transition loss at tau = 1; r_neff at tau; mu_spread and"
+          " mu_spread_x as defined, below 1e-5 for 8 copies of one candidate")
     print(f"  trainer: tau 196608 at step 0, sqrt(196608) at 150, exactly 1 from 300 on; from 300 on the loss equals the exact trainer's bit for bit; at step 0 it"
           f" differs, logs tau {res['gm/tau'].item():.0f} and r_neff {res['gm/r_neff'].item():.2f}, and the gradient is finite; bad schedules and the per-pixel model refused;"
           f" the step is Lightning's global step")

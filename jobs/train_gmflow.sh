@@ -49,7 +49,8 @@ ANNEAL=none
 if [ "$1" = "--anneal" ]; then
   ANNEAL=$2; shift 2
   [[ $ANNEAL =~ ^[1-9][0-9]*:[1-9][0-9]*$ ]] && [ "${ANNEAL%%:*}" -gt 1 ] || { echo "--anneal takes <tau0>:<steps>, integers, tau0 > 1"; exit 2; }
-  [ $SCOPE = image ] || { echo "--anneal tempers the posterior over whole candidate images: it needs --scope image"; exit 2; }
+  [ $SCOPE = image ] || { echo "--anneal tempers the posterior over whole candidate images: it needs --scope image (options in this order: --wt --spread --lam --scope --anneal)"; exit 2; }
+  [ "${ANNEAL##*:}" -le $STEPS ] || echo "warning: --anneal ends at step ${ANNEAL##*:}, after the run's $STEPS steps: the run ends tempered (smoke tests only)"
 fi
 for t in "$@"; do   # the evaluation tasks are checked before the training, so a task that the evaluation would refuse fails now, not after it (review_image_mix M2)
   [[ $t =~ ^[0-9]+:[a-z0-9_]+:[0-9]+(:[0-9]+)?$ ]] || { echo "task $t is not step:sampler:calls[:substeps]"; exit 2; }
