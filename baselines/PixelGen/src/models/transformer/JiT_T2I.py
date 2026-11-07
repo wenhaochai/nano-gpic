@@ -447,6 +447,7 @@ class JiT_T2I(nn.Module):
         text_mask = full_mask = None
         if y_mask is not None and _ATTN == "fa3":   # lever A: valid keys per sample; captions are left-aligned (padding after)
             text_mask = y_mask.sum(1, dtype=torch.int32)
+            # (the conditioners check that every mask is left-aligned: src/models/conditioner/cached_text.py, review M3)
             full_mask = text_mask + x.shape[1]
         elif y_mask is not None:   # SDPA boolean masks, True = attend
             text_mask = y_mask[:, None, None, :]

@@ -14,6 +14,13 @@ import torch
 from src.models.conditioner.base import BaseConditioner
 
 
+def assert_left_aligned(mask):
+    """MFU review M3: FA3 (lever A) takes each sample's first mask.sum() caption keys as its valid ones, so a mask with
+    padding before or between tokens would let it attend to padding. A device-side assert (eager, no host sync)."""
+    n = mask.sum(1, keepdim=True)
+    torch._assert_async((mask == (torch.arange(mask.shape[1], device=mask.device)[None] < n)).all())
+
+
 class CachedTextConditioner(BaseConditioner):
     def __init__(self, emb_dir: str, embed_dim: int = 2048):
         super().__init__()
@@ -31,6 +38,7 @@ class CachedTextConditioner(BaseConditioner):
             return self._to_cuda(metadata["text_emb"])
         out, mask = self._to_cuda(metadata["text_emb"]), self._to_cuda(metadata["text_mask"])
         metadata["y_mask"] = mask.bool()
+        assert_left_aligned(metadata["y_mask"])
         return out
 
     def _impl_uncondition(self, y, metadata: dict = None):

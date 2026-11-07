@@ -177,8 +177,18 @@ class RebalancingLoader:
 
 
 class _Iter:
+    """Starts at its first __next__, not at __iter__: Lightning calls iter() once just to check that the loader is
+    iterable and drops the result (w1420: a thread started there took every other batch from the shared, persistent
+    worker iterator, so the steps got other samples than the reference arm, and the workers loaded twice as much)."""
+    _active = None
+
     def __init__(self, loader, depth):
+        self.loader, self.depth, self.started = loader, depth, False
+
+    def _start(self):
         assert dist.is_initialized()
+        assert _Iter._active is None, "one rebalancing iterator per process: the loader's worker iterator is shared"
+        _Iter._active = self
         self.rank, self.world = dist.get_rank(), dist.get_world_size()
         self.group = dist.new_group(backend="gloo")
         tag = os.environ.get("WQ_JOB_ID") or os.environ.get("SLURM_JOB_ID") or str(os.getppid())
@@ -187,15 +197,18 @@ class _Iter:
         import atexit
         atexit.register(self.slots.close)
         self.pin = torch.cuda.is_available()
-        self.q = queue.Queue(maxsize=depth)
-        self.balance = []   # per step: the busiest rank's caption tokens over the mean, before and after
-        self.thread = threading.Thread(target=self._run, args=(iter(loader),), daemon=True)
+        self.q = queue.Queue(maxsize=self.depth)
+        self.balance = []   # per step: the busiest rank's caption tokens over the mean
+        self.thread = threading.Thread(target=self._run, args=(iter(self.loader),), daemon=True)
         self.thread.start()
+        self.started = True
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        if not self.started:
+            self._start()
         item = self.q.get()
         if isinstance(item, BaseException):
             raise item

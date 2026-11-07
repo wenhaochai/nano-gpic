@@ -31,8 +31,8 @@ import os
 
 # launch configuration (tools/mfu/tests/bench_fused_kernel.py sweeps them); ALIGNED tables (every address 16-byte aligned,
 # every size a multiple of 4) tell Triton it may use 16-byte loads and stores
-BLOCK = int(os.environ.get("GPIC_MFU_FUSED_BLOCK", "4096"))
-NUM_WARPS = int(os.environ.get("GPIC_MFU_FUSED_WARPS", "8"))
+BLOCK = int(os.environ.get("GPIC_MFU_FUSED_BLOCK", "1024"))   # w1419: 1024 with 2-4 warps is the fastest
+NUM_WARPS = int(os.environ.get("GPIC_MFU_FUSED_WARPS", "4"))
 USE_ALIGNED = os.environ.get("GPIC_MFU_FUSED_ALIGNED", "1") == "1"
 
 

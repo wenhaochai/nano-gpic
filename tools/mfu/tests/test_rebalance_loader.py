@@ -5,7 +5,8 @@ long-captioned as the length grouping makes them). Checks, over 6 steps:
 1. split_samples then join_samples gives back the batch exactly (every tensor and int of the job, rows, lengths, types);
 2. over all ranks each sample of a step comes out once, at its own batch position (its t and noise);
 3. each sample's bytes (source crop, both passes' tables, geometry, caption rows) equal those of its source batch;
-4. the busiest rank's caption tokens over the mean fall (the deal does its job).
+4. the busiest rank's caption tokens over the mean fall (the deal does its job);
+5. an iterator created and dropped before the real one (Lightning's iterability check) takes no batch (w1420).
 usage: python test_rebalance_loader.py
 """
 import os, random, sys, tempfile
@@ -43,12 +44,14 @@ def fake_batch(rank, step):
 
 
 class FakeLoader:
+    """Like a DataLoader with persistent workers: every iter() hands back the same underlying iterator."""
+
     def __init__(self, rank):
         self.rank = rank
+        self.it = (fake_batch(rank, s) for s in range(10 ** 9))
 
     def __iter__(self):
-        for s in range(10 ** 9):
-            yield fake_batch(self.rank, s)
+        return self.it
 
 
 def same(a, b):
@@ -72,7 +75,9 @@ def worker(rank, init):
     rt = join_samples(split_samples(b0), pin=False)
     ok &= same(rt[0], b0[0]) and same(rt[1], b0[1]) and same(rt[2], b0[2])
     # 2-4. rebalanced steps
-    it = iter(RebalancingLoader(FakeLoader(rank)))
+    loader = RebalancingLoader(FakeLoader(rank))
+    iter(loader)   # Lightning checks that the loader is iterable and drops the iterator (w1420's bug)
+    it = iter(loader)
     worst_before, worst_after = [], []
     for s in range(STEPS):
         job, caps, meta = next(it)

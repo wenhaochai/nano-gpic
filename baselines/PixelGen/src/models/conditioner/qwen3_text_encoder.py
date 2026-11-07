@@ -51,6 +51,8 @@ class Qwen3TextEncoder(BaseConditioner):
                 out = out.clone()
             if isinstance(metadata, dict):
                 metadata["y_mask"] = mask.bool()
+                from src.models.conditioner.cached_text import assert_left_aligned
+                assert_left_aligned(metadata["y_mask"])
             return self._fit_dim(out)
         tokenized = self.tokenizer(y, truncation=True, max_length=self.max_length, padding="max_length", return_tensors="pt")
         # perf C7: pinned, asynchronous copies (a pageable copy blocks the host until the GPU queue drains)

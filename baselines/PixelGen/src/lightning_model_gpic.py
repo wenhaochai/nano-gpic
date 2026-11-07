@@ -163,6 +163,13 @@ class LightningModel(pl.LightningModule):
     def configure_callbacks(self) -> Union[Sequence[Callback], Callback]:
         return [self.ema_tracker]
 
+    def state_dict(self, *args, **kwargs):
+        """MFU review S1: every checkpoint path (ModelParallelStrategy gathers the state dict before the callbacks'
+        on_save_checkpoint) waits for the EMA lerp of the last step first: the default stream waits for the EMA stream."""
+        if getattr(self, "ema_tracker", None) is not None:
+            self.ema_tracker._join()
+        return super().state_dict(*args, **kwargs)
+
     def configure_optimizers(self) -> OptimizerLRScheduler:
         params_denoiser = filter_nograd_tensors(self.denoiser.parameters())
         params_trainer = filter_nograd_tensors(self.diffusion_trainer.parameters())

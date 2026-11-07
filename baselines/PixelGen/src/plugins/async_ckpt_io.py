@@ -14,8 +14,11 @@ is what torch.save writes from the same dict: the values are copies, no math cha
 Use: trainer.plugins += [src.plugins.async_ckpt_io.AsyncShmCheckpointIO] (GPIC_MFU_ASYNC_CKPT=1 in jobs/mfu/arm.sh).
 """
 import atexit
+import glob
 import os
 import queue
+import re
+import signal
 import sys
 import time
 
@@ -34,8 +37,18 @@ class _Ref:
 
 def _writer(jobs, acks):
     """The writer process: rebuild the tensors from the shared buffer, torch.save, rename, set the mtime."""
+    # review S3: a SIGTERM to the job's process group must not cut a write short (it left a 13-27 GB *.tmp<pid>); the
+    # training process waits for the writes at exit, and a SIGKILL leftover is removed at the next launch (_clean_tmp)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    parent = os.getppid()
     while True:
-        job = jobs.get()
+        try:
+            job = jobs.get(timeout=5)
+        except queue.Empty:
+            if os.getppid() != parent:   # the training process is gone: stop (SIGTERM no longer stops this process)
+                return
+            continue
         if job is None:
             return
         k, buf, snap, path, t_snap = job
@@ -43,9 +56,15 @@ def _writer(jobs, acks):
             delay = float(os.environ.get("GPIC_ASYNC_CKPT_TEST_DELAY", "0"))   # tests only: a slow file system
             if delay:
                 time.sleep(delay)
+            st = buf.untyped_storage()
+
             def rebuild(r):
+                # review M1: no copy (27 GB of host memory at d1792): each tensor gets its own storage, a slice of the
+                # shared buffer, so torch.save writes the same bytes as for an independent copy
                 n = int(torch.Size(r.shape).numel()) * torch.empty((), dtype=r.dtype).element_size()
-                return buf[r.off:r.off + n].view(r.dtype).view(r.shape).clone()
+                if n == 0:   # an empty slice would start where the next tensor starts: torch.save refuses that
+                    return torch.empty(r.shape, dtype=r.dtype)
+                return torch.empty(0, dtype=r.dtype).set_(st[r.off:r.off + n], 0, r.shape)
             ckpt = apply_to_collection(snap, _Ref, rebuild)
             tmp = f"{path}.tmp{os.getpid()}"
             torch.save(ckpt, tmp)
@@ -56,6 +75,26 @@ def _writer(jobs, acks):
         except Exception as e:   # raised in the training process at its next save or at teardown
             acks.put((k, path, repr(e)))
         del buf
+
+
+def _clean_tmp(directory):
+    """Temporary files of writers that are gone (review S3: a SIGKILL during a write leaves path.tmp<pid>)."""
+    for f in glob.glob(os.path.join(directory, "*.tmp*")):
+        m = re.search(r"\.tmp(\d+)$", f)
+        if not m:
+            continue
+        try:
+            os.kill(int(m.group(1)), 0)   # that writer still runs (another job on this node): leave its file
+        except ProcessLookupError:
+            try:
+                if time.time() - os.path.getmtime(f) < 1800:   # a writer of another node's job could own a fresh one
+                    continue
+                os.remove(f)
+                print(f"AsyncShmCheckpointIO: removed the leftover {f}", flush=True)
+            except OSError:
+                pass
+        except PermissionError:
+            pass
 
 
 class AsyncShmCheckpointIO(TorchCheckpointIO):
@@ -121,6 +160,7 @@ class AsyncShmCheckpointIO(TorchCheckpointIO):
         t_snap = time.time()
         os.makedirs(os.path.dirname(os.path.abspath(str(path))), exist_ok=True)
         if self._proc is None:
+            _clean_tmp(os.path.dirname(os.path.abspath(str(path))))
             ctx = mp.get_context("spawn")
             self._jobs, self._acks = ctx.Queue(), ctx.Queue()
             self._proc = ctx.Process(target=_writer, args=(self._jobs, self._acks), daemon=True)
@@ -151,6 +191,8 @@ class AsyncShmCheckpointIO(TorchCheckpointIO):
             self.teardown()
         except Exception as e:   # a lost final checkpoint must not end the job with exit 0
             print(f"AsyncShmCheckpointIO at exit: {e!r}", file=sys.stderr, flush=True)
+            if self._proc is not None and self._proc.is_alive():   # the writer ignores SIGTERM (S3): kill it
+                self._proc.kill()
             os._exit(97)
 
     def teardown(self):
