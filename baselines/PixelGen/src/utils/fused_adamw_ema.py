@@ -27,13 +27,20 @@ try:
 except ImportError:   # older Triton
     from triton.language.extra.cuda import libdevice
 
-BLOCK = 4096
+import os
+
+# launch configuration (tools/mfu/tests/bench_fused_kernel.py sweeps them); ALIGNED tables (every address 16-byte aligned,
+# every size a multiple of 4) tell Triton it may use 16-byte loads and stores
+BLOCK = int(os.environ.get("GPIC_MFU_FUSED_BLOCK", "4096"))
+NUM_WARPS = int(os.environ.get("GPIC_MFU_FUSED_WARPS", "8"))
+USE_ALIGNED = os.environ.get("GPIC_MFU_FUSED_ALIGNED", "1") == "1"
 
 
 @triton.jit
 def _adamw_ema_kernel(PP, GP, MP, VP, SP, EP, NUMEL, TID, TOFF, COEF, HP, ema_w,
                       HAS_COEF: tl.constexpr, HAS_EMA: tl.constexpr, HAS_WD: tl.constexpr,
-                      FMA_M: tl.constexpr, FMA_V: tl.constexpr, FMA_E: tl.constexpr, BLOCK: tl.constexpr):
+                      FMA_M: tl.constexpr, FMA_V: tl.constexpr, FMA_E: tl.constexpr, BLOCK: tl.constexpr,
+                      ALIGNED: tl.constexpr):
     pid = tl.program_id(0)
     t = tl.load(TID + pid)
     off = tl.load(TOFF + pid)
@@ -43,6 +50,13 @@ def _adamw_ema_kernel(PP, GP, MP, VP, SP, EP, NUMEL, TID, TOFF, COEF, HP, ema_w,
     m_ptr = tl.load(MP + t).to(tl.pointer_type(tl.float32))
     v_ptr = tl.load(VP + t).to(tl.pointer_type(tl.float32))
     s_ptr = tl.load(SP + t).to(tl.pointer_type(tl.float32))
+    if ALIGNED:   # the host checked: 16-byte aligned addresses, sizes a multiple of 4, offsets a multiple of BLOCK
+        p_ptr = tl.multiple_of(p_ptr, 16)
+        g_ptr = tl.multiple_of(g_ptr, 16)
+        m_ptr = tl.multiple_of(m_ptr, 16)
+        v_ptr = tl.multiple_of(v_ptr, 16)
+        n = tl.multiple_of(n, 4)
+        off = tl.multiple_of(off, BLOCK)
     lr = tl.load(HP + 0)
     b1 = tl.load(HP + 1)
     b2 = tl.load(HP + 2)
@@ -88,6 +102,8 @@ def _adamw_ema_kernel(PP, GP, MP, VP, SP, EP, NUMEL, TID, TOFF, COEF, HP, ema_w,
     tl.store(v_ptr + offs, v, mask=mask)
     if HAS_EMA:
         e_ptr = tl.load(EP + t).to(tl.pointer_type(tl.float32))
+        if ALIGNED:
+            e_ptr = tl.multiple_of(e_ptr, 16)
         e = tl.load(e_ptr + offs, mask=mask, other=0.0)
         if FMA_E == 0:
             e = tl.fma(ema_w, p - e, e)
@@ -136,11 +152,15 @@ class _Tables:
             self.toff = toff.pin_memory().to(dev, non_blocking=True)
             self.programs = int(tid.numel())
             self.n = n
+            self.block = BLOCK
         else:   # the same sizes, new addresses (FSDP2 hands new gradient tensors each step): the gradients' checks only
             assert [t.numel() for t in lists[1]] == n
             self._check(lists[1], dev)
         # a new device tensor each time: a kernel still queued keeps reading the old table (stream order)
-        ptr = torch.tensor([[ts[i].data_ptr() for i in self.keep] for ts in lists], dtype=torch.int64)
+        addr = [[ts[i].data_ptr() for i in self.keep] for ts in lists]
+        self.aligned = USE_ALIGNED and all(n[i] % 4 == 0 for i in self.keep) and all(
+            a % 16 == 0 for k, row in enumerate(addr) if k != 4 for a in row)   # list 4 (steps) is read as a scalar
+        ptr = torch.tensor(addr, dtype=torch.int64)
         self.ptr = ptr.pin_memory().to(dev, non_blocking=True)
         self.key = key
         self.rebuilds += 1
@@ -210,5 +230,6 @@ class FusedAdamWEMA(torch.optim.AdamW):
                 tb.ptr[0], tb.ptr[1], tb.ptr[2], tb.ptr[3], tb.ptr[4], tb.ptr[5] if has_ema else tb.ptr[0],
                 tb.numel, tb.tid, tb.toff, co, hp, float(self.ema_weight) if has_ema else 0.0,
                 HAS_COEF=coef is not None, HAS_EMA=has_ema, HAS_WD=group["weight_decay"] != 0,
-                FMA_M=FMA_M, FMA_V=FMA_V, FMA_E=FMA_E, BLOCK=BLOCK, num_warps=8, enable_fp_fusion=False)
+                FMA_M=FMA_M, FMA_V=FMA_V, FMA_E=FMA_E, BLOCK=tb.block, ALIGNED=tb.aligned, num_warps=NUM_WARPS,
+                enable_fp_fusion=False)
         return loss
