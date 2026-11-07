@@ -38,10 +38,10 @@ def fp8_filter(mod, fqn):
 def convert_fp8(net, recipe):
     """Swap the blocks' Linear layers of net for torchao's Float8Linear (the same parameters and state-dict keys);
     recipe "native": the image blocks' rowwise FP8 GEMMs with fused casts (src/models/layers/fp8_native.py)."""
-    if recipe in ("native", "native2"):   # native2: the MLP's dgrads in FP8 too (phase 2)
+    if recipe in ("native", "native2", "native3"):   # native2: the MLP's dgrads in FP8 too; native3: delayed scaling
         from src.models.layers.fp8_native import convert_native
         keys = set(net.state_dict())
-        n = convert_native(net, phase=2 if recipe == "native2" else 1)
+        n = convert_native(net, phase={"native": 1, "native2": 2, "native3": 3}[recipe])
         assert set(net.state_dict()) == keys, "FP8 conversion changed the state-dict keys"
         print(f"FP8 ({recipe} rowwise, lever F8b): {n} GEMMs of the image blocks converted", flush=True)
         return n
