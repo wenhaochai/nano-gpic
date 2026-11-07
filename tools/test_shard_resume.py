@@ -202,7 +202,8 @@ def main():
         tool = os.path.join(ROOT, "tools", "ckpt_shard_clock.py")
         out = subprocess.run([sys.executable, tool, os.path.join(d, "last.ckpt")], capture_output=True, text=True).stdout.split()
         old_out = subprocess.run([sys.executable, tool, os.path.join(d, "old.ckpt")], capture_output=True, text=True).stdout.split()
-        good = (len(out) == 3 and t0 <= float(out[0]) <= time.time() and out[1] == str(SEED) and out[2] == "600"
+        # the tool prints the time to the millisecond (rounded), and the callback stores it microseconds after t0
+        good = (len(out) == 3 and t0 - 1e-3 <= float(out[0]) <= time.time() + 1e-3 and out[1] == str(SEED) and out[2] == "600"
                 and old_out == ["1700000000", "-", "-"] and set(ck[KEY]) == {"time", "seed", "step"})
         check("9. checkpoint clock", good, f"stored dump time, seed and step read back {out}; a checkpoint without it gives its floored mtime {old_out}")
 
