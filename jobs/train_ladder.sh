@@ -92,9 +92,12 @@ GPIC_MFU_ASYNC_CKPT=${GPIC_MFU_ASYNC_CKPT:-1}
 export GPIC_MFU_LOCAL_OPT=${GPIC_MFU_LOCAL_OPT:-0} GPIC_MFU_FSDP_GROUP=${GPIC_MFU_FSDP_GROUP:-1}
 export GPIC_MFU_FUSED_OPT=${GPIC_MFU_FUSED_OPT:-0}   # MFU lever H: 1 = clip multiply + AdamW in one kernel, 2 = also the EMA
 MFU_ARGS=()
-[ "$GPIC_MFU_FSDP" = 1 ] && MFU_ARGS+=(--trainer.strategy '{"class_path":"lightning.pytorch.strategies.ModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}')
+export GPIC_MFU_FSDP_FLAT=${GPIC_MFU_FSDP_FLAT:-0}   # MFU lever B3: one flat parameter per FSDP2 unit (src/utils/fsdp_setup.py)
+FSDP_CLS=lightning.pytorch.strategies.ModelParallelStrategy
+[ "$GPIC_MFU_FSDP_FLAT" = 1 ] && FSDP_CLS=src.utils.fsdp_setup.FlatModelParallelStrategy   # checkpoints keep the per-parameter keys
+[ "$GPIC_MFU_FSDP" = 1 ] && MFU_ARGS+=(--trainer.strategy '{"class_path":"'$FSDP_CLS'","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}')
 [ "$GPIC_MFU_ASYNC_CKPT" = 1 ] && MFU_ARGS+=(--trainer.plugins+='{"class_path":"src.plugins.async_ckpt_io.AsyncShmCheckpointIO"}')
-echo "$(date -u +%FT%TZ) MFU levers: attn=$GPIC_MFU_ATTN fsdp=$GPIC_MFU_FSDP gpu_resize=$GPIC_MFU_GPU_RESIZE uint8=$GPIC_MFU_UINT8 pack=$GPIC_MFU_PACK rebalance=$GPIC_MFU_REBALANCE async_ckpt=$GPIC_MFU_ASYNC_CKPT local_opt=$GPIC_MFU_LOCAL_OPT fsdp_group=$GPIC_MFU_FSDP_GROUP fused_opt=$GPIC_MFU_FUSED_OPT" >> $RUN/launches.txt
+echo "$(date -u +%FT%TZ) MFU levers: attn=$GPIC_MFU_ATTN fsdp=$GPIC_MFU_FSDP gpu_resize=$GPIC_MFU_GPU_RESIZE uint8=$GPIC_MFU_UINT8 pack=$GPIC_MFU_PACK rebalance=$GPIC_MFU_REBALANCE async_ckpt=$GPIC_MFU_ASYNC_CKPT local_opt=$GPIC_MFU_LOCAL_OPT fsdp_group=$GPIC_MFU_FSDP_GROUP fsdp_flat=$GPIC_MFU_FSDP_FLAT fused_opt=$GPIC_MFU_FUSED_OPT" >> $RUN/launches.txt
 # the main thread spent 14.5% of its CPU time in glibc malloc; the threshold keeps tcmalloc's large-alloc report out of the log
 [ -f /usr/lib64/libtcmalloc.so.4 ] && export LD_PRELOAD=/usr/lib64/libtcmalloc.so.4${LD_PRELOAD:+:$LD_PRELOAD} TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD=100000000000
 python main.py fit --config configs_h100/lite_ladder.yaml --trainer.default_root_dir $ROOT \

@@ -11,12 +11,14 @@
 # same batches in every arm, each rank's loss per step), for each given width: levers off, then each given lever set.
 # usage: widths.sh <code worktree> <steps> <width>:<set>[,<set>...] ...   sets: ACD, ACDE, ABCD, ABCDE (A FA3, B FSDP2,
 #   C GPU resize, D uint8, E packed + rebalanced captions, R the same deal on the host one step ahead (E2), L AdamW and EMA on the local shards (B2), G<k> k blocks per
-#   FSDP2 unit, H1 / H2 clip multiply + AdamW (+ EMA) in one kernel (lever H), T Inductor coordinate-descent tuning
+#   FSDP2 unit, Q one flat parameter per FSDP2 unit (lever B3, with B), H1 / H2 clip multiply + AdamW (+ EMA) in one
+#   kernel (lever H), T Inductor coordinate-descent tuning
 #   (lever G0), P torch.profiler over steps 500-505 and
 #   per-stage CUDA events: read the median), off (a second
 #   levers-off arm, d<width>_off2)
 # Parity floor (tools/mfu/parity_loss.py): off2 if listed, else the first set (put a rounding-only set first: ACD changes
-# only the attention kernel's rounding, C and D are bit-exact).
+# only the attention kernel's rounding, C and D are bit-exact). WIDTHS_NO_OFF=1 drops the levers-off arm (fewer arms, less
+# idle GPU time between them); the first set is then the reference and the second the floor.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 WT=${1:?code worktree} STEPS=${2:?steps}; shift 2
@@ -30,16 +32,18 @@ source $WT/jobs/mfu/gpu_checks.sh
 gpu_checks $WT $OUT || { echo "GPU checks failed"; exit 3; }
 export MFU_WT=$WT MFU_LIMIT=900 GPIC_MFU_DET_DATA=1 GPIC_SHARD_SEED=20261106
 FSDP='{"class_path":"lightning.pytorch.strategies.ModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
+FSDP_FLAT='{"class_path":"src.utils.fsdp_setup.FlatModelParallelStrategy","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}'
 arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; echo "[$(date +%T)] $1 rc=$?" | tee -a $OUT/summary.txt; }
 geom() { case $1 in 640) echo "9 2" ;; 768) echo "10 2" ;; 896) echo "11 2" ;; 1024) echo "12 3" ;; 1280) echo "14 3" ;; 1536) echo "16 4" ;; 1792) echo "18 4" ;; esac; }
 for spec in "$@"; do
   d=${spec%%:*}; sets=${spec#*:}
   read -r nb nt <<< "$(geom $d)"
-  arm d${d}_off $d $nb $nt $STEPS
+  [ -z "${WIDTHS_NO_OFF:-}" ] && arm d${d}_off $d $nb $nt $STEPS   # WIDTHS_NO_OFF=1: no levers-off arm (the first set is the reference)
   for s in ${sets//,/ }; do
     [ $s = off ] && { arm d${d}_off2 $d $nb $nt $STEPS; continue; }
     env=(GPIC_MFU_ATTN=fa3)
     [[ $s == *B* ]] && env+=(GPIC_MFU_FSDP=1 MFU_STRATEGY=$FSDP)
+    [[ $s == *Q* ]] && env+=(GPIC_MFU_FSDP=1 GPIC_MFU_FSDP_FLAT=1 MFU_STRATEGY=$FSDP_FLAT)   # lever B3: flat units
     [[ $s == *C* ]] && env+=(GPIC_MFU_GPU_RESIZE=1)
     [[ $s == *D* ]] && env+=(GPIC_MFU_UINT8=1)
     [[ $s == *E* ]] && env+=(GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1)
@@ -59,6 +63,10 @@ python tools/mfu/bench_summary.py $(ls -d $OUT/d*/) --skip 100 | tee -a $OUT/sum
 for spec in "$@"; do
   d=${spec%%:*}; sets=${spec#*:}
   arms=(); for s in ${sets//,/ }; do [ $s = off ] && arms=($OUT/d${d}_off2 "${arms[@]}") || arms+=($OUT/d${d}_$s); done
-  python tools/mfu/parity_loss.py $OUT/d${d}_off "${arms[@]}" | tee -a $OUT/summary.txt
+  if [ -n "${WIDTHS_NO_OFF:-}" ]; then   # reference: the first set; floor: the first set against itself is useless, so the second
+    python tools/mfu/parity_loss.py "${arms[0]}" "${arms[@]:1}" | tee -a $OUT/summary.txt
+  else
+    python tools/mfu/parity_loss.py $OUT/d${d}_off "${arms[@]}" | tee -a $OUT/summary.txt
+  fi
 done
 echo "DONE $OUT"

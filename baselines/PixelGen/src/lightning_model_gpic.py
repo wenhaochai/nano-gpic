@@ -111,9 +111,14 @@ class LightningModel(pl.LightningModule):
         if os.environ.get("GPIC_MFU_FSDP") == "1":   # MFU lever B: FSDP2 per block, same math (src/utils/fsdp_setup.py)
             from src.utils.fsdp_setup import shard
             mesh = self.trainer.strategy.device_mesh["data_parallel"]
-            self._replicated = shard(self.denoiser, mesh, compute_bf16=True, compile_blocks=True)
-            shard(self.ema_denoiser, mesh, compute_bf16=False, compile_blocks=False)
-            print("FSDP2: blocks sharded and compiled", flush=True)
+            names = {m: n for n, m in self.named_modules()}   # checkpoint keys of lever B3's key map
+            self._replicated = shard(self.denoiser, mesh, compute_bf16=True, compile_blocks=True, names=names)
+            shard(self.ema_denoiser, mesh, compute_bf16=False, compile_blocks=False, names=names, trainable_only=False)
+            kmap = self.denoiser.__dict__.get("_b3_kmap", []) + self.ema_denoiser.__dict__.get("_b3_kmap", [])
+            if kmap:   # MFU lever B3: the strategy splits the flat parameters into the original keys on save, and back
+                assert type(self.trainer.strategy).__name__ == "FlatModelParallelStrategy", type(self.trainer.strategy)
+                self._b3_kmap = kmap
+            print(f"FSDP2: blocks sharded and compiled{' (flat units, lever B3)' if kmap else ''}", flush=True)
             return
         # torch.compile
         print("Compiling models...")
