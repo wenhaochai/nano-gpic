@@ -13,12 +13,16 @@
 # batch 1024, a multiple of 32). All segments of a ladder and size share runs/gpic-speed/muon_<ladder>/exp_ladder_<size> and the
 # W&B run muon-<ladder>-<size>; a later segment continues the run (flat lr after warmup). ms checkpoints at the multiples of
 # steps/4; last.ckpt every C0/8. One shard seed per ladder for every width. Code: the frozen worktree gpic-wt/muon_ladder_run.
-# usage: train_muon_ladder.sh <full|lite> <size> <d> <nb> <nt> <C0 steps> <multiple> <adamw lr> <muon lr>
+# usage: train_muon_ladder.sh <full|lite|s80|s8> <size> <d> <nb> <nt> <C0 steps> <multiple> <adamw lr> <muon lr>
 set -o pipefail
 WC=/scratch/gpfs/GROUP/USER
-[ $# -eq 9 ] || { echo "usage: train_muon_ladder.sh <full|lite> <size> <d> <nb> <nt> <C0 steps> <multiple> <adamw lr> <muon lr>"; exit 2; }
+[ $# -eq 9 ] || { echo "usage: train_muon_ladder.sh <full|lite|s80|s8> <size> <d> <nb> <nt> <C0 steps> <multiple> <adamw lr> <muon lr>"; exit 2; }
 LAD=$1 SIZE=$2 WD=$3 NB=$4 NT=$5 S=$6 M=$7 ALR=$8 MLR=$9
-case $LAD in full) PAT='gpic_train_{00000..07999}.tar' SEED=20261106 ;; lite) PAT='gpic_train_{00000..00800}.tar' SEED=20261107 ;; *) echo "ladder must be full or lite"; exit 2 ;; esac
+# s80 / s8: the repetition arms (owner 2026-11-07; genmodel's repeat-arms, src/data/dataset/gpic_dataset.py EpochShuffledShards):
+# the first 80 or 8 shards with the Full ladder's seed; fewer shards than 8 GPUs x 32 workers, so every pass reads k copies
+case $LAD in full) PAT='gpic_train_{00000..07999}.tar' SEED=20261106 ;; lite) PAT='gpic_train_{00000..00800}.tar' SEED=20261107 ;;
+  s80) PAT='gpic_train_{00000..00079}.tar' SEED=20261106 ;; s8) PAT='gpic_train_{00000..00007}.tar' SEED=20261106 ;;
+  *) echo "ladder must be full, lite, s80 or s8"; exit 2 ;; esac
 case $M in 1|2|4|8) ;; *) echo "multiple must be 1, 2, 4 or 8"; exit 2 ;; esac
 [ $((S % 32)) -eq 0 ] || { echo "C0 steps must be a multiple of 32"; exit 2; }
 [ "$SIZE" = "d$WD" ] || { echo "size $SIZE does not match d $WD"; exit 2; }
