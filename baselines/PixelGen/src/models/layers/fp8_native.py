@@ -73,6 +73,47 @@ def _swiglu_rowcast_kernel(Z, Q, S, H, sz, sq, BK: tl.constexpr):
     tl.store(S + row, m / 448.0)
 
 
+# The SwiGLU backward of one row (phase 2): from z = [z1 | z2] and da (the gradient of silu(z1) * z2), dz = [dz1 | dz2] in
+# bf16 (for w12's weight gradient) and as scaled e4m3 rows with the row's scale (for w12's FP8 dgrad). The first loop writes
+# bf16 dz and finds the row amax, the second recomputes dz from the inputs (no read of what the first wrote) and casts it.
+@triton.jit
+def _swiglu_bwd_kernel(Z, DA, DZ, DZQ, S, H, sz, sda, sdz, sdq, BK: tl.constexpr):
+    row = tl.program_id(0)
+    zr = Z + row.to(tl.int64) * sz
+    dar = DA + row.to(tl.int64) * sda
+    dzr = DZ + row.to(tl.int64) * sdz
+    dqr = DZQ + row.to(tl.int64) * sdq
+    amax = tl.zeros([BK], tl.float32)
+    for k0 in range(0, H, BK):
+        k = k0 + tl.arange(0, BK)
+        m = k < H
+        z1 = tl.load(zr + k, mask=m, other=0.0).to(tl.float32)
+        z2 = tl.load(zr + H + k, mask=m, other=0.0).to(tl.float32)
+        da = tl.load(dar + k, mask=m, other=0.0).to(tl.float32)
+        sg = tl.sigmoid(z1)
+        sl = (z1 * sg).to(tl.bfloat16).to(tl.float32)
+        d1 = (da * z2 * (sg * (1.0 + z1 * (1.0 - sg)))).to(tl.bfloat16)
+        d2 = (da * sl).to(tl.bfloat16)
+        tl.store(dzr + k, d1, mask=m)
+        tl.store(dzr + H + k, d2, mask=m)
+        amax = tl.maximum(amax, tl.maximum(tl.abs(d1.to(tl.float32)), tl.abs(d2.to(tl.float32))))
+    a = tl.maximum(tl.max(amax, axis=0), 1e-12)
+    scale = 448.0 / a
+    for k0 in range(0, H, BK):
+        k = k0 + tl.arange(0, BK)
+        m = k < H
+        z1 = tl.load(zr + k, mask=m, other=0.0).to(tl.float32)
+        z2 = tl.load(zr + H + k, mask=m, other=0.0).to(tl.float32)
+        da = tl.load(dar + k, mask=m, other=0.0).to(tl.float32)
+        sg = tl.sigmoid(z1)
+        sl = (z1 * sg).to(tl.bfloat16).to(tl.float32)
+        d1 = (da * z2 * (sg * (1.0 + z1 * (1.0 - sg)))).to(tl.bfloat16).to(tl.float32)
+        d2 = (da * sl).to(tl.bfloat16).to(tl.float32)
+        tl.store(dqr + k, tl.minimum(tl.maximum(d1 * scale, -448.0), 448.0).to(tl.float8e4nv), mask=m)
+        tl.store(dqr + H + k, tl.minimum(tl.maximum(d2 * scale, -448.0), 448.0).to(tl.float8e4nv), mask=m)
+    tl.store(S + row, a / 448.0)
+
+
 def _bk(k):
     return min(4096, triton.next_power_of_2(k))
 
@@ -114,10 +155,31 @@ def _(z):
     return z.new_empty(M, H2 // 2, dtype=E4), z.new_empty(M, 1, dtype=torch.float32)
 
 
-def _mm(xq, sx, wq, sw):
-    """[M, K] e4m3 with row scales x [N, K] e4m3 with row (= output channel) scales -> [M, N] bf16."""
+@triton_op("gpic::fp8_swiglu_bwd", mutates_args=())
+def swiglu_bwd(z: torch.Tensor, da: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """z [M, 2H] bf16, da [M, H] bf16 -> dz [M, 2H] bf16, dz as e4m3 rows [M, 2H] and their scales [M, 1] fp32."""
+    M, H2 = z.shape
+    zc, dac = z.contiguous(), da.contiguous()
+    dz = torch.empty(M, H2, dtype=torch.bfloat16, device=z.device)
+    dq = torch.empty(M, H2, dtype=E4, device=z.device)
+    s = torch.empty(M, 1, dtype=torch.float32, device=z.device)
+    if M:
+        _launch(_swiglu_bwd_kernel)[(M,)](zc, dac, dz, dq, s, H2 // 2, zc.stride(0), dac.stride(0), dz.stride(0),
+                                          dq.stride(0), BK=_bk(H2 // 2), num_warps=8)
+    return dz, dq, s
+
+
+@swiglu_bwd.register_fake
+def _(z, da):
+    M, H2 = z.shape
+    return z.new_empty(M, H2), z.new_empty(M, H2, dtype=E4), z.new_empty(M, 1, dtype=torch.float32)
+
+
+def _mm(xq, sx, wq, sw, fast=True):
+    """[M, K] e4m3 with row scales x [N, K] e4m3 with row (= output channel) scales -> [M, N] bf16. Fast accumulation
+    for the forward only (gradients accumulate in full fp32, as Transformer Engine does)."""
     return torch._scaled_mm(xq, wq.t(), scale_a=sx, scale_b=sw.view(1, -1), out_dtype=torch.bfloat16,
-                            use_fast_accum=True)
+                            use_fast_accum=fast)
 
 
 class _Fp8Linear(torch.autograd.Function):
@@ -174,6 +236,46 @@ class _SwiGLUw3(torch.autograd.Function):
         return torch.cat([dz1, dz2], dim=-1).view(ctx.shape), dw3
 
 
+class _Fp8MLP(torch.autograd.Function):
+    """Phase 2: the whole SwiGLU MLP, y = w3(silu(z1) * z2) with z = w12(x), so the backward can hand FP8 gradients from one
+    GEMM to the next: the forward GEMMs in FP8 (phase 1), and the dgrads of w3 and w12 in FP8 too: dy cast in rows, the
+    SwiGLU backward kernel writing dz both in bf16 (w12's weight gradient) and in FP8 rows (w12's dgrad). Weight
+    gradients in bf16. The weights' FP8 copies for the dgrads are taken from their transposes, one scale per input
+    channel (the dgrad's output column)."""
+    @staticmethod
+    def forward(ctx, x, w12, w3):
+        shape = x.shape
+        x2 = x.reshape(-1, shape[-1])
+        xq, sx = rowcast(x2)
+        w12q, s12 = rowcast(w12)
+        z = _mm(xq, sx, w12q, s12)
+        aq, sa = swiglu_rowcast(z)
+        w3q, s3 = rowcast(w3)
+        y = _mm(aq, sa, w3q, s3)
+        ctx.save_for_backward(x2, z, aq, sa, w12, w3)
+        ctx.shape, ctx.dt = shape, (w12.dtype, w3.dtype)
+        return y.view(*shape[:-1], w3.shape[0])
+
+    @staticmethod
+    def backward(ctx, dy):
+        x2, z, aq, sa, w12, w3 = ctx.saved_tensors
+        dy2 = dy.reshape(-1, dy.shape[-1]).to(torch.bfloat16)
+        dyq, sdy = rowcast(dy2)
+        w3tq, s3t = rowcast(w3.t().contiguous())          # [H, C]: one scale per hidden channel
+        da = _mm(dyq, sdy, w3tq, s3t, fast=False)          # [M, H]
+        dz, dzq, sdz = swiglu_bwd(z, da)
+        w12tq, s12t = rowcast(w12.t().contiguous())        # [C, 2H]: one scale per input channel
+        dx = _mm(dzq, sdz, w12tq, s12t, fast=False)        # [M, C]
+        dw12 = (dz.t() @ x2).to(ctx.dt[0])
+        dw3 = (dy2.t() @ (aq.to(torch.float32) * sa).to(torch.bfloat16)).to(ctx.dt[1])
+        return dx.view(ctx.shape), dw12, dw3
+
+
+def fp8_mlp(x, w12, w3):
+    with torch.autocast("cuda", enabled=False):
+        return _Fp8MLP.apply(x.to(torch.bfloat16), w12, w3)
+
+
 def fp8_linear(x, w, b=None):
     with torch.autocast("cuda", enabled=False):
         return _Fp8Linear.apply(x.to(torch.bfloat16), w, b)
@@ -190,10 +292,23 @@ class Fp8Linear(torch.nn.Linear):
         return fp8_linear(x, self.weight, self.bias)
 
 
-def convert_native(net):
-    """The image blocks' qkv_x, proj, w12 to Fp8Linear, and their SwiGLU's w3 GEMM to the fused path. Returns the count."""
+def convert_native(net, phase=1):
+    """Phase 1: the image blocks' qkv_x, proj, w12 to Fp8Linear and their SwiGLU's w3 GEMM to the fused path. Phase 2:
+    qkv_x and proj as in phase 1, the MLP as one fused FP8 function with FP8 dgrads. Returns the count of GEMMs."""
     n = 0
     for blk in getattr(net, "blocks", []):
+        if phase >= 2:
+            for name in ("qkv_x", "proj"):
+                lin = getattr(blk.attn, name)
+                if type(lin) is torch.nn.Linear:
+                    lin.__class__ = Fp8Linear
+                    n += 1
+            mlp = blk.mlp
+            if not getattr(mlp, "_fp8", False):
+                mlp._fp8 = True
+                mlp.forward = (lambda m: (lambda x: fp8_mlp(x, m.w12.weight, m.w3.weight)))(mlp)
+                n += 2
+            continue
         for parent, name in ((blk.attn, "qkv_x"), (blk.attn, "proj"), (blk.mlp, "w12")):
             lin = getattr(parent, name)
             if type(lin) is torch.nn.Linear:
