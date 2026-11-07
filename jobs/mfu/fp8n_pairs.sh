@@ -12,11 +12,12 @@
 # each (global batch 512; d1792 64 x 2), the same batches, so the pair compares like for like. Half B starts 150 s later,
 # so each half's cold compile (GPUs idle) overlaps the other half's training (the controller, 2026-11-07: multi-arm jobs
 # left all 8 GPUs at 0% during their compiles). The FP8 and packed K2 tests on GPU 0 first.
-# usage: fp8n_pairs.sh <code worktree>
+# usage: fp8n_pairs.sh <code worktree> [<FP8 recipe of half A: none|native|native2> <of half B>]   (default: none native)
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 WT=${1:?code worktree}
-OUT=$WC/runs/gpic-speed/mfu/fp8pairs_$(date +%m%d_%H%M)
+RA=${2:-none} RB=${3:-native}
+OUT=$WC/runs/gpic-speed/mfu/fp8pairs_${RA}_${RB}_$(date +%m%d_%H%M)
 mkdir -p $OUT
 git -C $WT rev-parse HEAD > $OUT/commit.txt
 python $WT/tools/gpu_health.py > $OUT/gpu_health.txt 2>&1 || { tail -3 $OUT/gpu_health.txt; echo "unhealthy GPU on $(hostname); exit 98"; exit 98; }
@@ -30,13 +31,13 @@ FS4='{"class_path":"src.utils.fsdp_setup.NoSyncModelParallelStrategy","init_args
 arm() { bash $WT/jobs/mfu/arm.sh $OUT "$@"; local rc=$?; echo "[$(date +%T)] $1 rc=$rc" | tee -a $OUT/summary.txt; }
 SPECS=("640 9 2 2048 ddp 128" "768 10 2 2048 ddp 128" "896 11 2 1536 ddp 128" "1024 12 3 1024 ddp 128"
        "1280 14 3 1024 fsdp7 128" "1536 16 4 768 fsdp 128" "1792 18 4 768 fsdp 64")
-half() {   # <gpus> <master port> <FP8: 0|1> <tag suffix>
+half() {   # <gpus> <master port> <FP8 recipe: none|native|native2> <tag suffix>
   local spec d nb nt steps mode mb
   for spec in "${SPECS[@]}"; do
     read -r d nb nt steps mode mb <<< "$spec"
     (
       export CUDA_VISIBLE_DEVICES=$1 MASTER_PORT=$2 MFU_MICRO=$mb
-      [ "$3" = 1 ] && export GPIC_MFU_FP8=native
+      [ "$3" != none ] && export GPIC_MFU_FP8=$3
       case $mode in
         fsdp7) export GPIC_MFU_FSDP=1 GPIC_MFU_FSDP_GROUP=7 MFU_STRATEGY=$FS4 ;;
         fsdp) export GPIC_MFU_FSDP=1 MFU_STRATEGY=$FS4 ;;
@@ -45,10 +46,11 @@ half() {   # <gpus> <master port> <FP8: 0|1> <tag suffix>
     )
   done
 }
-half 0,1,2,3 29511 0 EK4 > $OUT/halfA.log 2>&1 &
+half 0,1,2,3 29511 $RA EK4 > $OUT/halfA.log 2>&1 &
 sleep 150
-half 4,5,6,7 29512 1 EKN4 > $OUT/halfB.log 2>&1 &
+half 4,5,6,7 29512 $RB EKN4 > $OUT/halfB.log 2>&1 &
 wait
+echo "half A: $RA, half B: $RB" | tee -a $OUT/summary.txt
 python - $OUT <<'PY' | tee -a $OUT/summary.txt
 import json, glob, math, os, statistics as st, sys
 out = sys.argv[1]
@@ -65,7 +67,7 @@ for d in sorted(glob.glob(os.path.join(out, "d*_EK4")), key=lambda p: int(os.pat
     n = min(len(b), len(f)); lb = st.mean(x["loss"] for x in b[n - 200:n]); lf = st.mean(x["loss"] for x in f[n - 200:n])
     nf = sum(1 for r in (b, f) for x in r if not math.isfinite(x["loss"]))
     w = int(tag.split("_")[0][1:])
-    print(f"{tag[:-4]}: bf16 {tm(b):.1f} ms, FP8 {tm(f):.1f} ms ({tm(f) / tm(b) - 1:+.1%}); loss over the last 200 steps bf16 {lb:.5f}, "
-          f"FP8 {lf:.5f}; non-finite losses {nf}")
+    print(f"{tag[:-4]}: A {tm(b):.1f} ms, B {tm(f):.1f} ms ({tm(f) / tm(b) - 1:+.1%}); loss over the last 200 steps A {lb:.5f}, "
+          f"B {lf:.5f}; non-finite losses {nf}")
 PY
 echo "DONE $OUT"
