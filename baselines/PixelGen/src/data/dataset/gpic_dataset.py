@@ -21,10 +21,19 @@ _PACK = os.environ.get("GPIC_MFU_PACK") == "1"     # MFU lever E: packed caption
 # MFU lever C: the region crop's two resize passes run on the GPU, bit for bit Pillow's (pil_exact.py, pil_exact_gpu.py);
 # the workers decode, draw the crop and compute the coefficient tables. Needs the region crop (GPIC_REGION_CROP=1).
 _GPU_RESIZE = os.environ.get("GPIC_MFU_GPU_RESIZE") == "1"
+# GPU JPEG decoding (GPIC_MFU_GPU_DECODE=1, with lever C; owner 2026-11-07: 「可以用GPU解码」): a training JPEG in RGB or L whose
+# crop needs no BOX halving (about 84% of the images) leaves the worker undecoded, with its crop plan computed from the header's
+# size (pil_exact.draw_region_crop: the same random draws); the training step decodes the batch's JPEGs with nvJPEG and runs the
+# same exact resize passes (pil_exact_gpu.run). PNGs, other modes and halved images keep the CPU decode. nvJPEG's pixels differ
+# slightly from libjpeg-turbo's (tools/mfu/jpeg_gpu_bench.py: mean |diff| 0.3-0.45 of 255), so this changes the data.
+# GPIC_MFU_GPU_DECODE=2: the same, with each batch decoded a step ahead by a background thread (pil_exact_gpu.DecodeAhead).
+_GPU_DECODE = os.environ.get("GPIC_MFU_GPU_DECODE") in ("1", "2")
+_GPU_DECODE_AHEAD = os.environ.get("GPIC_MFU_GPU_DECODE") == "2"
 # tests only (MFU parity runs): the grouping RNG and the sample shuffle seeded from the shard seed (production seeds them from
 # the PID and the clock), so two runs read the same batches and their per-step losses can be compared
 _DET = os.environ.get("GPIC_MFU_DET_DATA") == "1"
 assert not _GPU_RESIZE or os.environ.get("GPIC_REGION_CROP") == "1", "GPIC_MFU_GPU_RESIZE needs GPIC_REGION_CROP=1"
+assert not _GPU_DECODE or _GPU_RESIZE, "GPIC_MFU_GPU_DECODE needs GPIC_MFU_GPU_RESIZE=1"
 train_transform = T.Compose([
     T.Lambda(lambda pil_image: _train_crop(pil_image, 256)),
     T.ToTensor(),
@@ -522,6 +531,10 @@ class GPICWebDataset(IterableDataset):
         crop, as a uint8 array; with lever C the crop's plan (source rows, two passes) for the GPU instead."""
         for k in IMAGE_SUFFIXES:
             if k in sample:
+                if _GPU_DECODE and k in ("jpg", "jpeg") and not self.is_val:
+                    item = self._plan_jpeg(sample[k])
+                    if item is not None:
+                        return item
                 img = _DECODE_PIL(k, sample[k]).convert("RGB")
                 if _GPU_RESIZE:
                     from .pil_exact import plan_region_crop
@@ -529,6 +542,26 @@ class GPICWebDataset(IterableDataset):
                     return np.ascontiguousarray(src), passes
                 return np.asarray(self._pre(img), dtype=np.uint8)
         raise ValueError("no image")
+
+    def _plan_jpeg(self, data):
+        """GPU decoding: ("jpeg", the file's bytes, (H, W), rows, passes) for an RGB or L JPEG whose crop needs no BOX halving;
+        for a halved one the CPU decode here with the draws already taken; None for other modes (the CPU path draws)."""
+        import io
+        from PIL import Image
+        from .pil_exact import draw_region_crop
+        im = Image.open(io.BytesIO(data))   # the header only
+        if im.mode not in ("RGB", "L"):
+            return None
+        W, H = im.size
+        n, size, passes, rows = draw_region_crop(W, H, 256)
+        if n == 0:
+            return ("jpeg", bytes(data), (H, W), rows, passes)
+        img = im.convert("RGB")
+        for _ in range(n):
+            img = img.resize(tuple(x // 2 for x in img.size), resample=Image.BOX)
+        assert img.size == size, (img.size, size)
+        arr = np.asarray(img, dtype=np.uint8)
+        return np.ascontiguousarray(arr if rows is None else arr[rows[0]:rows[1]]), passes
 
     def _tokenize(self, sample):
         ids = self._tokenizer()(sample["caption"], truncation=True, max_length=self.text_max_length)["input_ids"]
@@ -810,11 +843,20 @@ class GPICWebDataset(IterableDataset):
             **({"collate_fn": self._collate_cached if self.emb_dir else self._collate_grouped} if self.group_text_len else {}),
         )
         self._dataloader = loader.pipeline[0]
+        out = self._step_loader(loader)
+        if _GPU_DECODE_AHEAD and not self.is_val:   # GPU JPEG decoding a step ahead, on whatever loader the step pulls from
+            from .pil_exact_gpu import DecodeAhead
+            out = DecodeAhead(out)
+        return out
+
+    def _step_loader(self, loader):
+        """The loader the training step pulls from: the DataLoader itself or a wrapper around it."""
         if self.shared_bucket:   # new ladders: the same caption-length bucket on every rank in every micro-batch
             from src.data.shared_bucket_loader import SharedBucketLoader
             return SharedBucketLoader(loader, self.bucket_edges)
         if os.environ.get("GPIC_MFU_REBALANCE") == "2":   # MFU lever E2: the deal over the ranks on the host, one step ahead
             assert self.group_text_len and self.emb_dir and _PACK and _GPU_RESIZE, "lever E2 needs the cached, packed collate with lever C"
+            assert not _GPU_DECODE, "lever E2 repacks CPU sources only (no GPU JPEG decoding)"
             from src.data.rebalance_loader import RebalancingLoader
             return RebalancingLoader(loader)
         n = int(os.environ.get("GPIC_PROF_CYCLE_BATCHES", 0))   # profiling switch (jobs/smoke_ladder_kernels.sh), unset in production
