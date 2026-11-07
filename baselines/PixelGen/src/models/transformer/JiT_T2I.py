@@ -1,14 +1,57 @@
+import os
+
 import torch
 import torch.nn as nn
 import numpy as np
 
 from functools import lru_cache
 from src.models.layers.attention_op import attention
-from src.models.layers.rope import apply_rotary_emb, precompute_freqs_cis_ex2d as precompute_freqs_cis_2d
+from src.models.layers.rope import apply_rotary_emb, apply_rotary_emb_real, precompute_freqs_cis_ex2d as precompute_freqs_cis_2d
 from src.models.layers.time_embed import TimestepEmbedder as TimestepEmbedder
 from src.models.layers.patch_embed import Embed as Embed
 from src.models.layers.swiglu import SwiGLU as FeedForward
 from src.models.layers.rmsnorm import RMSNorm as Norm
+
+# MFU lever A (docs/mfu.md): GPIC_MFU_ATTN=fa3 runs the masked attention with FlashAttention-3 and per-sample key counts
+# (src/models/layers/fa3_op.py) instead of SDPA with a boolean mask; the same attention, in FA's [B, S, H, D] layout.
+_ATTN = os.environ.get("GPIC_MFU_ATTN", "sdpa")
+# the text blocks' attention (T ~ 50 keys): SDPA's memory-efficient kernel beats FA3 there (w1321: 0.23 vs 0.45 ms forward
+# + backward at d1280); GPIC_MFU_TEXT_ATTN=fa3 keeps FA3 in them as well
+_TEXT_ATTN = os.environ.get("GPIC_MFU_TEXT_ATTN", "sdpa")
+if _ATTN == "fa3":
+    from src.models.layers.fa3_op import fa3_attention, fa3_varlen
+# MFU lever K (docs/mfu.md): GPIC_MFU_FUSED_NORM=1 runs the image blocks' residual add, RMSNorm and adaLN modulation as
+# one Triton kernel per site, forward and backward (src/models/layers/fused_norm.py); the same ops up to rounding.
+_FUSED_NORM = os.environ.get("GPIC_MFU_FUSED_NORM", "0") == "1"
+if _FUSED_NORM:
+    from src.models.layers.fused_norm import mod_rmsnorm, res_mod_rmsnorm
+# MFU lever K2 (docs/mfu.md): GPIC_MFU_FUSED_QK=1 builds the image blocks' attention inputs (q/k RMSNorm, RoPE, the image
+# and caption keys and values concatenated) in one Triton kernel per token kind, forward and backward
+# (src/models/layers/fused_qk.py; lever A's path); the same ops up to rounding.
+_FUSED_QK = os.environ.get("GPIC_MFU_FUSED_QK", "0") == "1"
+if _FUSED_QK:
+    from src.models.layers.fused_qk import qk_prep, qk_prep_packed
+
+# MFU lever E (docs/mfu.md): packed captions. With y_pack (a dict, below) the caption tokens of the batch lie back to back,
+# y [S, 2048], S = the sum of the caption lengths: the text blocks and the caption key projections run on the S real tokens
+# only (no padded rows), the text blocks' attention is FA3 varlen, and the image blocks' keys keep the padded layout
+# [B, N + Tp] with per-sample key counts. The same math as the masked path (padded tokens never reach a real token there).
+# y_pack: lens [B] int32, cu [B + 1] int32 (offsets of the real tokens), pidx [S] int64 (b * Tp + pos: the token's row in
+# a padded [B * Tp] layout; B * Tp, a scratch row, for a dummy row), kmask [B, Tp] bool (the valid positions; Tp >= the
+# longest caption comes from its shape), onehot [S, B] bool (token s belongs to sample b; no sample for a dummy row), real
+# [S] bool, pos [S] int64 (position in its caption, 0 for a dummy), max_T (int, the bound for the varlen kernels:
+# txt_max_length). S, the rows of y, is the real token count rounded up to a multiple of 128 with zero dummy rows after
+# the real ones: an exact count gives the caption GEMMs a new M nearly every step, and cuBLASLt then runs its heuristics
+# before each launch (1-4 ms of host time each; packed d640 37 vs 17.5 ms padded, w1382). A dummy row reaches no real
+# token: its modulation is 0, its keys land in the scratch row, its attention output is 0, so its gradient is 0.
+
+
+def _rope_bshd(x, cos, sin):
+    """apply_rotary_emb_real for x [B, S, H, Hc]; cos, sin [S, Hc/2] float32."""
+    cos, sin = cos[None, :, None], sin[None, :, None]
+    xf = x.float().reshape(*x.shape[:-1], -1, 2)
+    x0, x1 = xf[..., 0], xf[..., 1]
+    return torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1).flatten(3).type_as(x)
 
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
@@ -74,13 +117,39 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor, y, pos) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y, pos, mask=None) -> torch.Tensor:
         B, N, C = x.shape
+        if isinstance(mask, dict) and _FUSED_QK:   # lever E with K2: the packed caption keys placed by the kernel
+            q, k, v = qk_prep_packed(self.qkv_x(x), self.kv_y(y), mask["pidx"], mask["kmask"].shape[1], self.q_norm.weight,
+                                     self.k_norm.weight, pos[0], pos[1], self.num_heads, self.q_norm.variance_epsilon)
+            return self.proj_drop(self.proj(fa3_attention(q, k, v, mask["lens"] + N).reshape(B, N, C)))
+        if isinstance(mask, dict):   # lever E: packed captions, y [S, C]
+            H, Hc, Tp = self.num_heads, C // self.num_heads, mask["kmask"].shape[1]
+            q, kx, vx = self.qkv_x(x).view(B, N, 3, H, Hc).unbind(2)
+            q, kx = _rope_bshd(self.q_norm(q), pos[0], pos[1]), _rope_bshd(self.k_norm(kx), pos[0], pos[1])
+            ky, vy = self.kv_y(y).view(-1, 2, H, Hc).unbind(1)
+            # one scratch row (B * Tp) takes the dummy rows of the bucketed token count; it is cut off before the attention
+            pad = lambda t: t.new_zeros(B * Tp + 1, H, Hc).index_copy(0, mask["pidx"], t)[:B * Tp].view(B, Tp, H, Hc)
+            k = torch.cat([kx, pad(self.k_norm(ky))], dim=1)
+            v = torch.cat([vx, pad(vy)], dim=1)
+            return self.proj_drop(self.proj(fa3_attention(q, k, v, mask["lens"] + N).reshape(B, N, C)))
+        if mask is not None and mask.dtype == torch.int32 and _FUSED_QK:   # lever K2 on lever A's path
+            q, k, v = qk_prep(self.qkv_x(x), self.kv_y(y), self.q_norm.weight, self.k_norm.weight, pos[0], pos[1],
+                              self.num_heads, self.q_norm.variance_epsilon)
+            return self.proj_drop(self.proj(fa3_attention(q, k, v, mask).reshape(B, N, C)))
+        if mask is not None and mask.dtype == torch.int32:   # lever A: mask = valid keys per sample (N + caption length)
+            H, Hc = self.num_heads, C // self.num_heads
+            q, kx, vx = self.qkv_x(x).view(B, N, 3, H, Hc).unbind(2)
+            q, kx = _rope_bshd(self.q_norm(q), pos[0], pos[1]), _rope_bshd(self.k_norm(kx), pos[0], pos[1])
+            ky, vy = self.kv_y(y).view(B, -1, 2, H, Hc).unbind(2)
+            k = torch.cat([kx, self.k_norm(ky)], dim=1)
+            v = torch.cat([vx, vy], dim=1)
+            return self.proj_drop(self.proj(fa3_attention(q, k, v, mask).reshape(B, N, C)))
         qkv_x = self.qkv_x(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, kx, vx = qkv_x[0], qkv_x[1], qkv_x[2]
         q = self.q_norm(q.contiguous())
         kx = self.k_norm(kx.contiguous())
-        q, kx = apply_rotary_emb(q, kx, freqs_cis=pos)
+        q, kx = apply_rotary_emb_real(q, kx, pos[0], pos[1])   # perf C4: pos = (cos, sin)
         kv_y = self.kv_y(y).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         ky, vy = kv_y[0], kv_y[1]
         ky = self.k_norm(ky.contiguous())
@@ -92,7 +161,7 @@ class Attention(nn.Module):
         k = k.view(B, self.num_heads, -1, C // self.num_heads).contiguous()  # B, H, N, Hc
         v = v.view(B, self.num_heads, -1, C // self.num_heads).contiguous()
 
-        x = attention(q, k, v)
+        x = attention(q, k, v) if mask is None else attention(q, k, v, attn_mask=mask)   # mask: [B,1,1,N+T]
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -110,9 +179,14 @@ class FlattenDiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, y, c, pos):
+    def forward(self, x, y, c, pos, mask=None):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), y, pos)
+        if _FUSED_NORM:   # lever K: norm1 + modulation; the first residual add + norm2 + modulation
+            h = mod_rmsnorm(x, self.norm1.weight, shift_msa, scale_msa, self.norm1.variance_epsilon)
+            x, h = res_mod_rmsnorm(x, self.attn(h, y, pos, mask), gate_msa, self.norm2.weight, shift_mlp, scale_mlp,
+                                   self.norm2.variance_epsilon)
+            return x + gate_mlp * self.mlp(h)
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), y, pos, mask)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -138,8 +212,26 @@ class TextRefineAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
+        if isinstance(mask, dict):   # lever E: packed captions, x [S, C]
+            S, C = x.shape
+            H, Hc = self.num_heads, C // self.num_heads
+            q, k, v = self.qkv(x).view(S, 3, H, Hc).unbind(1)
+            q, k = self.q_norm(q), self.k_norm(k)
+            if _TEXT_ATTN == "fa3":   # the kernel leaves the dummy rows after cu[-1] unwritten: zero them
+                o = fa3_varlen(q, k, v, mask["cu"], mask["cu"], mask["max_T"], mask["max_T"]) * mask["real"][:, None, None]
+            else:   # SDPA on the padded layout (faster than FA3 at T ~ 50, w1321); padded queries are dropped again
+                B, Tp = mask["kmask"].shape
+                pad = lambda t: t.new_zeros(B * Tp + 1, H, Hc).index_copy(0, mask["pidx"], t)[:B * Tp].view(B, Tp, H, Hc).transpose(1, 2)
+                o = attention(pad(q), pad(k), pad(v), attn_mask=mask["kmask"][:, None, None, :]).transpose(1, 2).reshape(B * Tp, H, Hc)
+                o = torch.cat([o, o.new_zeros(1, H, Hc)]).index_select(0, mask["pidx"])   # dummy rows read the zero row
+            return self.proj_drop(self.proj(o.reshape(S, C)))
         B, N, C = x.shape
+        if mask is not None and mask.dtype == torch.int32 and _TEXT_ATTN == "fa3":   # lever A: caption length per sample
+            q, k, v = self.qkv(x).view(B, N, 3, self.num_heads, C // self.num_heads).unbind(2)
+            return self.proj_drop(self.proj(fa3_attention(self.q_norm(q), self.k_norm(k), v, mask).reshape(B, N, C)))
+        if mask is not None and mask.dtype == torch.int32:   # lever A with SDPA in the text blocks: lengths -> key mask
+            mask = (torch.arange(N, device=x.device)[None] < mask[:, None])[:, None, None, :]
         qkv_x = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv_x[0], qkv_x[1], qkv_x[2]
         q = self.q_norm(q)
@@ -147,7 +239,7 @@ class TextRefineAttention(nn.Module):
         q = q.view(B, self.num_heads, -1, C // self.num_heads)  # B, H, N, Hc
         k = k.view(B, self.num_heads, -1, C // self.num_heads).contiguous()  # B, H, N, Hc
         v = v.view(B, self.num_heads, -1, C // self.num_heads).contiguous()
-        x = attention(q, k, v)
+        x = attention(q, k, v) if mask is None else attention(q, k, v, attn_mask=mask)   # mask: [B,1,1,T]
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
@@ -166,9 +258,18 @@ class TextRefineBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, mask=None):
+        if isinstance(mask, dict):   # lever E: x [S, C]; each token takes its sample's modulation
+            # each token takes its sample's modulation as a product with the [S, B] one-hot assignment: the forward gives
+            # exactly the gathered values (1.0 times one value, fp32 accumulation), and the backward sums each sample's
+            # tokens in one fp32-accumulated GEMM, as the padded path's broadcast does, where an index_select would
+            # accumulate them with bf16 atomics (index_add, through Inductor's proxy executor)
+            m = mask["onehot"].to(c.dtype) @ self.adaLN_modulation(c).squeeze(1)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = m.chunk(6, dim=-1)
+            x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), mask)
+            return x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), mask)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -289,13 +390,19 @@ class JiT_T2I(nn.Module):
         self.weight_path = weight_path
         self.load_ema = load_ema
 
+    # MFU lever X under DDP (the whole model compiled with CUDA graphs): the tables are cached on first use, so make them
+    # eagerly, in the ordinary memory pool (a table first made inside a graph's warm-up would live in the graphs' pool
+    # outside every graph output, which cudagraph trees refuse)
+    @(torch.compiler.disable if os.environ.get("GPIC_PROF_DEN_COMPILE_MODE") == "reduce-overhead" else (lambda f: f))
     def fetch_pos(self, height, width, device):
-        if (height, width) in self.precompute_pos:
-            return self.precompute_pos[(height, width)].to(device)
-        else:
-            pos = precompute_freqs_cis_2d(self.hidden_size // self.num_groups, height, width).to(device)
-            self.precompute_pos[(height, width)] = pos
-            return pos
+        """(cos, sin) of the 2D RoPE angles, [N, Hc/2] float32 each (perf C4: real parts of freqs_cis)."""
+        # perf C7: cached on the device. A CPU cache made every forward copy both tables from pageable memory, and a
+        # pageable copy blocks the host until the GPU has drained its queue (35-41 ms per step, 2026-11-01 profile).
+        key = (height, width, torch.device(device))
+        if key not in self.precompute_pos:
+            pos = precompute_freqs_cis_2d(self.hidden_size // self.num_groups, height, width)
+            self.precompute_pos[key] = (pos.real.contiguous().float().to(device), pos.imag.contiguous().float().to(device))
+        return self.precompute_pos[key]
 
     def initialize_weights(self):
         # Basic initialization
@@ -347,23 +454,44 @@ class JiT_T2I(nn.Module):
         )
         return x
     
-    def forward(self, x, t, y, return_layer=None):
+    def forward(self, x, t, y, return_layer=None, y_mask=None, y_pack=None):
+        """y_mask (ladder option B): [B, T] bool, True = a real caption token, T <= txt_max_length; None = the
+        official unmasked path (y padded to txt_max_length). y_pack (lever E): packed captions, y [S, txt_embed_dim]."""
         B, _, H, W = x.shape
         x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
-        ypos = self.y_pos_embedding
+        if y_pack is not None:
+            t = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
+            y = self.y_embedder(y) + self.y_pos_embedding[0].index_select(0, y_pack["pos"]).to(y.dtype)
+            condition = nn.functional.silu(t)
+            for block in self.text_refine_blocks:
+                y = block(y, condition, y_pack)
+            x = self.x_embedder(x)
+            x += self.pos_embed
+            for block in self.blocks:
+                x = block(x, y, condition, xpos, y_pack)
+            return self.unpatchify(self.final_layer(x), H, W)
+        ypos = self.y_pos_embedding if y_mask is None else self.y_pos_embedding[:, :y.shape[1]]
+        text_mask = full_mask = None
+        if y_mask is not None and _ATTN == "fa3":   # lever A: valid keys per sample; captions are left-aligned (padding after)
+            text_mask = y_mask.sum(1, dtype=torch.int32)
+            # (the conditioners check that every mask is left-aligned: src/models/conditioner/cached_text.py, review M3)
+            full_mask = text_mask + x.shape[1]
+        elif y_mask is not None:   # SDPA boolean masks, True = attend
+            text_mask = y_mask[:, None, None, :]
+            full_mask = torch.cat([torch.ones(B, 1, 1, x.shape[1], dtype=torch.bool, device=x.device), text_mask], dim=-1)
         t = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
         y = self.y_embedder(y).view(B, -1, self.hidden_size) + ypos.to(y.dtype)
         condition = nn.functional.silu(t)
         for i, block in enumerate(self.text_refine_blocks):
-            y = block(y, condition)
+            y = block(y, condition) if text_mask is None else block(y, condition, text_mask)
 
         x = self.x_embedder(x)
         x += self.pos_embed
         for i, block in enumerate(self.blocks):
             if return_layer is not None and i==return_layer:
                 feat = x
-            x = block(x, y, condition, xpos)
+            x = block(x, y, condition, xpos) if full_mask is None else block(x, y, condition, xpos, full_mask)
             
         x = self.final_layer(x)
         output = self.unpatchify(x, H, W)

@@ -82,3 +82,6 @@ if __name__ == "__main__":
                             auto_configure_optimizers=False,
                             save_config_callback=ReWriteRootSaveConfigCallback,
                             save_config_kwargs={"overwrite": True})
+    train_dataset = getattr(cli.datamodule, "train_dataset", None)
+    if hasattr(train_dataset, "stop_workers"):
+        train_dataset.stop_workers()
