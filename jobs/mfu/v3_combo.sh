@@ -12,6 +12,6 @@
 # (jobs/mfu/widths_nooff.sh, 2048 steps: d768 and d640, A+C+D against A+C+D+H1).
 # usage: v3_combo.sh <code worktree>
 WT=${1:?code worktree}
-D=$(dirname "$(readlink -f "$0")")
+D=$WT/jobs/mfu   # wq runs a copy of this script: find the others in the worktree
 V2_MODES=flat bash $D/v2c_resume.sh $WT
 WIDTHS_NO_OFF=1 bash $D/widths.sh $WT 2048 768:ACD,ACDH1 640:ACD,ACDH1

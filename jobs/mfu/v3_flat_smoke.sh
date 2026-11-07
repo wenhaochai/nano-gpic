@@ -12,4 +12,4 @@
 # checkpoints' layout against 5cd3372's smoke (the same keys and shapes); gmflow_run4's evaluation on ms-step=001600.
 # usage: v3_flat_smoke.sh <code worktree>
 export V2_MODES=flat
-exec bash "$(dirname "$(readlink -f "$0")")/v2c_resume.sh" "$@"
+exec bash "${1:?code worktree}/jobs/mfu/v2c_resume.sh" "$@"   # wq runs a copy of this script: find the others in the worktree
