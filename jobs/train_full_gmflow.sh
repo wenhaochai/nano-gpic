@@ -14,7 +14,7 @@
 # and the W&B run ladder-full-gmflow-k<K>-<size>; segment k resumes where segment k-1 stopped. ms checkpoints at the multiples of steps/4, last.ckpt every C0/8.
 # Only d640 to d1024: from d1280 train_ladder.sh sends a run to the point model's MFU worktree, which has no GMFlow, so wider sizes are refused here.
 # Code: the frozen worktree gpic-wt/ladder_full_gmflow_run (branch ladder-full-gmflow); the point model's gpic-wt/ladder_full_run is not touched.
-# Evaluations: gpic-wt/gmflow_run7/jobs/evals_gmflow.sh <K> ... with LADDER_RUN_ROOT this root.
+# Evaluations: gpic-wt/gmflow_run4/jobs/evals_gmflow.sh <K> ... with this root (the code of the point model's full-ladder evaluations).
 # usage: train_full_gmflow.sh <K> <size> <d> <nb> <nt> <C0 steps> <multiple>
 set -o pipefail
 WC=/scratch/gpfs/GROUP/USER
