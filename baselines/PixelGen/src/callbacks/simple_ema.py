@@ -19,6 +19,7 @@ class SimpleEMA(Callback):
         self.every_n_steps = every_n_steps
         self._stream = None   # perf C3: created on the parameters' own device (was GPU 0 on every rank)
         self.previous_step = 0
+        self.fused = False    # MFU lever H (GPIC_MFU_FUSED_OPT=2): the optimizer's kernel updates the EMA
 
     def setup_models(self, net: nn.Module, ema_net: nn.Module):
         self.net_params = list(net.parameters())
@@ -72,6 +73,8 @@ class SimpleEMA(Callback):
         if trainer.global_step == self.previous_step:
             return
         self.previous_step = trainer.global_step
+        if self.fused:
+            return
         if trainer.global_step % self.every_n_steps == 0:
             self.ema_step()
 

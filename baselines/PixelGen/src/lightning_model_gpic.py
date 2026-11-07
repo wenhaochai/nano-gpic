@@ -135,17 +135,29 @@ class LightningModel(pl.LightningModule):
         """perf C3: Lightning's mixed-precision plugin refuses to clip when the optimizer is fused (it assumes the
         optimizer unscales gradients), although bf16 autocast has no gradient scaler. Clip exactly as Lightning's
         'norm' algorithm does: the global 2-norm over every parameter of the optimizer."""
+        # MFU lever H (GPIC_MFU_FUSED_OPT, src/utils/fused_adamw_ema.py): the same norm and clip coefficient, and the
+        # optimizer's kernel multiplies the gradients by it (no separate pass over them)
+        fused = os.environ.get("GPIC_MFU_FUSED_OPT", "0") != "0"
+        opt = getattr(optimizer, "_optimizer", optimizer)
         if os.environ.get("GPIC_MFU_FSDP") == "1":   # MFU lever B: replicated grads averaged, the same global-norm clip
             from src.utils.fsdp_setup import sync_replicated_grads, clip_grad_norm_
             sync_replicated_grads(self._replicated)
             if gradient_clip_val:
                 assert gradient_clip_algorithm in (None, "norm"), gradient_clip_algorithm
-                clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], gradient_clip_val)
+                out = clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], gradient_clip_val, apply=not fused)
+                if fused:
+                    opt.clip_coef = out[1]
             return
         if not gradient_clip_val:
             return
         assert gradient_clip_algorithm in (None, "norm"), gradient_clip_algorithm
         params = [p for g in optimizer.param_groups for p in g["params"]]
+        if fused:   # torch.nn.utils.clip_grad_norm_ without its _foreach_mul_
+            grads = [p.grad for p in params if p.grad is not None]
+            total_norm = torch.nn.utils.clip_grad._get_total_norm(grads, 2.0, False, True)
+            clip_coef = gradient_clip_val / (total_norm + 1e-6)
+            opt.clip_coef = torch.clamp(clip_coef, max=1.0)
+            return
         torch.nn.utils.clip_grad_norm_(params, gradient_clip_val, foreach=True)
 
     def configure_callbacks(self) -> Union[Sequence[Callback], Callback]:
@@ -168,7 +180,11 @@ class LightningModel(pl.LightningModule):
                             {"params": [p for p in params_denoiser if not is_dtensor(p)]}] + [g for g in param_groups[1:] if g["params"]]
         # optimizer: torch.optim.Optimizer = self.optimizer([*params_trainer, *params_denoiser])
         optimizer: torch.optim.Optimizer = self.optimizer(param_groups)
-        if os.environ.get("GPIC_MFU_FSDP") == "1" and os.environ.get("GPIC_MFU_LOCAL_OPT") == "1":
+        if os.environ.get("GPIC_MFU_FUSED_OPT", "0") != "0":   # MFU lever H: clip multiply + AdamW (+ EMA) in one kernel
+            from src.utils.fused_adamw_ema import FusedAdamWEMA   # (local tensors of DTensors too, as lever B2)
+            assert type(optimizer) is torch.optim.AdamW and optimizer.defaults["fused"], type(optimizer)
+            optimizer = FusedAdamWEMA.like(optimizer, param_groups)
+        elif os.environ.get("GPIC_MFU_FSDP") == "1" and os.environ.get("GPIC_MFU_LOCAL_OPT") == "1":
             from src.utils.fsdp_setup import ShardLocalAdamW   # MFU lever B2: AdamW on the shards' local tensors
             assert type(optimizer) is torch.optim.AdamW and optimizer.defaults["fused"], type(optimizer)
             optimizer = ShardLocalAdamW.like(optimizer, param_groups)
@@ -204,6 +220,15 @@ class LightningModel(pl.LightningModule):
         if os.environ.get("GPIC_MFU_FSDP") != "1":   # FSDP2: the sharded EMA is fp32 already
             self.ema_denoiser.to(torch.float32)
         self.ema_tracker.setup_models(net=self.denoiser, ema_net=self.ema_denoiser)
+        if os.environ.get("GPIC_MFU_FUSED_OPT", "0") == "2":   # MFU lever H: the optimizer's kernel also updates the EMA
+            from src.utils.fused_adamw_ema import FusedAdamWEMA
+            opt = self.trainer.optimizers[0]
+            assert isinstance(opt, FusedAdamWEMA) and len(self.trainer.optimizers) == 1, type(opt)
+            assert self.ema_tracker.every_n_steps == 1, self.ema_tracker.every_n_steps
+            # the parameters without gradients (pos_embed) keep their EMA: a lerp between equal values is the identity
+            opt.ema_of = dict(zip(self.denoiser.parameters(), self.ema_denoiser.parameters()))
+            opt.ema_weight = 1.0 - self.ema_tracker.decay
+            self.ema_tracker.fused = True
         print(f"[rank {self.trainer.global_rank}] on_train_start done")
 
     def on_load_checkpoint(self, checkpoint):

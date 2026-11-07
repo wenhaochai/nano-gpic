@@ -119,6 +119,8 @@ def main():
     ap.add_argument("--fsdp", action="store_true", help="FSDP2 instead of DDP: per-block fully_shard, bf16 compute params, "
                     "fp32 reduce-scatter, fused AdamW and EMA on the shards; RMSNorm weights and pos_embed stay fp32 and "
                     "replicated (all-reduced), as autocast uses them in fp32")
+    ap.add_argument("--fused-opt", type=int, default=0, choices=(0, 1, 2), help="lever H (src/utils/fused_adamw_ema.py): "
+                    "1 = the clip multiply and AdamW in one kernel, 2 = also the EMA lerp (DDP or one GPU)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
     nb, nt = (a.nb, a.nt) if a.nb else SIZES[a.d]
@@ -209,6 +211,11 @@ def main():
         params = [p for p in net.parameters() if p.requires_grad]
         opt = torch.optim.AdamW(params, lr=1e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0, fused=True)
         ema_params, net_params = list(ema.parameters()), list(net.parameters())
+        if a.fused_opt:
+            from src.utils.fused_adamw_ema import FusedAdamWEMA
+            opt = FusedAdamWEMA.like(opt, [{"params": params}])
+            if a.fused_opt == 2:   # pos_embed (no gradient) keeps its EMA, which equals it
+                opt.ema_of, opt.ema_weight = dict(zip(net_params, ema_params)), 1.0 - 0.9999
 
     # batches: a pool on the GPU, cycled
     rng = random.Random(a.seed * 1000 + (0 if a.same_T else rank))
@@ -258,14 +265,22 @@ def main():
         if opt is None:   # FSDP2
             torch.cuda.current_stream().wait_stream(ema_stream)
             gn = fsdp_update()
+        elif a.fused_opt:   # clip_grad_norm_ without its multiply: the fused kernel applies the coefficient
+            grads = [p.grad for p in params if p.grad is not None]
+            gn = torch.nn.utils.clip_grad._get_total_norm(grads, 2.0, False, True)
+            opt.clip_coef = torch.clamp(1.0 / (gn + 1e-6), max=1.0)
+            torch.cuda.current_stream().wait_stream(ema_stream)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
         else:
             gn = torch.nn.utils.clip_grad_norm_(params, 1.0, foreach=True)
             torch.cuda.current_stream().wait_stream(ema_stream)   # SimpleEMA._join before the optimizer step
             opt.step()
             opt.zero_grad(set_to_none=True)
-        ema_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(ema_stream), torch.no_grad():
-            torch._foreach_lerp_(ema_params, net_params, 1.0 - 0.9999)
+        if a.fused_opt != 2:
+            ema_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(ema_stream), torch.no_grad():
+                torch._foreach_lerp_(ema_params, net_params, 1.0 - 0.9999)
         if rec is not None:
             l_ = loss.detach().clone()
             if ddp:   # the global mean loss: a rebalanced rank holds other samples than before
@@ -365,6 +380,8 @@ def main():
         res["param_sum"] = float(sum(p.double().sum() for p in net_params))
         res["param_abs"] = float(sum(p.double().abs().sum() for p in net_params))
         res["ema_sum"] = float(sum(p.double().sum() for p in ema_params))
+    if a.fused_opt:   # how often the fused kernel's address tables were rebuilt (once if the gradients keep their memory)
+        res["fused_rebuilds"] = sum(t.rebuilds for t in opt._tables.values())
     if rank == 0:
         print(f"d{a.d} {nb}+{nt} world {world} {res['mode']} bucket {a.bucket_mb} hook {a.hook} T={a.T}{' same' if a.same_T else ''}: mean {mean:.2f} ms, median "
               f"{res['median_ms']:.2f}, MFU {100 * res.get('mfu', float('nan')):.1f}%, peak {res['peak_alloc_gb']:.1f} GiB, "

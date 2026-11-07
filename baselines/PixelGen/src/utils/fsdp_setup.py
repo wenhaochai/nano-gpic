@@ -68,10 +68,11 @@ def sync_replicated_grads(params):
 
 
 @torch.no_grad()
-def clip_grad_norm_(params, max_norm):
+def clip_grad_norm_(params, max_norm, apply=True):
     """torch.nn.utils.clip_grad_norm_ over sharded (DTensor) and replicated parameters: the 2-norm of all gradients,
     each element counted once (shards all-reduced, replicated parameters counted on every rank once), then the same
-    clip_coef = max_norm / (norm + 1e-6), clamped at 1."""
+    clip_coef = max_norm / (norm + 1e-6), clamped at 1. apply=False (lever H): returns (norm, clip_coef) without the
+    multiply, which the fused optimizer kernel does."""
     sh = [p.grad.to_local() for p in params if p.grad is not None and is_dtensor(p.grad)]
     rp = [p.grad for p in params if p.grad is not None and not is_dtensor(p.grad)]
     dev = (sh or rp)[0].device
@@ -81,6 +82,8 @@ def clip_grad_norm_(params, max_norm):
         sq = sq + torch.stack(torch._foreach_norm(rp)).pow(2).sum()
     norm = sq.sqrt()
     coef = (max_norm / (norm + 1e-6)).clamp(max=1.0)
+    if not apply:
+        return norm, coef
     if sh:
         torch._foreach_mul_(sh, coef)
     if rp:

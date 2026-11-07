@@ -186,6 +186,23 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
 - Expectation: 5-15% off the element-wise time, 2-5% of the step.
 - Result: pending.
 
+### H. The clip multiply, AdamW and the EMA in one kernel (`GPIC_MFU_FUSED_OPT=1`: clip + AdamW; `=2`: also the EMA)
+- Hypothesis: under DDP every rank runs the clip's multiply (a read and a write of every gradient), torch's fused AdamW
+  and the EMA lerp over all parameters: 2.3 ms of a 17.4 ms d640 step on one GPU (fused AdamW 1.26, EMA lerp 0.54, clip
+  multiply 0.33, clip norm 0.18; probe9 trace w1382), at about 1.3 TB/s, so about 7.6 ms of d1024's 48 ms. torch's
+  multi-tensor launches use 320 blocks of 512 threads per launch. One kernel with a block per 4096 elements of every
+  tensor (address tables on the GPU), the clip coefficient applied in registers and the EMA read once with the new
+  parameter moves 36 instead of 48 bytes per parameter at a higher bandwidth.
+- Setup: src/utils/fused_adamw_ema.py (FusedAdamWEMA, a torch.optim.AdamW whose step runs the Triton kernel; the state
+  stays AdamW's, so checkpoints and resumes are unchanged). configure_gradient_clipping computes the same norm and
+  coefficient as torch.nn.utils.clip_grad_norm_ and hands the coefficient to the optimizer; with =2 SimpleEMA skips its
+  lerp. DDP, and the local shards under FSDP2.
+- Same math, bit for bit by design: torch 2.7's adam_math (double-precision moments and bias corrections, IEEE fp32
+  division and square root) and lerp, operation for operation; nvcc's FMA contractions are matched by testing every
+  placement against torch (tools/mfu/tests/test_fused_adamw_ema.py).
+- Expectation: d1024 -4 to -5 ms (about -9%), d640 -1.5 ms; under FSDP2 (from d1280) about -1 ms.
+- Result: pending (jobs/mfu/probe12.sh).
+
 ### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
 - Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches
   (13%) make a step wait in about two thirds of the steps (5.9 ms at d640, 6.1 ms at d1280, w1316). A FLOP model of the
