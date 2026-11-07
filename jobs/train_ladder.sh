@@ -69,7 +69,7 @@ echo "$(date -u +%FT%TZ) shard seed $GPIC_SHARD_SEED, shard log kept up to $KEEP
 BENCH_CB=""
 if [ -n "${BENCH_OUT:-}" ]; then BENCH_CB=',{"class_path":"src.callbacks.bench.BenchTimer"}'; fi
 # the ms hook first: a kill between the two saves must not leave last.ckpt ahead of a missing ms file (review N1)
-CB='[{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"ms-{step:06d}","monitor":null,"save_last":false,"save_top_k":-1,"every_n_train_steps":'$MS'}},{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"resume-{step:06d}","monitor":null,"save_last":true,"save_top_k":0,"every_n_train_steps":'$LAST'}},{"class_path":"src.callbacks.compile_warmup.CompileWarmup"},{"class_path":"src.callbacks.host_tuning.HostTuning"},{"class_path":"src.callbacks.shard_clock.ShardClock"}'$BENCH_CB']'
+CB='[{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"ms-{step:06d}","monitor":null,"save_last":false,"save_top_k":-1,"every_n_train_steps":'$MS'}},{"class_path":"src.callbacks.model_checkpoint.CheckpointHook","init_args":{"filename":"resume-{step:06d}","monitor":null,"save_last":true,"save_top_k":0,"every_n_train_steps":'$LAST'}},{"class_path":"src.callbacks.compile_warmup.CompileWarmup"},{"class_path":"src.callbacks.host_tuning.HostTuning"},{"class_path":"src.callbacks.shard_clock.ShardClock"},{"class_path":"src.callbacks.none_refcount.NoneRefcount","init_args":{"path":"'$RUN/none_refcount.txt'","every":1000}}'$BENCH_CB']'
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
 export GPIC_SHARD_SEED GPIC_SHARD_LOG_DIR=$RUN   # one shard order per run and pass, shared by all ranks (above)
