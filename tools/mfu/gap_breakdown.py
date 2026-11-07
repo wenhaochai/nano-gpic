@@ -75,6 +75,8 @@ def arm(d):
     n = min(len(x) for x in rows)
     mean["data_wait"] = st.mean(st.mean(1000 * x["data_wait_s"] for x in rr[n // 2:n]) for rr in rows)
     mean["step_ms"] = st.mean(x.get("step_ms", 1000 * (x["t_end"] - x["t_start"])) for x in rows[0][n // 2:n])
+    mean["nonfinite_loss_steps"] = sum(1 for x in rows[0] if not (isinstance(x.get("loss"), float) and x["loss"] == x["loss"]
+                                                               and abs(x["loss"]) != float("inf")))
     log = open(os.path.join(d, "train.log"), errors="replace").read()
     sb = re.findall(r"\[shared_bucket\].*DataLoader ([\d.]+) ms, all-reduce ([\d.]+) ms", log)
     if sb:
@@ -89,6 +91,8 @@ if __name__ == "__main__":
     for d in sys.argv[1:]:
         m = arm(d)
         gpu = " ".join(f"{c} {m[c]:.1f}" for c in CLASSES)
+        if m["nonfinite_loss_steps"]:
+            print(f"{os.path.basename(d)}: WARNING {m['nonfinite_loss_steps']} steps with a non-finite loss: the times are not valid")
         print(f"{os.path.basename(d)}: step {m['step_ms']:.1f} ms (second half); profiled window per step {m['window']:.1f}: "
               f"GPU busy {m['busy']:.1f} [{gpu}], idle {m['idle']:.1f}, straggler wait in NCCL {m['straggler']:.1f}; "
               f"data wait {m['data_wait']:.1f}" + (f"; bucket waits per micro-batch: pull {m['bucket_pull']:.1f}, "
