@@ -47,9 +47,10 @@ def _rsqrt(v, INTERP: tl.constexpr):
         return libdevice.rsqrt(v)
 
 
+# fp32 -> DT, round to nearest even (the interpreter's own bf16 cast truncates: emulate it there). No docstrings in the
+# jitted functions: with the C++ launcher Inductor embeds their source in a triple-quoted block of its generated file.
 @triton.jit
 def _to(v, DT: tl.constexpr, INTERP: tl.constexpr):
-    """fp32 -> DT, round to nearest even (the interpreter's own bf16 cast truncates: emulate it there)."""
     if INTERP:
         if DT == tl.bfloat16:
             u = v.to(tl.uint32, bitcast=True)

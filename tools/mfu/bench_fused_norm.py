@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Lever K's kernels alone (src/models/layers/fused_norm.py) against the same ops compiled by Inductor, one GPU: forward +
 backward of one site per width (B 32, N 256 image tokens, bf16, the modulation as chunks of one adaLN output), CUDA
-events over many iterations. Site 1 = norm1 + modulation; site 2 = residual add + norm2 + modulation (with the upstream
+events over many iterations (wall, bound by the host's launches in eager mode) and the profiler's sum of kernel times
+(GPU time: what the kernels cost inside a compiled step, where Inductor launches them from its own code). Site 1 = norm1 + modulation; site 2 = residual add + norm2 + modulation (with the upstream
 gradient of x_new). Also a sweep of the backward's rows per program and warps. The bytes the site must move at least
 (each [B, N, C] tensor once) set the reference bandwidth.
 usage: python bench_fused_norm.py [--widths 1024,1280,1536,1792] [--iters 200]"""
@@ -20,6 +21,18 @@ def ref(x, a, gate, w, shift, scale, has_res):
     hs = x.float()
     hs = hs * torch.rsqrt(hs.pow(2).mean(-1, keepdim=True) + EPS)
     return x, (w * hs).to(x.dtype) * (1 + scale) + shift
+
+
+def gpu_time(f, iters):
+    """Sum of the kernels' device time per iteration (ms), from the profiler."""
+    for _ in range(5):
+        f()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            f()
+        torch.cuda.synchronize()
+    return sum(e.self_device_time_total for e in prof.key_averages()) / iters / 1e3
 
 
 def timed(f, iters):
@@ -69,24 +82,25 @@ def main():
             return f
         for has_res, nbytes in ((False, 2 + 3), (True, 4 + 6)):   # site 1: x, h | dh, dx (+ x again); site 2: x, a, xn, h | dh, dxn, xn, a, dx, da
             site = "site 2" if has_res else "site 1"
-            t = {impl: timed(run(impl, has_res), args.iters) for impl in ("eager", "inductor", "k")}
-            print(f"d{C} {site}: eager {t['eager']:.3f}, inductor {t['inductor']:.3f}, K {t['k']:.3f} "
-                  f"(K saves {t['inductor'] - t['k']:+.3f} ms per site; floor {nbytes * unit:.3f})")
-        # backward sweep at site 2
+            t = {impl: gpu_time(run(impl, has_res), 50) for impl in ("eager", "inductor", "k")}
+            wall = {impl: timed(run(impl, has_res), args.iters) for impl in ("inductor", "k")}
+            print(f"d{C} {site} GPU time: eager {t['eager']:.3f}, inductor {t['inductor']:.3f}, K {t['k']:.3f} ms "
+                  f"(K saves {t['inductor'] - t['k']:+.3f} ms per site; floor {nbytes * unit:.3f}); wall in eager mode: "
+                  f"inductor {wall['inductor']:.3f}, K {wall['k']:.3f}")
         best = None
-        for rows in (8, 16, 32, 64):
+        for rows in (16, 32, 64):
             for warps in (4, 8, 16):
                 fn.ROWS_B = rows
                 os.environ["GPIC_MFU_FUSED_NORM_WARPS"] = str(warps)
                 try:
-                    tk = timed(run("k", True), args.iters)
+                    tk = gpu_time(run("k", True), 30)
                 except Exception as e:   # register pressure etc.
                     print(f"   rows {rows} warps {warps}: {type(e).__name__}"); continue
                 best = min(best or (9e9, 0, 0), (tk, rows, warps))
-                print(f"   site 2, backward rows per program {rows}, warps {warps}: {tk:.3f} ms")
+                print(f"   site 2 GPU time, backward rows per program {rows}, warps {warps}: {tk:.3f} ms")
         fn.ROWS_B = 16
         os.environ.pop("GPIC_MFU_FUSED_NORM_WARPS", None)
-        print(f"d{C} best site-2 setting: rows {best[1]}, warps {best[2]}: {best[0]:.3f} ms")
+        print(f"d{C} best site-2 setting: rows {best[1]}, warps {best[2]}: {best[0]:.3f} ms GPU time")
 
 
 if __name__ == "__main__":

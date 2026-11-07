@@ -70,10 +70,19 @@ def check(B, N, C, has_res, use_dxn, seed):
         h = mod_rmsnorm(X, Wt, SH, SC, EPS); xn = None
     L64, xn64, h64, noise_x, noise_h = ref64(x, a, gate, w, shift, scale, has_res)
     r_h = rounding_ratio(h.detach(), h64.detach(), noise_h)
+    if DEV == "cuda":   # the GPU's rsqrt (libdevice, as Inductor and torch use) is approximate: n may flip by one bf16 ulp
+        with torch.no_grad():
+            ulp = lambda v: torch.pow(2.0, torch.floor(torch.log2(v.abs().clamp_min(2.0 ** -126))) - 7)
+            sh64, sc64 = L64[4].detach(), L64[5].detach()
+            n64 = (h64.detach() - sh64) / (1 + sc64)
+            strict = 0.5 * ulp(h64.detach()) + noise_h
+            flips = float(((h.detach().double() - h64.detach()).abs() > strict).float().mean())
+            r_h = rounding_ratio(h.detach(), h64.detach(), noise_h + ulp(n64) * (1 + sc64).abs())
+        ok &= flips < 1e-3
     xe, he = reference(x, a, gate, w, shift, scale, EPS, has_res)
     r_he = rounding_ratio(he, h64.detach(), noise_h)
     line = (f"B={B} N={N} C={C} res={has_res} dxn={use_dxn}: forward error / (0.5 ulp + fp32 noise), at most 1 = "
-            f"correctly rounded: h {r_h:.2f} (eager ops {r_he:.2f})")
+            f"correctly rounded: h {r_h:.2f} (eager ops {r_he:.2f})" + (f", elements off by more than 0.5 ulp {flips:.4%} (n flipped by the approximate rsqrt)" if DEV == "cuda" else ""))
     ok &= r_h <= 1.0
     if has_res:
         r_x = rounding_ratio(xn.detach(), xn64.detach(), noise_x)
