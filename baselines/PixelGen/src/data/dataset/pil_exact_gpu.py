@@ -102,7 +102,8 @@ def pack(items, K=None):
     return {"src": flat, "src_off": torch.from_numpy(off), "xmin": torch.from_numpy(xmin), "kk": torch.from_numpy(kk),
             "geo": torch.from_numpy(np.stack([g1, g2])),     # [2 passes, 6, B] int64
             "mid_off": torch.from_numpy(mid_off), "out_off": torch.arange(B, dtype=torch.int64) * (OUT * OUT * 3),
-            "K": int(K), "B": B, "mid_bytes": int(mid_bytes.sum()), "n_i_max": [int(g1[0].max()), int(g2[0].max())]}
+            "K": int(K), "B": B, "mid_bytes": int(mid_bytes.sum()), "n_i_max": [int(g1[0].max()), int(g2[0].max())],
+            "hw": torch.from_numpy(hw), "axis": torch.from_numpy(axis)}   # for lever E2's per-sample repacking
 
 
 def run(job):

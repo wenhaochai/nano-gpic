@@ -540,6 +540,10 @@ class GPICWebDataset(IterableDataset):
             **({"collate_fn": self._collate_cached if self.emb_dir else self._collate_grouped} if self.group_text_len else {}),
         )
         self._dataloader = loader.pipeline[0]
+        if os.environ.get("GPIC_MFU_REBALANCE") == "2":   # MFU lever E2: the deal over the ranks on the host, one step ahead
+            assert self.group_text_len and self.emb_dir and _PACK and _GPU_RESIZE, "lever E2 needs the cached, packed collate with lever C"
+            from src.data.rebalance_loader import RebalancingLoader
+            return RebalancingLoader(loader)
         n = int(os.environ.get("GPIC_PROF_CYCLE_BATCHES", 0))   # profiling switch (jobs/smoke_ladder_kernels.sh), unset in production
         if n and self.group_text_len:
             it = iter(loader)

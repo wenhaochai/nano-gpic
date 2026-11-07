@@ -86,6 +86,7 @@ export GPIC_MFU_ATTN=${GPIC_MFU_ATTN:-fa3}
 export GPIC_MFU_FSDP=${GPIC_MFU_FSDP:-$([ $D -ge 1280 ] && echo 1 || echo 0)}
 export GPIC_MFU_GPU_RESIZE=${GPIC_MFU_GPU_RESIZE:-1} GPIC_MFU_UINT8=${GPIC_MFU_UINT8:-1}
 export GPIC_MFU_PACK=${GPIC_MFU_PACK:-0} GPIC_MFU_REBALANCE=${GPIC_MFU_REBALANCE:-0}   # E: off until its slowdown is fixed (docs/mfu.md)
+# E2: GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=2 deals the samples on the host one step ahead (src/data/rebalance_loader.py)
 GPIC_MFU_ASYNC_CKPT=${GPIC_MFU_ASYNC_CKPT:-1}
 # B2 (AdamW and EMA on the shards' local tensors) and FSDP2 blocks per unit: under test (docs/mfu.md), off by default
 export GPIC_MFU_LOCAL_OPT=${GPIC_MFU_LOCAL_OPT:-0} GPIC_MFU_FSDP_GROUP=${GPIC_MFU_FSDP_GROUP:-1}
