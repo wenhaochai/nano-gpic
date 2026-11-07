@@ -173,7 +173,20 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   shows in the loss: check gradients or Adam's moments. The smoke's moments (exp_avg_sq FSDP2 / DDP: median 1.04 sharded,
   1.30 replicated, inside the DDP / DDP scatter) rule out a scale error in production.
 - Expectation: B pays at d1024 (24% of the full ladder's GPU-h) and maybe d896.
-- Result: pending (GPU, prio 0).
+- Result (w1405, w1406; production path, the same batches, 512 steps, mean of steps 101-511, ms):
+
+| width | off | A+C+D | A+B+C+D | + L | + L + G3 | + L + G2 |
+|---|---|---|---|---|---|---|
+| d768 | 31.85 | 29.32 | - | - | 38.64 | - |
+| d1024 | 52.28 | 48.43 (23.2%) | 54.59 | 52.92 | 42.85 (26.2%) | - |
+| d1280 | 83.54 | - | 65.06 | 65.00 | - | 64.47 |
+
+  At d1024 the hooks were the cost: 15 FSDP2 units -> 5 (G3) takes 10 ms off, and FSDP2 now beats DDP by 11.5%.
+  L alone gives 1.7 ms. At d1280 (GPU-bound) G2 gives 0.6 ms. At d768 FSDP2 still loses by 9 ms.
+- Parity (tools/mfu/parity_loss.py against A+B+C+D, its profiled repeat as the floor): d1024 L last-200 relative
+  difference 7.1e-6, L+G3 2.9e-5 (floor 1.7e-5), the same mean loss over the last 500 steps to 6 digits; d1280 L+G2
+  within the floor. Against levers off, every FSDP2 arm differs as before (the compile boundaries; see B's checks).
+- Decision: L + G3 at d1024 (pending the group sweep w1418: G3/G4/G6 at d1024 and d896, and G3 + H2).
 
 ### G0. Inductor's autotuning of the element-wise and reduction kernels (Inductor flags; jobs/mfu/probe7.sh)
 - Hypothesis: the element-wise and reduction kernels (RMSNorm with the residual add, modulation, gates, SwiGLU, RoPE, and
