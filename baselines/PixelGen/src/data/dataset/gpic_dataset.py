@@ -74,19 +74,41 @@ class EpochShuffledShards(IterableDataset):
     in a pass. jobs/train_ladder.sh keeps one seed per run (shard_seed.txt), so every launch draws the same permutations,
     and keeps only the log lines up to the dump time stored in the resumed checkpoint (src/callbacks/shard_clock.py; a
     shard started later was read only for steps that the resume throws away, so it is read again). The log is read here,
-    in each rank's main process before the workers start, so all workers of a rank split the same remaining list."""
+    in each rank's main process before the workers start, so all workers of a rank split the same remaining list.
+    Repetition arms (subsets of GPIC train, owner 2026-11-07): with workers (the training set's data workers per rank) and
+    fewer shards n than B = world x workers slots, a pass holds k = B / gcd(n, B) copies of every shard (_repeat_copies),
+    so every worker of every rank reads the same number S = k n / B of entries (8 shards: k 32, S 1; 80 shards: k 16, S 5)
+    and the loader runs on all its workers, as on GPIC Full. The pass's schedule (_schedule) is k rounds, each a
+    permutation of the n shards drawn with the seed formula above, cut into S time slots of B entries; worker w of rank r
+    reads entries perm[r::world][w::workers] (in this mode this class splits by worker). All workers give one sample per
+    step on average, so a slot lasts about one shard (N samples) of steps, holds each shard B / n times (32 for 8 shards,
+    3 or 4 for 80), and the 8 batches of one global step (worker w of every rank: world consecutive entries) never hold
+    one shard twice when n is a multiple of world. Copy i of the m copies of a shard in its g-th slot of the run starts
+    at sample floor(N frac(u + g L / N + i / m)), u uniform and seeded by (seed, url), and reads L samples on from there,
+    past the shard's end to its start (_RotatedTar: seeks to a sample's first tar header, no decode). L is the smallest
+    sample count of the subset's shards (load_index), so every worker of every rank gives the same number of batches in a
+    pass and the ranks and workers stay in step for the whole run (with whole shards they drift apart by the shards' size
+    differences, and copies of one shard then meet in one step). The g L / N term starts each slot's copies where the
+    slot before stopped, so the reads of an image fall about N / m steps apart all run long, also across passes: the mean
+    gap of uniform random sampling (tools/sim_repeat.py). A copy leaves out N - L samples (at most 1.8% of a shard),
+    and they move every slot. The log names an entry "<url>#<copy>:<k>" and the resume keys on it; a resumed pass splits the rank's remaining entries over its workers
+    in schedule order (the workers' own remaining entries when the stop fell inside a slot), so no worker idles. With
+    n >= B, or without workers (the validation set, tests), k = 1 and everything is as before: the same permutations,
+    entries, worker split and logs."""
 
-    def __init__(self, urls, seed, log_dir=None):
+    def __init__(self, urls, seed, log_dir=None, workers=None):
         super().__init__()
         self.urls, self.seed, self.passes = list(urls), int(seed), 0
         self.rank, self.world = _rank_world()
+        self.workers = max(1, int(workers)) if workers is not None else None
+        self.k = _repeat_copies(len(self.urls), self.world * self.workers) if self.workers else 1
         self.log_path = os.path.join(log_dir, f"shards_started_rank{self.rank}.txt") if log_dir else None
-        self.skip = set()
+        self.skip, self.index, self.length = set(), None, None
         if self.log_path:
             self.passes, self.skip = self._resume_point()
             if self.passes or self.skip:
-                print(f"[shards] rank {self.rank}: resume in pass {self.passes}, {len(self.skip)} of its shards "
-                      f"started before ({self.log_path})", flush=True)
+                print(f"[shards] rank {self.rank}: resume in pass {self.passes}, {len(self.skip)} of its "
+                      f"{'entries' if self.k > 1 else 'shards'} started before ({self.log_path})", flush=True)
 
     def _perm(self, p):
         import random
@@ -94,14 +116,78 @@ class EpochShuffledShards(IterableDataset):
         random.Random(self.seed * 100003 + p).shuffle(urls)
         return urls
 
+    def _schedule(self, p):
+        """k > 1: the pass's entries in permutation order, each (name "<url>#<copy>:<k>", url, start fraction)."""
+        import random
+        rng = random.Random(self.seed * 100003 + p)
+        order = []
+        for _ in range(self.k):
+            r = list(self.urls)
+            rng.shuffle(r)
+            order += r
+        B = self.world * self.workers
+        # a shard's g-th time slot of the run (g = p S + t, S slots per pass) starts its copies at u + g L / N + i / m: a
+        # copy reads L samples on from its start, so a copy of slot g + 1 starts where one of slot g stopped, and the
+        # reads of an image keep their spacing across slots and passes (with a fresh start each pass, the first reads of
+        # a pass fall near the last reads of the pass before: up to 25 duplicate images in one step, tools/sim_repeat.py).
+        # The N - L samples a copy leaves out move by N - L every slot. Without the index (names only), the drift is 0.
+        S = self.k * len(self.urls) // B
+        u0 = {u: random.Random(f"{self.seed}:{u}").random() for u in self.urls}
+        drift = {u: (self.length / len(self.index[u][0]) if self.index is not None else 0.0) for u in self.urls}
+        copies, out = {u: 0 for u in self.urls}, []
+        for t, j in enumerate(range(0, len(order), B)):
+            slot = order[j:j + B]
+            m = {u: slot.count(u) for u in set(slot)}
+            seen = {u: 0 for u in m}
+            for u in slot:
+                out.append((f"{u}#{copies[u]}:{self.k}", u, (u0[u] + (p * S + t) * drift[u] + seen[u] / m[u]) % 1.0))
+                copies[u] += 1
+                seen[u] += 1
+        return out
+
+    def load_index(self, threads=8):
+        """k > 1: the sample offsets of every shard (tar_sample_offsets), read once in the rank's main process before the
+        data workers fork, so 32 workers x 8 ranks do not each read 25K headers per entry at the start of every pass."""
+        if self.k == 1:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        import time
+        t = time.time()
+        with ThreadPoolExecutor(threads) as ex:
+            self.index = dict(zip(self.urls, ex.map(tar_sample_offsets, self.urls)))
+        self.length = min(len(st) for st, _ in self.index.values())
+        print(f"[shards] rank {self.rank}: sample offsets of {len(self.urls)} shards in {time.time() - t:.1f} s; every copy "
+              f"reads {self.length} samples (shards hold {self.length}-{max(len(st) for st, _ in self.index.values())})", flush=True)
+
+    def parts(self, u, start):
+        """The byte ranges of a copy of shard u that starts at fraction `start`: L samples from sample floor(start N) on,
+        wrapping past the shard's end to its start."""
+        starts, end = self.index[u]
+        n, L = len(starts), self.length
+        a = min(int(start * n), n - 1)
+        b = a + L
+        if b <= n:
+            return [(int(starts[a]), int(starts[b]) if b < n else int(end))]
+        return [(int(starts[a]), int(end)), (0, int(starts[b - n]))]
+
+    def _names(self, p):
+        """The names of this rank's entries in pass p: urls (k = 1) or "<url>#<copy>:<k>"."""
+        if self.k == 1:
+            return self._perm(p)[self.rank::self.world]
+        return [e[0] for e in self._schedule(p)[self.rank::self.world]]
+
     def _resume_point(self):
-        """(pass, the shards of this rank started in that pass) from the rank's log: the newest pass with a started
-        shard, or the next pass when every shard of this rank in that pass was started."""
+        """(pass, the entries of this rank started in that pass) from the rank's log: the newest pass with a started
+        entry, or the next pass when every entry of this rank in that pass was started. An entry is a shard (k = 1) or
+        a copy of a shard (k > 1)."""
         try:
             with open(self.log_path) as f:
-                rows = [line.split() for line in f if line.strip()]
+                text = f.read()
         except FileNotFoundError:
             return 0, set()
+        rows = [line.split() for line in text.split("\n") if line.strip()]
+        if self.k > 1 and rows and not text.endswith("\n"):   # a torn "<url>#<copy>:<k>" can still have 3 fields: no newline marks it
+            rows[-1] = rows[-1][:2]
         if rows and len(rows[-1]) != 3:   # a worker killed inside its one write can leave a torn last line (review M8)
             print(f"[shards] rank {self.rank}: drops a torn last line of {self.log_path}: {' '.join(rows[-1])[:120]}", flush=True)
             rows = rows[:-1]
@@ -111,14 +197,17 @@ class EpochShuffledShards(IterableDataset):
         rows = [(int(p), u) for _, p, u in rows]
         p = max(q for q, _ in rows)
         done = {u for q, u in rows if q == p}
-        mine = set(self._perm(p)[self.rank::self.world])
-        assert done <= mine, (f"{self.log_path}: pass {p} names {len(done - mine)} shards that are not this rank's "
-                              f"(another seed, shard list or number of GPUs?), first {sorted(done - mine)[:2]}")
+        mine = set(self._names(p))
+        assert done <= mine, (f"{self.log_path}: pass {p} names {len(done - mine)} entries that are not this rank's "
+                              f"(another seed, shard list, number of GPUs or of workers?), first {sorted(done - mine)[:2]}")
         return (p + 1, set()) if done == mine else (p, done)
 
     def __iter__(self):
         rank, world = _rank_world()
         assert (rank, world) == (self.rank, self.world), ("rank or world size changed", (rank, world), (self.rank, self.world))
+        if self.k > 1:
+            yield from self._iter_copies()
+            return
         perm = self._perm(self.passes)
         urls = perm[rank::world]
         n_skip = 0
@@ -134,6 +223,123 @@ class EpochShuffledShards(IterableDataset):
         self.passes += 1
         for u in urls:
             yield dict(url=u, shard_pass=p)
+
+    def _iter_copies(self):
+        """k > 1: this worker's entries of the pass (the worker split is done here), without the ones the resume skips."""
+        p = self.passes
+        self.passes += 1
+        perm = self._schedule(p)
+        ents = perm[self.rank::self.world]
+        wi = torch.utils.data.get_worker_info()
+        if wi is not None:
+            assert wi.num_workers == self.workers, ("data workers changed", wi.num_workers, self.workers)
+        skip, self.skip = self.skip, set()   # only in the first pass of a resumed launch
+        left = [e for e in ents if e[0] not in skip]
+        if wi is None or wi.id == 0:   # one line per rank and epoch: every rank must print the same permutation
+            print(f"[shards] rank {self.rank} pass {p}: {self.k} copies of {len(self.urls)} shards, permutation "
+                  f"{' '.join(e[0].rsplit('/', 1)[-1] for e in perm[:3])}; {len(left)} entries for this rank, "
+                  f"{len(ents) // self.workers} per worker in a whole pass"
+                  + (f", {len(ents) - len(left)} started before the resume skipped" if len(left) < len(ents) else ""), flush=True)
+        for name, u, start in (left if wi is None else left[wi.id::wi.num_workers]):
+            d = dict(url=u, shard_pass=p, entry=name, start=start)
+            if self.index is not None:
+                d["parts"] = self.parts(u, start)
+            yield d
+
+
+def _repeat_copies(n, slots):
+    """Copies of each shard per pass: 1 with n >= slots shards, else the least k with k n a multiple of slots, so every
+    slot (a data worker of a rank) gets k n / slots entries: 8 shards on 8 x 32 slots -> 32 copies, 80 -> 16."""
+    return 1 if n >= slots else slots // math.gcd(n, slots)
+
+
+def tar_sample_offsets(path):
+    """(byte offset of each sample's first tar header, end of the last member) of a shard, from the headers alone (one
+    512-byte pread per member: 0.2 s for a GPIC shard of 25K members). A sample starts where the key changes, as in
+    webdataset's group_by_keys. Only plain ustar members, the only kind in GPIC train; anything else raises, so a
+    rotation never starts inside a sample."""
+    from webdataset.tariterators import base_plus_ext
+    fd = os.open(path, os.O_RDONLY)
+    starts, off, prev = [], 0, None
+    try:
+        while True:
+            h = os.pread(fd, 512, off)
+            if len(h) < 512 or h == bytes(512):
+                break
+            if h[156:157] not in (b"0", b"\0"):
+                raise ValueError(f"{path}: member at byte {off} has tar type {h[156:157]!r}; rotation reads only plain files")
+            name = h[:100].split(b"\0", 1)[0].decode()
+            if h[257:262] == b"ustar" and h[345:500].strip(b"\0"):
+                name = h[345:500].split(b"\0", 1)[0].decode() + "/" + name
+            key = base_plus_ext(name)[0]
+            if key != prev:
+                starts.append(off)
+                prev = key
+            off += 512 + (int(h[124:136].split(b"\0", 1)[0].strip() or b"0", 8) + 511) // 512 * 512
+    finally:
+        os.close(fd)
+    assert starts, f"{path}: no members"
+    return np.asarray(starts, dtype=np.int64), off
+
+
+class _RotatedTar:
+    """Byte ranges of a shard, each from a sample's first header to another's, then the two zero blocks that end a tar:
+    a valid tar stream of those samples (EpochShuffledShards.parts, k > 1)."""
+
+    def __init__(self, path, parts):
+        self.parts = [(int(a), int(b)) for a, b in parts]
+        self.f = open(path, "rb", buffering=int(os.environ.get("GOPEN_BUFFER", -1)))   # the buffer gopen gives a local file
+        self.left, self.tail = 0, bytes(1024)
+
+    def read(self, n=-1):
+        out = []
+        n = float("inf") if n is None or n < 0 else n
+        while n > 0:
+            if self.left == 0:
+                if not self.parts:
+                    break
+                a, b = self.parts.pop(0)
+                self.f.seek(a)
+                self.left = b - a
+                continue
+            b = self.f.read(int(min(n, self.left)))
+            if not b:
+                raise IOError(f"{self.f.name}: short read")
+            out.append(b)
+            n -= len(b)
+            self.left -= len(b)
+        if n > 0 and self.tail:
+            t, self.tail = self.tail[:int(min(n, len(self.tail)))], self.tail[int(min(n, len(self.tail))):]
+            out.append(t)
+        return b"".join(out)
+
+    def close(self):
+        self.f.close()
+
+
+def _rotated_tar_samples(src, handler=wds.warn_and_continue):
+    """wds.tarfile_to_samples for the entries of EpochShuffledShards with k > 1: each entry opened as a _RotatedTar over
+    its byte ranges, then webdataset's own expander and grouping, so each sample is the same as from the plain shard."""
+    from webdataset.tariterators import group_by_keys, tar_file_expander
+
+    def opened():
+        for d in src:
+            # the rank's index (EpochShuffledShards.load_index) gives every entry its byte ranges; without it no entry can
+            # be read, and the handler below would skip every one of them in silence
+            assert "parts" in d, f"{d.get('entry')}: no byte ranges (EpochShuffledShards.load_index was not called)"
+            try:
+                d = dict(d, stream=_RotatedTar(d["url"], d["parts"]))
+            except Exception as exn:
+                exn.args = exn.args + (d.get("url"),)
+                if handler(exn):
+                    continue
+                break
+            try:
+                yield d
+            finally:
+                d["stream"].close()
+
+    return group_by_keys(tar_file_expander(opened(), handler=handler), handler=handler)
 
 
 class _CycleBatches:
@@ -492,7 +698,7 @@ class GPICWebDataset(IterableDataset):
         fd = os.open(self._shard_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
             for d in src:
-                os.write(fd, f"{time.time():.3f} {d['shard_pass']} {d['url']}\n".encode())
+                os.write(fd, f"{time.time():.3f} {d['shard_pass']} {d.get('entry', d['url'])}\n".encode())   # entry: k > 1 only
                 yield d
         finally:
             os.close(fd)
@@ -507,13 +713,19 @@ class GPICWebDataset(IterableDataset):
         import braceexpand
         urls = list(braceexpand.braceexpand(shard_spec)) if isinstance(shard_spec, str) else list(shard_spec)
         log_dir = None if self.is_val else os.environ.get("GPIC_SHARD_LOG_DIR") or None
-        shards = EpochShuffledShards(urls, seed, log_dir)
+        # repetition arms: the training set's data workers, so a subset with fewer shards than slots repeats them (k > 1)
+        workers = None if self.is_val else getattr(self, "_num_workers", None)
+        shards = EpochShuffledShards(urls, seed, log_dir, workers=workers)
         print(f"GPIC_SHARD_SEED={seed}: {len(urls)} shards, reshuffled every epoch"
+              + (f", {shards.k} copies of each per pass (repetition arm)" if shards.k > 1 else "")
               + (f", started shards logged in {shards.log_path}" if log_dir else ""))
+        self._repeat_arm = shards.k > 1
+        shards.load_index()
+        split = [] if self._repeat_arm else [wds.split_by_worker]   # k > 1: EpochShuffledShards splits by worker itself
         if not log_dir:
-            return [shards, wds.split_by_worker]
+            return [shards, *split]
         self._shard_log = shards.log_path
-        return [shards, wds.split_by_worker, self._log_started]
+        return [shards, *split, self._log_started]
 
     def create_dataset(self):
         shard_spec = make_shard_spec(self.tar_dir, self.tar_pattern)
@@ -530,14 +742,16 @@ class GPICWebDataset(IterableDataset):
         # ladder: with GPIC_SHARD_SEED set (shared by all ranks through the environment; one value per run since the
         # full ladder), the shard list is shuffled before the node/worker split, with a new permutation in every
         # epoch, so no two epochs read the shards in the same order (_shard_stages). Unset: the official fixed order.
+        self._repeat_arm = False
         stages = self._shard_stages(shard_spec)
+        to_samples = (_rotated_tar_samples if self._repeat_arm else wds.tarfile_to_samples(handler=wds.warn_and_continue))
         if self.group_text_len:
             assert isinstance(self.transform, T.Compose) and len(self.transform.transforms) >= 2
             self._pre = self.transform.transforms[0]                        # random crop (PIL)
             self._post = T.Compose(self.transform.transforms[1:])          # ToTensor + Normalize
             return wds.DataPipeline(
                 *stages,
-                wds.tarfile_to_samples(handler=wds.warn_and_continue),
+                to_samples,                                                # wds.tarfile_to_samples unless k > 1
                 wds.select(self._has_caption),
                 wds.map(self._add_caption, handler=wds.warn_and_continue),
                 wds.select(self._has_image),
@@ -550,7 +764,7 @@ class GPICWebDataset(IterableDataset):
         dataset = wds.DataPipeline(
             *stages,
 
-            wds.tarfile_to_samples(handler=wds.warn_and_continue),
+            to_samples,
             wds.decode("pil", handler=wds.warn_and_continue),
 
             wds.select(self._has_caption),
@@ -573,6 +787,7 @@ class GPICWebDataset(IterableDataset):
 
     def build_dataloader(self, batch_size, num_workers):
         self.group_batch = batch_size   # ladder: one length-sorted chunk per per-GPU batch, whatever the config says
+        self._num_workers = num_workers   # repetition arms: EpochShuffledShards sizes the copies per pass by it
         assert not self.group_text_len or self.group_window % batch_size == 0, (self.group_window, batch_size)
         dataset = self.create_dataset()
         # pinned host batches: the image copy to the GPU becomes asynchronous (Lightning moves batches with
