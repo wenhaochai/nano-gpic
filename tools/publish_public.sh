@@ -16,7 +16,7 @@ mkdir -p $T && cd $T
 case "$T/repo" in */tmp/gd_public/repo) rm -rf -- "$T/repo";; esac
 git clone -q --no-local --single-branch -b $BR $SRC repo && cd repo
 SUB='
-REPL = [(b"/scratch/gpfs/GROUP/USER", b"/scratch/gpfs/GROUP/USER"), (b"USER", b"USER"), (b"GROUP", b"GROUP"), (b"group", b"group")]
+REPL = [(b"/scratch/gpfs/GROUP/USER", b"/scratch/gpfs/GROUP/USER"), (b"USER", b"USER"), (b"GROUP", b"GROUP"), (b"group", b"group"), (b"USER", b"USER")]
 def sub(b):
     for a, c in REPL: b = b.replace(a, c)
     return b
