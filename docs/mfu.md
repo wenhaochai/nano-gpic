@@ -59,9 +59,11 @@ Mean step over 1024-1216 steps (jobs/mfu/v1_parity.sh, probe11, widths.sh; mean 
   (d640, d1024) and is hidden from d1280 on. Default: on from d1280.
 - C + D pay where the data path's CPUs bind (d640: -7.6%); E costs more than it saves at d640 even with bucketed rows
   (its per-step gloo plan and two all_to_all calls add host work to a host-bound step). E stays off by default.
-- d1536 and d1792 (w1398): A+B+C+D -23.9% at both. Parity: mean |loss diff| over the last 200 steps 2.27e-3 and 3.35e-3;
-  mean loss over the last 500 steps +0.77% and -0.38% against levers off (other widths: at most 0.31%); the floor (a
-  levers-off repeat at these widths) is w1415.
+- d1536 and d1792 (w1398): A+B+C+D -23.9% at both. Floor (w1416, the same batches): the 500-step mean loss of three
+  levers-off runs spans 0.65% at d1536 (0.168835 / 0.169265 / 0.169945) and 0.60% at d1792 (0.164804 / 0.165244 /
+  0.165791); A+B+C+D (two runs each) 0.170557 / 0.170562 (d1536, above all three off runs) and 0.164507 / 0.164173 (d1792,
+  below all three): the sign flips between widths, so chaos, not a bias of B; A+C+D at d1536 0.168990 (inside). Mean
+  |loss diff| over the last 200 steps: off repeats 2.3-4.1e-3, lever arms 2.5-3.6e-3.
 - Saves (lever F, w1391): a save step adds up to 15.3 s at d1536 and 21.9 s at d1792 (36.6 s and 57.8 s before).
 
 Full ladder (ladder_full_run: C0 steps 534400 ... 36000, the same FLOPs per C0 at every width; trained to 1, 2, 4, 8, 8, 8,
@@ -186,7 +188,10 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
 - Parity (tools/mfu/parity_loss.py against A+B+C+D, its profiled repeat as the floor): d1024 L last-200 relative
   difference 7.1e-6, L+G3 2.9e-5 (floor 1.7e-5), the same mean loss over the last 500 steps to 6 digits; d1280 L+G2
   within the floor. Against levers off, every FSDP2 arm differs as before (the compile boundaries; see B's checks).
-- Decision: L + G3 at d1024 (pending the group sweep w1418: G3/G4/G6 at d1024 and d896, and G3 + H2).
+- Group sweep (w1418, 512 steps, ms): d1024 G3 42.51, G4 42.13, G6 41.34 (27.1%), A+C+D 48.50; d896 G3 39.76, G4 38.84,
+  G6 37.21 (21.0%), A+C+D 37.89. Larger units win: fewer hooks, and FSDP2 still prefetches the next unit. Every
+  L + G arm has A+B+C+D's 500-step mean loss to 6 digits.
+- Decision: L + G6 at d1024 and d896 (the larger groups, 1 unit, and d768 / d1280 in w1422).
 
 ### G0. Inductor's autotuning of the element-wise and reduction kernels (Inductor flags; jobs/mfu/probe7.sh)
 - Hypothesis: the element-wise and reduction kernels (RMSNorm with the residual add, modulation, gates, SwiGLU, RoPE, and
@@ -200,7 +205,15 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
 - Same math: pw and cd change block sizes, so the order of the fp32 sums in a reduction. ma also changes the GEMM
   kernels, and a fused epilogue can round once where the unfused graph rounds twice.
 - Expectation: 5-15% off the element-wise time, 2-5% of the step.
-- Result: pending.
+- Result (w1412, one GPU, plain / tuned / plain, mean ms): pw gives nothing (d1792 141.6 / 142.2 / 142.0, d1280 63.7 /
+  63.6 / 63.8, d1024 38.6 / 38.5 / 38.5, d640 17.4 / 17.2 / 17.1); cd: d1792 141.6 / 139.7 / 141.8 (-1.4%), d1280
+  63.4 / 61.6 / 63.4 (-2.8%), d1024 38.6 / 37.6 / 38.4 (-2.2%); ma (GEMMs too) d1280 63.6 / 61.9: the same as cd, after a
+  20-minute compile, so Triton GEMM templates win nothing over cuBLAS here. cd's compile adds 2-4 minutes, once per
+  shape set (the Inductor cache keeps the tuned configurations).
+- Per-kernel bandwidth (Inductor profile_bandwidth, d1280): the element-wise and reduction kernels of a step move
+  about 39 GB (forward 14.8, backward 24.0); the worst are the backward's sums over tokens for the modulation gradients
+  (triton_red_fused__to_copy_mul_sum_*, 0.9-1.3 TB/s alone) and many tiny kernels bound by their launch.
+- Production test with 1024-step parity: w1421 (letter T in jobs/mfu/widths.sh).
 
 ### H. The clip multiply, AdamW and the EMA in one kernel (`GPIC_MFU_FUSED_OPT=1`: clip + AdamW; `=2`: also the EMA)
 - Hypothesis: under DDP every rank runs the clip's multiply (a read and a write of every gradient), torch's fused AdamW
@@ -217,7 +230,16 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   division and square root) and lerp, operation for operation; nvcc's FMA contractions are matched by testing every
   placement against torch (tools/mfu/tests/test_fused_adamw_ema.py).
 - Expectation: d1024 -4 to -5 ms (about -9%), d640 -1.5 ms; under FSDP2 (from d1280) about -1 ms.
-- Result: pending (jobs/mfu/probe12.sh).
+- Result: bit for bit PASS (w1414: FMA_M=0, FMA_E=0, any FMA_V; 0 mismatching elements of param, exp_avg, exp_avg_sq and
+  EMA over 6 steps at weight decay 0 and 0.1; every configuration of w1419 too). torch's kernels already ran at about
+  2.4 TB/s, not 1.3 (the 1.3 came from a wrong parameter count). Time at d1024's 376 M parameters (norm + clip + AdamW
+  + EMA): torch 8.0 ms; first kernel (scalar loads) 7.6 / 7.0 (H1 / H2); with 16-byte alignment hints and BLOCK 1024, 2-4
+  warps (w1419) 6.2 / 5.6. Host side: the first version rebuilt its address tables whenever a gradient moved (every step
+  on one GPU: d640 17.3 -> 19.3 / 23.5 ms); now only the gradient addresses are compared each step, through a pinned
+  ring. Production (w1414, old kernel): d1024 A+C+D 48.27 -> H1 47.69 ms (-1.2%), H2 47.79; d640 no change (bound by the
+  host and the data path); under FSDP2 nothing (d1536 96.03 -> 96.10, d1024 L+G3 42.51 -> 42.73), as the shards are 1/8.
+  H2 also moves the EMA lerp from its side stream onto the critical path, so H1 is the better form.
+- Decision: off by default. A DDP-width option (d640-d768) only; re-measure H1 with the aligned kernel there.
 
 ### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
 - Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches
@@ -243,6 +265,24 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   replaces the gather by a product with the one-hot token-to-sample matrix (the same forward values, an fp32-accumulated
   backward). probe9 (w1382): profiles of padded and packed at d640, the Python wrapper, eager, FA3 text attention.
 - Decision for now: off by default in jobs/train_ladder.sh (genmodel, 2026-11-06), until fixed and measured.
+- Where E loses (w1417): one GPU, packed against padded after the row bucketing: d1280 median 62.9 against 63.1 ms,
+  d1024 38.0 against 37.6: the packed model path is nearly free now. In production, E costs +5.0 ms at d1280 under FSDP2
+  (median 64.1 -> 69.1) and +0.8 ms at d1024 under DDP (47.6 -> 48.3). Per-stage times (BENCH_STAGES, d1280 A+B+C+D):
+  the forward takes 25.9 ms of host time against 21.3 ms of GPU time (FSDP2's pre-forward hooks are about half of the
+  host's forward), so the host binds the forward, and E's plan inside the step (a blocking gloo all_gather, the plan in
+  Python) adds 5.2 ms of host time there.
+
+### E2. E's deal on the host, one step ahead (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=2`, src/data/rebalance_loader.py)
+- Hypothesis: the deal itself is cheap; E's cost is where it runs (in the step, on the host's critical path, and an
+  all_to_all that lines up the ranks at the step's start).
+- Setup: a thread per rank takes the next batch from the loader, writes its samples (lever C's source crops and resize
+  tables, lever E's caption rows) to its shared-memory slot (all ranks of a run share one node), and joins one gloo
+  all_gather of lengths and byte ranges, which is both the plan's input and the barrier; then it copies the samples
+  src/utils/rebalance.plan gives this rank out of the 8 slots and rebuilds the batch in the packed collate's format.
+  The step builds y_pack without any exchange. The same deal as E, so the same math (a sample keeps its position).
+- Test (CPU, 8 gloo ranks, tools/mfu/tests/test_rebalance_loader.py): exact round trip of the batch format; every
+  sample once per step, at its position, with its bytes; busiest rank's caption tokens 1.15-2.16x the mean -> 1.006-1.013x.
+- Result: pending (w1420: d1280 A+B+C+D vs +R, d1024 A+B+C+D+L+G3 vs +R, d640 A+C+D vs +R).
 
 ### D. uint8 crops (`GPIC_MFU_UINT8=1`)
 - The workers keep the crop as uint8 HWC; the training step maps it with a 256-entry table that train_transform's own
