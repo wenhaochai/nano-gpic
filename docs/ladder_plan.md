@@ -194,3 +194,7 @@
    6. 2026-11-06 20:3x：`gpic-wt/ladder_full_run` 从 5cd3372 移到 5f3c700（移之前确认没有正在运行的作业用它；git checkout 换新的 inode）；w1330（d1280）和 w1331（d1536）改回 prio 0。20:4x：w1332（d1792）也改回 prio 0。
    7. 每个宽度第一次启动后检查 launches.txt：第一行是 f6713be，有 `fsdp=1`。第一次续训后在 W&B 上看损失是否连续。
 5. 评测：FSDP2 的 ms 检查点和 DDP 的布局相同（288 个键，形状和数据类型都相同），所以 d1280 到 d1792 仍用 gmflow_run4 的 `evals_gmflow.sh` 评测。
+
+### 12.8 GMFlow 上 Full ladder（2026-11-06，owner 弹窗 21:4x）
+
+详见 docs/gmflow.md 第 17 节。分支 ladder-full-gmflow（ladder-full 合并 gmflow，没有冲突），冻结在 gpic-wt/ladder_full_gmflow_run。点模型的 gpic-wt/ladder_full_run 不变（5f3c700）。GMFlow K = 8 用点模型的数据、分片种子 20261106、分段和评测点：d640 到 1C0，d768 到 2C0，d896 到 4C0，d1024 到 8C0；C0 步数按 FLOP 对齐（499200、322400、220800、155200）。`jobs/train_full_gmflow.sh` 拒绝 d1280 以上（本节 12.7 的分派会把它们送到没有 GMFlow 的 MFU worktree）。
