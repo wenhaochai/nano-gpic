@@ -30,54 +30,62 @@ def _keep(net):
 # FSDP2 does Python work per parameter on every step (the all-gather's copy-in and copy-out lists, a DTensor for every
 # sharded gradient, the swap of every parameter between its sharded and unsharded tensor: about a third of the host's
 # time at d1024-d1280, where the host binds; docs/mfu.md B3). With one flat fp32 parameter per unit, that work is per
-# unit. Each original parameter becomes a view of the flat one, read through a property of its module (torch.compile
-# traces the slice), so the forward and backward compute the same values: the same weights, gathered in bf16 as one
-# tensor, and each gradient element reduced in fp32 as before. Checkpoints keep the original keys
-# (FlatModelParallelStrategy splits the flat tensors on save and rebuilds them on load).
+# unit. Each original parameter becomes a plain tensor attribute of its module, a view of the flat parameter that a
+# forward pre-hook sets after FSDP2's own (which all-gathers the unit): one split per unit per forward (its backward is one
+# concatenation into the flat gradient), and the views enter each compiled block as ordinary inputs, so the blocks of one
+# class share one graph as before (a first version read the views through per-instance properties: every block got its
+# own class, its own graph, and past Dynamo's 8 graphs per function the rest ran eagerly, 3.2x slower at d1024, w1431).
+# The same values: the same weights, gathered in bf16 as one tensor, and each gradient element reduced in fp32 as before.
+# Checkpoints keep the original keys (FlatModelParallelStrategy splits the flat tensors on save and rebuilds them on load).
 FLAT = "_b3_flat"
+ALIGN = 16   # every view starts on a 16-element boundary (aligned inputs for the compiled kernels)
 
 
-def _b3_view(self, name):
-    o, n, shape = self.__dict__["_b3_views"][name]
-    flat = self.__dict__["_b3_owner"]._parameters[FLAT]
-    if is_dtensor(flat):   # sharded (outside the unit's forward and backward): no full weight exists here; a stand-in
-        return torch.empty(0, dtype=flat.dtype)   # for `is not None` checks (a slice of a DTensor would redistribute)
-    return flat[o:o + n].view(shape)
-
-
-def _install_view(sub, name, owner, o, n, shape):
-    if "_b3_views" not in sub.__dict__:   # this instance gets its own subclass, so the property is its alone
-        cls = sub.__class__
-        sub.__class__ = type(cls.__name__, (cls,), {"__module__": cls.__module__})
-        sub.__dict__["_b3_views"] = {}
-        sub.__dict__["_b3_owner"] = owner   # not registered as a submodule
-    assert sub.__dict__["_b3_owner"] is owner
-    sub.__dict__["_b3_views"][name] = (o, n, tuple(shape))
-    setattr(type(sub), name, property(lambda self, _n=name: _b3_view(self, _n)))
+@torch.compiler.disable
+def _b3_pre_forward(module, args):
+    """Set the views of this module's parameters (FSDP2's pre-forward hook has unsharded the unit: prepend=True). The
+    unit's first module makes the split; the others reuse it."""
+    owner, first, entries = module.__dict__["_b3_spec"]
+    if first or "_b3_pieces" not in owner.__dict__:
+        flat = owner._parameters[FLAT]
+        assert not is_dtensor(flat), "B3: a flat parameter is still sharded in its unit's forward"
+        owner.__dict__["_b3_pieces"] = torch.split(flat, owner.__dict__["_b3_sizes"])
+    pieces = owner.__dict__["_b3_pieces"]
+    for sub, pname, i, shape in entries:
+        sub.__dict__[pname] = pieces[i].view(shape)
 
 
 def flatten_unit(unit, keep, names, trainable_only=True):
     """The (trainable, unless trainable_only=False: the EMA module's are frozen) parameters of the modules in unit, except
-    keep, as views of one flat parameter registered on unit[0]. names: {module: qualified name}. Returns the key map
-    [(parameter key, flat key, offset, numel, shape)]."""
-    owner, entries, chunks, off = unit[0], [], [], 0
+    keep, as views of one flat parameter registered on unit[0] (padded so that every view is aligned). names: {module:
+    qualified name}. Returns the key map [(parameter key, flat key, offset, numel, shape)]."""
+    owner, chunks, sizes, per_module, kmap, off = unit[0], [], [], [], [], 0
+    q = lambda m, n: f"{names[m]}.{n}" if names[m] else n
+    proto = None
     for m in unit:
+        entries = []
         for sub in m.modules():
             for pname, p in list(sub._parameters.items()):
                 if p is None or p in keep or (trainable_only and not p.requires_grad):
                     continue
-                entries.append((sub, pname, tuple(p.shape), off, p.numel()))
-                chunks.append(p.detach().reshape(-1))
-                off += p.numel()
-    if not entries:
+                if off % ALIGN:
+                    pad = ALIGN - off % ALIGN
+                    chunks.append(p.detach().new_zeros(pad)); sizes.append(pad); off += pad
+                entries.append((sub, pname, len(sizes), tuple(p.shape)))
+                kmap.append((q(sub, pname), q(owner, FLAT), off, p.numel(), tuple(p.shape)))
+                chunks.append(p.detach().reshape(-1)); sizes.append(p.numel()); off += p.numel()
+                proto = p
+        per_module.append((m, entries))
+    if proto is None:
         return []
-    owner.register_parameter(FLAT, torch.nn.Parameter(torch.cat(chunks), requires_grad=entries and trainable_only))
-    q = lambda m, n: f"{names[m]}.{n}" if names[m] else n
-    kmap = []
-    for sub, pname, shape, o, n in entries:
-        del sub._parameters[pname]
-        _install_view(sub, pname, owner, o, n, shape)
-        kmap.append((q(sub, pname), q(owner, FLAT), o, n, shape))
+    owner.register_parameter(FLAT, torch.nn.Parameter(torch.cat(chunks), requires_grad=trainable_only))
+    owner.__dict__["_b3_sizes"] = sizes
+    for m, entries in per_module:
+        for sub, pname, _, _ in entries:
+            del sub._parameters[pname]
+            sub.__dict__[pname] = proto.new_empty(0)   # a stand-in outside the forward (for `is not None` checks)
+        m.__dict__["_b3_spec"] = (owner, m is owner, entries)
+        m.register_forward_pre_hook(_b3_pre_forward)   # after FSDP2's (registered with prepend=True)
     return kmap
 
 
@@ -137,8 +145,12 @@ class _FlatView:
         return k in self.parts or k in self.sd
 
     def __getitem__(self, k):
-        if k in self.parts:
-            return torch.cat([self.sd[p].reshape(-1) for _, p in sorted(self.parts[k])])
+        if k in self.parts:   # zeros in the alignment gaps (flatten_unit's padding)
+            parts = sorted(self.parts[k])
+            out = self.sd[parts[0][1]].new_zeros(max(o + self.sd[p].numel() for o, p in parts))
+            for o, p in parts:
+                out[o:o + self.sd[p].numel()] = self.sd[p].reshape(-1)
+            return out
         return self.sd[k]
 
 

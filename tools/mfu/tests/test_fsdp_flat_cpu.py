@@ -4,9 +4,13 @@
    (forward, backward, replicated sync, clip, ShardLocalAdamW) with 3-block units, flat against per-parameter: the full
    parameters (the flat ones split back by the key map) and gradients equal bit for bit after step 0, and within 1e-6
    after steps 1-2 (CPU's fused AdamW rounds tensor ends differently; see below); with an acting clip within 1e-5.
-2. One process: a block whose parameters are views of a flat parameter, compiled (Inductor, CPU): forward and
-   backward equal to the same block without views in eager mode, and no recompilation over FSDP2-like swaps (the
-   registered parameter alternates between a sharded stand-in and one persistent unsharded parameter).
+2. One process: a block whose parameters are views of a flat parameter (set by the forward pre-hook), compiled (Inductor,
+   CPU): forward and backward equal to the same block without views in eager mode; a second block of the same class in
+   another unit reuses the graph; no recompilation over FSDP2-like swaps (the registered parameter alternates between a
+   sharded stand-in and one persistent unsharded parameter).
+4. 2 ranks, every block compiled under FSDP2 with bf16 compute parameters, as production: the flat units add no Dynamo
+   graph over the per-parameter units (w1431: per-instance classes made one graph per block, past the cache limit), and
+   the losses and gradients of 3 steps agree within bf16 rounding.
 3. The checkpoint key map: split_flat gives the original keys and tensors; _FlatView rebuilds the flat tensor.
 usage: python test_fsdp_flat_cpu.py"""
 import copy, os, sys
@@ -132,6 +136,40 @@ def run(rank, world, port):
     ok &= rel < 1e-5
     if rank == 0:
         print(f"clip acting (max_norm 0.05): largest relative parameter difference over 3 steps {rel:.1e}")
+    # 4. every block compiled under FSDP2, bf16 compute parameters (production): graphs and values, flat against per-parameter
+    from torch._dynamo.utils import counters
+
+    def train_compiled(flat):
+        torch._dynamo.reset(); counters.clear()
+        torch.manual_seed(0)
+        net = Net()
+        if flat:
+            os.environ["GPIC_MFU_FSDP_FLAT"] = "1"
+        rep = shard(net, mesh, compute_bf16=True, compile_blocks=True, group=3)
+        os.environ.pop("GPIC_MFU_FSDP_FLAT", None)
+        kmap = net.__dict__.get("_b3_kmap", [])
+        full = lambda t: t.full_tensor() if isinstance(t, DTensor) else t
+        out = []
+        for step in range(3):
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                loss = net(data(step))
+            loss.float().backward()
+            sync_replicated_grads(rep)
+            with torch.no_grad():
+                grads = split_flat({n: full(p.grad).float().clone() for n, p in net.named_parameters() if p.grad is not None}, kmap)
+            out.append((float(loss), grads))
+            for p in net.parameters():
+                p.grad = None
+        return out, counters["stats"]["unique_graphs"]
+    a, ua = train_compiled(False)
+    b, ub = train_compiled(True)
+    rel = max(float((b[s][1][k] - a[s][1][k]).norm() / a[s][1][k].norm().clamp_min(1e-12)) for s in range(3) for k in a[s][1])
+    dl = max(abs(a[s][0] - b[s][0]) / abs(a[s][0]) for s in range(3))
+    same_keys = all(set(a[s][1]) == set(b[s][1]) for s in range(3))
+    ok &= ub <= ua and same_keys and rel < 2e-2 and dl < 1e-3
+    if rank == 0:
+        print(f"compiled under FSDP2 (bf16 compute): Dynamo graphs per-parameter {ua}, flat {ub}; largest relative gradient "
+              f"difference over 3 steps {rel:.1e}, loss {dl:.1e}; same gradient keys {same_keys}")
     t = torch.tensor([int(ok)])
     dist.all_reduce(t, op=dist.ReduceOp.MIN)
     if rank == 0:
@@ -161,9 +199,10 @@ def single_process_checks():
     km &= ("blocks.0.fc.weight" in fv) and (f"blocks.0.{FLAT}" in fv) and (f"blocks.1.{FLAT}" not in fv)
     print(f"key map: split_flat = the original state dict, _FlatView rebuilds the flat tensors: {km}")
     ok &= km
-    # 2. compiled block with views: equal to eager without views, no recompile when the flat parameter object changes
-
+    # 2. compiled block with views: equal to eager without views, the graph shared, no recompile over FSDP2-like swaps
     torch._dynamo.reset()
+    from torch._dynamo.utils import counters
+    counters.clear()
     blk, rblk = net.blocks[0], ref.blocks[0]
     cblk = torch.compile(blk)
     x = torch.randn(4, 5, 12, requires_grad=True)
@@ -171,26 +210,28 @@ def single_process_checks():
     y, yr = cblk(x), rblk(xr)
     y.sum().backward(); yr.sum().backward()
     flat = getattr(blk, FLAT)
-    gref = torch.cat([p.grad.reshape(-1) for n, p in rblk.named_parameters() if p.requires_grad and p not in
-                      {rblk.norm1.weight}])
     eq = torch.allclose(y, yr, rtol=1e-6, atol=1e-6) and torch.allclose(x.grad, xr.grad, rtol=1e-6, atol=1e-6)
-    # the flat gradient covers blocks 0 and 1; block 0's part comes first
-    eq &= torch.allclose(flat.grad[:gref.numel()], gref, rtol=1e-6, atol=1e-6)
-    from torch._dynamo.utils import counters
+    rgrads = dict(rblk.named_parameters())
+    for pkey, fkey, o, n, shape in kmap:   # block 0's parameters, at their offsets in the flat gradient
+        if pkey.startswith("blocks.0."):
+            eq &= torch.allclose(flat.grad[o:o + n].view(shape), rgrads[pkey[len("blocks.0."):]].grad, rtol=1e-6, atol=1e-6)
+    g0 = counters["stats"]["unique_graphs"]
+    torch.compile(net.blocks[2])(torch.randn(4, 5, 12, requires_grad=True)).sum().backward()   # same class, another unit
+    shared = counters["stats"]["unique_graphs"] == g0
     # FSDP2 swaps the registered parameter between two fixed objects every step: the sharded DTensor between steps and
     # the persistent unsharded parameter during the unit's forward and backward (FSDPParam._unsharded_param)
     unsharded = nn.Parameter(flat.detach().clone())
     blk._parameters[FLAT] = unsharded
-    cblk(torch.randn(4, 5, 12)).sum().backward()   # FSDP2's first step: compiled with the unsharded object in place
+    cblk(torch.randn(4, 5, 12, requires_grad=True)).sum().backward()   # FSDP2's first step: the unsharded object in place
     n0 = counters["stats"]["unique_graphs"]
     for _ in range(3):
         blk._parameters[FLAT] = nn.Parameter(torch.zeros(1))   # the sharded stand-in between steps (never read)
         blk._parameters[FLAT] = unsharded                       # back for the forward
-        cblk(torch.randn(4, 5, 12)).sum().backward()
+        cblk(torch.randn(4, 5, 12, requires_grad=True)).sum().backward()
     rec = counters["stats"]["unique_graphs"] - n0
-    print(f"compiled block with views: forward and gradients equal to eager without views {eq}; new graphs over 3 "
-          f"FSDP2-like swaps after the first compile: {rec}")
-    ok &= eq and rec == 0
+    print(f"compiled block with views: forward and gradients equal to eager without views {eq}; a block of the same "
+          f"class in another unit reuses the graph {shared}; new graphs over 3 FSDP2-like swaps: {rec}")
+    ok &= eq and shared and rec == 0
     return ok
 
 
