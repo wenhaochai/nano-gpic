@@ -12,7 +12,7 @@
 # 1. step time without / with the bucket at d640, d1280, d1792;
 # 2. d640 with the bucket to step 128 (last.ckpt), then a resume to 256;
 # 3. every arm with the bucket: all 8 ranks' padded caption length T must agree micro-batch by micro-batch (the timer
-#    logs T), also after the resume.
+#    logs T), also after the resume; 4. the bucket with micro-batch 128 x accumulation 1 at d640 and d1024.
 # usage: bucket_check.sh <code worktree>
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
@@ -30,6 +30,9 @@ GPIC_SHARED_BUCKET=1 MFU_SAVE_EVERY=128 MFU_KEEP_CKPT=1 arm d640_S_to128 640 9 2
 CK=$(ls $OUT/d640_S_to128/exp_mfu_d640_S_to128/last*.ckpt $OUT/d640_S_to128/last*.ckpt 2>/dev/null | head -1)
 echo "resume from: $CK" | tee -a $OUT/summary.txt
 GPIC_SHARED_BUCKET=1 MFU_RESUME=$CK arm d640_S_resumed 640 9 2 256 "${MUON[@]}"
+# the new ladders' combination: the bucket with micro-batch 128 x accumulation 1 (the same global batch 1024)
+GPIC_SHARED_BUCKET=1 MFU_MICRO=128 arm d640_S_M128 640 9 2 512 "${MUON[@]}"
+GPIC_SHARED_BUCKET=1 MFU_MICRO=128 arm d1024_S_M128 1024 12 3 512 "${MUON[@]}"
 for d in "640 9 2" "1280 14 3" "1792 18 4"; do
   set -- $d
   arm d$1 $1 $2 $3 512 "${MUON[@]}"
@@ -38,7 +41,7 @@ done
 python - $OUT <<'PY' | tee -a $OUT/summary.txt
 import json, os, statistics as st, sys, glob
 out = sys.argv[1]
-for tag in ("d640_S_to128", "d640_S_resumed", "d640", "d640_S", "d1280", "d1280_S", "d1792", "d1792_S"):
+for tag in ("d640_S_to128", "d640_S_resumed", "d640_S_M128", "d1024_S_M128", "d640", "d640_S", "d1280", "d1280_S", "d1792", "d1792_S"):
     fs = sorted(glob.glob(os.path.join(out, tag, "bench", "steps_rank*.json")))
     if not fs:
         print(f"{tag}: no timer rows"); continue
