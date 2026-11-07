@@ -299,8 +299,9 @@ def qk_prep(qkv, kvy, wq, wk, cos, sin, H, eps):
 # Lever E (packed captions): the caption keys and values come packed, kvy [S, 2C] with S rows (real tokens, then dummy
 # rows), and pidx [S] int64 places row s at padded row b * Tp + t (B * Tp for a dummy row). The kernels write k and v in
 # the padded key layout [B, N + Tp] that the image blocks' FA3 call reads with per-sample key counts (lens + N), so the
-# per-block zero buffer and index_copy of the unfused packed path go away. Rows past a sample's caption are left unwritten:
-# FA3 reads only the first lens[b] + N keys of sample b, and its dk and dv start at zero.
+# per-block zero buffer and index_copy of the unfused packed path go away. Rows past a sample's caption are zeroed (one
+# strided memset of the caption part, B * Tp rows): FA3 masks those keys but still loads the last tile of V, and 0 x NaN is
+# NaN, so uninitialised rows turned every loss into NaN (w1865, 2026-11-07). FA3's dk and dv start at zero.
 @triton_op("gpic::qk_prep_packed_fwd", mutates_args=())
 def qk_prep_packed_fwd(qkv: torch.Tensor, kvy: torch.Tensor, pidx: torch.Tensor, Tp: int, wq: torch.Tensor,
                        wk: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, H: int, eps: float
@@ -315,6 +316,8 @@ def qk_prep_packed_fwd(qkv: torch.Tensor, kvy: torch.Tensor, pidx: torch.Tensor,
     v = qkv.new_empty(B, N + Tp, H, HC)
     rq = qkv.new_empty(B, N, H, dtype=torch.float32)
     rk = qkv.new_empty(B, N + Tp, H, dtype=torch.float32)
+    k[:, N:].zero_()
+    v[:, N:].zero_()
     _launch(_fwd_image)[(triton.cdiv(B * N, ROWS),)](
         qkvc, wq, wk, cos.contiguous(), sin.contiguous(), q, k, v, rq, rk, B * N, N, Tp, H, C, eps,
         BH=BH, HC=HC, ROWS=ROWS, INTERP=INTERP, num_warps=4)

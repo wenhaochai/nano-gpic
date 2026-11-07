@@ -37,5 +37,9 @@ timeout -k 60 ${MFU_LIMIT:-1200} python main.py fit --config configs_h100/lite_l
   ${MFU_MICRO:+--data.train_batch_size $MFU_MICRO --trainer.accumulate_grad_batches $((1024 / 8 / ${MFU_MICRO:-32}))} > $OUT/$TAG/train.log 2>&1
 rc=$?
 [ -n "${MFU_KEEP_CKPT:-}" ] || rm -f $OUT/$TAG/exp_mfu_$TAG/*.ckpt $OUT/$TAG/*.ckpt
-echo "$(date -u +%FT%TZ) tag=$TAG rc=$rc" >> $OUT/arms.txt
+# a speed number from a run whose loss is not finite is no speed number (E + packed K2 trained to NaN unnoticed, w1865)
+NF=$(python3 -c "import json,math,sys; r=json.load(open(sys.argv[1]))['rows']; print(sum(1 for x in r if not (isinstance(x.get('loss'), float) and math.isfinite(x['loss']))))" $OUT/$TAG/bench/steps_rank0.json 2>/dev/null || echo "?")
+[ "$NF" != 0 ] && echo "[$(date +%T)] $TAG: $NF steps of rank 0 have a non-finite loss (or no timer rows)" | tee -a $OUT/summary.txt
+echo "$(date -u +%FT%TZ) tag=$TAG rc=$rc nonfinite_loss_steps=$NF" >> $OUT/arms.txt
+[ "$rc" = 0 ] && [ "$NF" != 0 ] && rc=3
 exit $rc
