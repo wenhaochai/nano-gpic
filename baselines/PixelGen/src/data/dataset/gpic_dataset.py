@@ -210,6 +210,9 @@ class GPICWebDataset(IterableDataset):
         pad_multiple=64,
         tokenizer_path="Qwen/Qwen3-1.7B",
         emb_dir=None,
+        shared_bucket=False,
+        bucket_edges=(16, 24, 32, 40, 48, 56, 64, 144, 176, 320),
+        bucket_index_shards=32,
     ):
         self.tar_dir = tar_dir
         self.tar_pattern = tar_pattern
@@ -221,6 +224,13 @@ class GPICWebDataset(IterableDataset):
         self.group_text_len = group_text_len
         self.group_window, self.group_batch = group_window, group_batch
         self.text_max_length, self.pad_multiple = text_max_length, pad_multiple
+        # new ladders (owner's popup 2026-11-07 01:3x): one caption-length bucket per micro-batch for every rank
+        # (_group_shared); the edges are the padded lengths, a bucket's batch pads to its edge
+        self.shared_bucket = shared_bucket or (os.environ.get("GPIC_SHARED_BUCKET") == "1" and group_text_len and not is_val)
+        self.bucket_edges = tuple(int(e) for e in bucket_edges)
+        self.bucket_index_shards = bucket_index_shards
+        assert not self.shared_bucket or (group_text_len and emb_dir), "shared_bucket needs group_text_len and the text cache"
+        assert list(self.bucket_edges) == sorted(set(self.bucket_edges)) and self.bucket_edges[-1] >= text_max_length
         self.tokenizer_path = tokenizer_path
         self._tok = None
         # ladder: with emb_dir (tools/encode_captions.py) a sample carries its text encoder outputs, in place of token ids
@@ -371,6 +381,40 @@ class GPICWebDataset(IterableDataset):
         if buf:
             yield from flush(buf)
 
+    def bucket_shares(self):
+        """Each bucket's share of the samples, from the text cache's index of the first bucket_index_shards shards of the
+        pattern (sorted): the same numbers in every rank and worker. Returns (edges, shares) over the non-empty buckets."""
+        import bisect
+        names = sorted(os.path.basename(u)[:-len(".tar")] for u in expand_pattern(self.tar_pattern))
+        counts = [0] * len(self.bucket_edges)
+        for n in names[:self.bucket_index_shards]:
+            with np.load(os.path.join(self.emb_dir, n + ".idx.npz")) as z:
+                for L in z["lengths"].tolist():
+                    P = min(-(-L // self.pad_multiple) * self.pad_multiple, self.text_max_length)
+                    counts[bisect.bisect_left(self.bucket_edges, P)] += 1
+        keep = [i for i, c in enumerate(counts) if c]
+        tot = sum(counts)
+        return [self.bucket_edges[i] for i in keep], [counts[i] / tot for i in keep]
+
+    def _group_shared(self, src):
+        """New ladders (src/data/shared_bucket_loader.py): one queue per caption-length bucket (the text only: the image
+        is decoded after this stage); a queue that reaches group_batch samples leaves as one batch, every sample
+        tagged with its bucket's edge, which the collate pads to. A worker holds fewer than group_batch samples per
+        bucket and drops nothing; SharedBucketLoader picks, on every rank alike, which bucket's batch trains next."""
+        import bisect
+        edges, B = self.bucket_edges, self.group_batch
+        queues = [[] for _ in edges]
+        for s in src:
+            L = s["text_len"]
+            P = min(-(-L // self.pad_multiple) * self.pad_multiple, self.text_max_length)
+            q = bisect.bisect_left(edges, P)
+            queues[q].append(s)
+            if len(queues[q]) == B:
+                for x in queues[q]:
+                    x["pad_to"] = edges[q]
+                    yield x
+                queues[q] = []
+
     def _finish(self, s):
         """The image work, after grouping. A window needs only the text lengths to sort, so reading it is cheap, and a
         worker's CPU follows the batches it emits. With the images decoded in the window, every worker spends about 6 s
@@ -378,6 +422,8 @@ class GPICWebDataset(IterableDataset):
         a sample, or a batch would lose its size: an image that fails to decode repeats the sample before it. A fault
         on every image must not train on one image, so 8 failures in a row stop the run."""
         text = {"text_emb": s["text_emb"], "text_len": s["text_len"]} if self.emb_dir else {"input_ids": s["input_ids"]}
+        if "pad_to" in s:   # shared bucket: the batch pads to its bucket's edge
+            text["pad_to"] = s["pad_to"]
         try:
             # MFU lever D (docs/mfu.md): GPIC_MFU_UINT8=1 keeps the crop as uint8 HWC; the training step maps it to the same
             # float32 values the transform's ToTensor + Normalize give (uint8_to_float: a table made by those transforms)
@@ -410,7 +456,8 @@ class GPICWebDataset(IterableDataset):
                 off += n
             return imgs, [s[1] for s in samples], {"caption_type": [s[2]["caption_type"] for s in samples],
                                                    "text_emb": emb, "text_lens": lens}
-        T = min(-(-max(lens) // self.pad_multiple) * self.pad_multiple, self.text_max_length)
+        T = samples[0][2].get("pad_to") or min(-(-max(lens) // self.pad_multiple) * self.pad_multiple, self.text_max_length)
+        assert max(lens) <= T, (max(lens), T)
         emb = torch.zeros((len(samples), T, EMB_DIM), dtype=torch.bfloat16)
         text_mask = torch.zeros((len(samples), T), dtype=torch.bool)
         for r, (s, n) in enumerate(zip(samples, lens)):
@@ -496,7 +543,7 @@ class GPICWebDataset(IterableDataset):
                 wds.select(self._has_image),
                 wds.map(self._attach_emb) if self.emb_dir else wds.map(self._tokenize, handler=wds.warn_and_continue),
                 wds.shuffle(self.shuffle_buffer, **({"seed": int(os.environ.get("GPIC_SHARD_SEED", "0"))} if _DET else {})),
-                self._group,                                               # nothing after this drops a sample
+                self._group_shared if self.shared_bucket else self._group,   # nothing after this drops a sample
                 wds.map(self._finish),                                     # the image work
             )
 
@@ -540,6 +587,9 @@ class GPICWebDataset(IterableDataset):
             **({"collate_fn": self._collate_cached if self.emb_dir else self._collate_grouped} if self.group_text_len else {}),
         )
         self._dataloader = loader.pipeline[0]
+        if self.shared_bucket:   # new ladders: the same caption-length bucket on every rank in every micro-batch
+            from src.data.shared_bucket_loader import SharedBucketLoader
+            return SharedBucketLoader(loader, self.bucket_edges)
         if os.environ.get("GPIC_MFU_REBALANCE") == "2":   # MFU lever E2: the deal over the ranks on the host, one step ahead
             assert self.group_text_len and self.emb_dir and _PACK and _GPU_RESIZE, "lever E2 needs the cached, packed collate with lever C"
             from src.data.rebalance_loader import RebalancingLoader

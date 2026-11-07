@@ -1,0 +1,82 @@
+"""The shared caption-length bucket of the new ladders (owner's popup 2026-11-07 01:3x; GPICWebDataset shared_bucket).
+
+Why: every rank pads its micro-batch to its own longest caption and the step waits for the slowest rank; with 8 ranks
+about 57% of the steps hold one rank with T >= 72 (w1482: own lengths cost d640 +28%, d1280 +15%, d1792 +7% against one
+length for all ranks; more with more GPUs).
+How: the data workers (GPICWebDataset._group_shared) emit full batches of one bucket each (a bucket is a range of
+padded caption lengths; its batch pads to the bucket's edge), greedily, so a worker never holds more than one batch per
+bucket. On every rank this loader keeps the batches in one pool per bucket and, before each micro-batch, takes one
+batch from the bucket that every rank holds most of: one all-reduce (MIN) of the pool sizes over a gloo group, the same
+argmax on every rank (ties to the shorter bucket). So every rank trains micro-batch k on the same bucket, the pools
+stay bounded (the bucket with the largest supply everywhere goes first), the buckets come at their share of the data,
+and nothing is dropped. The decision depends only on the pools, which the DataLoader fills in its fixed order, so a run
+is deterministic. A resume starts with empty pools on every rank.
+"""
+from collections import deque
+
+import torch
+import torch.distributed as dist
+
+
+def choose(min_counts):
+    """The bucket every rank holds most of (the first among ties), or None if no bucket is held by every rank."""
+    best = max(range(len(min_counts)), key=lambda i: (min_counts[i], -i))
+    return best if min_counts[best] > 0 else None
+
+
+class SharedBucketLoader:
+    """Wraps the training DataLoader of GPICWebDataset(shared_bucket=True). pool_min: batches each rank keeps pooled
+    before a decision (default two per bucket)."""
+
+    def __init__(self, loader, edges, pool_min=None, allreduce_min=None):
+        self.loader, self.edges = loader, list(edges)
+        self.pool_min = pool_min or 2 * len(self.edges)
+        self._allreduce_min = allreduce_min   # tests: a stand-in for the gloo all-reduce
+        self.taken = [0] * len(self.edges)
+
+    def __iter__(self):
+        return _Iter(self)
+
+    def __getattr__(self, name):   # everything else (e.g. the dataset) from the wrapped loader
+        return getattr(self.__dict__["loader"], name)
+
+
+class _Iter:
+    def __init__(self, parent):
+        self.p, self.it, self.group = parent, None, None   # started at the first next(): Lightning's iter() check
+        self.pools = [deque() for _ in parent.edges]          # drops an iterator without calling next()
+
+    def _bucket(self, batch):
+        T = batch[2]["text_mask"].shape[1]
+        return self.p.edges.index(T)
+
+    def _pull(self):
+        b = next(self.it)
+        self.pools[self._bucket(b)].append(b)
+
+    def _min_counts(self):
+        counts = [len(q) for q in self.pools]
+        if self.p._allreduce_min is not None:
+            return self.p._allreduce_min(counts)
+        if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+            return counts
+        if self.group is None:
+            self.group = dist.new_group(backend="gloo")
+        t = torch.tensor(counts, dtype=torch.int64)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN, group=self.group)
+        return t.tolist()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.it is None:
+            self.it = iter(self.p.loader)
+        while sum(len(q) for q in self.pools) < self.p.pool_min:
+            self._pull()
+        while True:
+            b = choose(self._min_counts())
+            if b is not None:
+                self.p.taken[b] += 1
+                return self.pools[b].popleft()
+            self._pull()   # no bucket on every rank yet: one more batch, then decide again
