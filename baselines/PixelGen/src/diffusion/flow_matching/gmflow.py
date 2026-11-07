@@ -48,17 +48,32 @@ def gm_component_ll(target, means, logstd):
     return (-0.5 * diff.square() - logstd).sum(dim=2)
 
 
-def gm_nll(target, means, logweights, logstd):
+def gm_nll(target, means, logweights, logstd, tau=1.0):
     """Per-pixel -log sum_k A_k N(target; means_k, exp(logstd)^2 I) over the C channels, without the constant C/2 log 2 pi (GMFlow diffusion_loss.py:33-36).
     target (B, C, H, W); means (B, K, C, H, W); logweights (B, K, 1, H, W); logstd broadcastable to (B, K, 1, H, W). Returns (B, H, W).
     One mixture per image (logweights (B, K, 1, 1, 1), docs/gmflow.md section 15): each component scores the whole image, -log sum_k A_k prod_pixels N(...),
-    divided by the number of pixels, returned as (B, 1, 1), so a mean over the pixels gives the same scale as the per-pixel loss. With K = 1 the two agree."""
+    divided by the number of pixels, returned as (B, 1, 1), so a mean over the pixels gives the same scale as the per-pixel loss. With K = 1 the two agree.
+    tau (one mixture per image only; docs/gmflow.md section 16): deterministic annealing EM (Ueda and Nakano 1998) of the posterior over the K candidates,
+    -(tau / pixels) log sum_k (A_k prod_pixels N(...))^(1 / tau). The gradient on the means is that of tau = 1 with the responsibilities
+    softmax_k((log A_k + ll_k) / tau) in place of the exact ones, so a large tau shares it among the candidates, and the gradient on the logits is
+    (A_k - r_k(tau)) / pixels at every tau. With A_k outside the temperature (Rose's mass-constrained form) that gradient would grow with the gaps in ll_k and
+    Adam would move the weights to the best candidate, which the means' gradient (r ~ A at a large tau) then follows. tau = 1 is the loss above, the same expression."""
     ll = gm_component_ll(target, means, logstd)                                         # (B, K, H, W)
     lw = logweights.squeeze(2)                                                         # (B, K, H, W) or (B, K, 1, 1)
     if lw.shape[-2:] == (1, 1) and ll.shape[-2:] != (1, 1):
         n_pix = ll.shape[-2] * ll.shape[-1]
-        return (-torch.logsumexp(ll.sum((-2, -1)) + lw.flatten(1), dim=1) / n_pix).view(-1, 1, 1)
+        if tau == 1:
+            return (-torch.logsumexp(ll.sum((-2, -1)) + lw.flatten(1), dim=1) / n_pix).view(-1, 1, 1)
+        return (-tau * torch.logsumexp((ll.sum((-2, -1)) + lw.flatten(1)) / tau, dim=1) / n_pix).view(-1, 1, 1)
+    assert tau == 1, "the temperature tempers the posterior over whole candidate images: one mixture per image only"
     return -torch.logsumexp(ll + lw, dim=1)
+
+
+def image_resp(target, means, logweights, logstd, tau=1.0):
+    """One mixture per image: the responsibilities of the K candidates that weight the gradient of the means under the temperature tau,
+    softmax_k((log A_k + ll_k) / tau) (section 16; tau = 1: the exact posterior). Returns (B, K)."""
+    ll = gm_component_ll(target, means, logstd).sum((-2, -1))                          # (B, K)
+    return ((ll + logweights.flatten(1)) / tau).softmax(1)
 
 
 def image_wins(target, means, logweights, logstd):
@@ -67,23 +82,34 @@ def image_wins(target, means, logweights, logstd):
     return (ll + logweights.flatten(1)).argmax(1)
 
 
-def transition_nll(gm, x_low, x_high, sigma_high, sigma_low):
-    """-log q(x_low | x_high) per pixel, q = sum_k A_k N(c1 x_high + c2 mu_x,k, (c2^2 s_x^2 + c3) I) (GMFlow gmflow.py:192-204, x0 branch). sigmas (B, 1, 1, 1)."""
+def bridge_mixture(gm, x_high, sigma_high, sigma_low):
+    """The mixture over x_low that the transition loss scores: means c1 x_high + c2 mu_x,k and log std 0.5 log(c2^2 s_x^2 + c3) (GMFlow gmflow.py:192-204, x0 branch).
+    sigmas (B, 1, 1, 1). Returns (means (B, K, C, H, W), logstd)."""
     c1, c2, c3 = bridge_coefs(sigma_high, sigma_low)
     c1, c2, c3 = c1.unsqueeze(1), c2.unsqueeze(1), c3.unsqueeze(1)                     # (B, 1, 1, 1, 1)
     lsx = logstd_x(gm, sigma_high.unsqueeze(1))
-    # log std of the transition: 0.5 log(c2^2 s_x^2 + c3); log(0) = -inf when c3 = 0 (lambda = 1), and logaddexp then returns the first term
+    # log(0) = -inf when c3 = 0 (lambda = 1), and logaddexp then returns the first term
     logstd_low = torch.logaddexp(2 * (lsx + torch.log(c2.clamp(min=1e-6))), torch.log(c3.clamp(min=0))) / 2
-    return gm_nll(x_low, c1 * x_high.unsqueeze(1) + c2 * gm["means"], gm["logweights"], logstd_low)
+    return c1 * x_high.unsqueeze(1) + c2 * gm["means"], logstd_low
+
+
+def transition_nll(gm, x_low, x_high, sigma_high, sigma_low, tau=1.0):
+    """-log q(x_low | x_high) per pixel, q = sum_k A_k N(c1 x_high + c2 mu_x,k, (c2^2 s_x^2 + c3) I) (GMFlow gmflow.py:192-204, x0 branch). sigmas (B, 1, 1, 1).
+    tau: the temperature of one mixture per image (gm_nll)."""
+    means, logstd_low = bridge_mixture(gm, x_high, sigma_high, sigma_low)
+    return gm_nll(x_low, means, gm["logweights"], logstd_low, tau)
 
 
 def transition_wins(gm, x_low, x_high, sigma_high, sigma_low):
     """One mixture per image: the winning component of each image under the transition loss's mixture (as transition_nll). Returns (B,)."""
-    c1, c2, c3 = bridge_coefs(sigma_high, sigma_low)
-    c1, c2, c3 = c1.unsqueeze(1), c2.unsqueeze(1), c3.unsqueeze(1)
-    lsx = logstd_x(gm, sigma_high.unsqueeze(1))
-    logstd_low = torch.logaddexp(2 * (lsx + torch.log(c2.clamp(min=1e-6))), torch.log(c3.clamp(min=0))) / 2
-    return image_wins(x_low, c1 * x_high.unsqueeze(1) + c2 * gm["means"], gm["logweights"], logstd_low)
+    means, logstd_low = bridge_mixture(gm, x_high, sigma_high, sigma_low)
+    return image_wins(x_low, means, gm["logweights"], logstd_low)
+
+
+def transition_resp(gm, x_low, x_high, sigma_high, sigma_low, tau=1.0):
+    """One mixture per image: the responsibilities under the transition loss's mixture and the temperature tau (image_resp). Returns (B, K)."""
+    means, logstd_low = bridge_mixture(gm, x_high, sigma_high, sigma_low)
+    return image_resp(x_low, means, gm["logweights"], logstd_low, tau)
 
 
 def gm_mean(gm):

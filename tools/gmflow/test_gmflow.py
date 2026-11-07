@@ -1698,6 +1698,144 @@ def T32():
           " the predict command; evals_gmflow.sh --scope image sets EVAL_SCOPE")
 
 
+@test
+def T33():
+    """Annealing one mixture per image (docs/gmflow.md section 16, owner 2026-11-06): the tempered loss against a brute force (tau = 1 is the exact loss, bit for bit),
+    its gradient (the responsibilities at tau in place of the exact ones), soft responsibilities at a large tau, the trainer's schedule and refusals, and the
+    --anneal plumbing of train_gmflow.sh."""
+    import shutil
+    import tempfile
+    from torch.distributions import Normal
+    # 1. the loss: tau = 1 is the expression of section 15 bit for bit; tau > 1 equals -(tau / pixels) log sum_k (A_k exp(ll_k))^(1 / tau) in float64 (DAEM)
+    torch.manual_seed(1)
+    B, K, C, H, W = 3, 4, 3, 8, 8
+    target = torch.randn(B, C, H, W, dtype=torch.float64)
+    means = 0.9 * target[:, None] + 0.3 * torch.randn(B, K, C, H, W, dtype=torch.float64)
+    lw = torch.randn(B, K, 1, 1, 1, dtype=torch.float64).log_softmax(1)
+    logstd = 0.2 * torch.randn(B, 1, 1, 1, 1, dtype=torch.float64)
+    ll = G.gm_component_ll(target, means, logstd).sum((-2, -1))
+    exact = (-torch.logsumexp(ll + lw.flatten(1), dim=1) / (H * W)).view(-1, 1, 1)
+    assert torch.equal(G.gm_nll(target, means, lw, logstd), exact) and torch.equal(G.gm_nll(target, means, lw, logstd, 1.0), exact)
+    f32 = [v.float() for v in (target, means, lw, logstd)]
+    ll32 = G.gm_component_ll(f32[0], f32[1], f32[3]).sum((-2, -1))
+    assert torch.equal(G.gm_nll(*f32), (-torch.logsumexp(ll32 + f32[2].flatten(1), dim=1) / (H * W)).view(-1, 1, 1))   # float32 too, as the trainer runs
+    lp = Normal(means, logstd.exp()).log_prob(target[:, None]).sum((2, 3, 4)) + 0.5 * math.log(2 * math.pi) * C * H * W
+    for tau in (3.0, 192.0, 1e5):
+        want = -tau * torch.logsumexp((lp + lw.flatten(1)) / tau, 1) / (H * W)
+        got = G.gm_nll(target, means, lw, logstd, tau)
+        assert got.shape == (B, 1, 1) and torch.allclose(got.flatten(), want, rtol=1e-12, atol=1e-12), (tau, got.flatten(), want)
+        # the gradient on mu_k: r_k(tau) (mu_k - x) / (s^2 pixels), r(tau) = softmax((log A + ll) / tau): the scale of tau = 1, the share of the tempered posterior
+        mg = means.clone().requires_grad_(True)
+        G.gm_nll(target, mg, lw, logstd, tau).sum().backward()
+        r = ((lp + lw.flatten(1)) / tau).softmax(1)
+        # the gradient on the logits is (A_k - r_k(tau)) / pixels, at most 1 / pixels per image at every tau (A inside the temperature)
+        lg = torch.randn(B, K, 1, 1, 1, dtype=torch.float64).requires_grad_(True)
+        G.gm_nll(target, means, lg.log_softmax(1), logstd, tau).sum().backward()
+        rl = ((lp + lg.detach().log_softmax(1).flatten(1)) / tau).softmax(1)
+        assert torch.allclose(lg.grad.flatten(1), (lg.detach().softmax(1).flatten(1) - rl) / (H * W), rtol=1e-9, atol=1e-15) and lg.grad.abs().max() <= 1 / (H * W)
+        assert torch.allclose(r, G.image_resp(target, means, lw, logstd, tau), rtol=1e-10, atol=1e-14)
+        g = r[:, :, None, None, None] * (means - target[:, None]) / ((2 * logstd).exp() * H * W)
+        assert torch.allclose(mg.grad, g, rtol=1e-9, atol=1e-14), (tau, (mg.grad - g).abs().max())
+    # soft at a large tau: candidate k sits (k + 1) u from the target (u ~ 0.5 N(0, 1) per value), so on 192 values the exact posterior is one-hot on the closest;
+    # tau = 192 (the number of values) shares the gradient
+    neff = lambda q: torch.exp(-(q * q.clamp(min=1e-300).log()).sum(1))
+    torch.manual_seed(8)
+    tgt = torch.randn(B, C, H, W, dtype=torch.float64)
+    far = tgt[:, None] + torch.arange(1, K + 1, dtype=torch.float64).view(1, K, 1, 1, 1) * 0.5 * torch.randn(B, 1, C, H, W, dtype=torch.float64)
+    z, lw0 = torch.zeros(B, 1, 1, 1, 1, dtype=torch.float64), torch.full((B, K, 1, 1, 1), -math.log(K), dtype=torch.float64)
+    r1, rs = G.image_resp(tgt, far, lw0, z), G.image_resp(tgt, far, lw0, z, float(C * H * W))
+    assert r1.max(1).values.min() > 0.999 and (r1.argmax(1) == 0).all() and neff(rs).min() > 1.5, (r1.max(1).values, neff(rs))
+    try:
+        G.gm_nll(target, means, torch.randn(B, K, 1, H, W, dtype=torch.float64).log_softmax(1), logstd, 2.0)
+        raise RuntimeError("the per-pixel loss accepted a temperature")
+    except AssertionError as e:
+        assert "one mixture per image only" in str(e), e
+    print(f"  loss: tau = 1 is the exact loss bit for bit (float64 and float32); tau 3, 192, 1e5 equal -(tau/pixels) log sum_k (A_k exp(ll_k))^(1/tau) (float64, 1e-12);"
+          f" the gradient on mu_k is r_k(tau) (mu_k - x) / (s^2 pixels), on the logits (A_k - r_k(tau)) / pixels, at most 1 / pixels; on 192 values the exact posterior is one-hot (top responsibility {r1.max(1).values.min().item():.4f}"
+          f" and up), tau = 192 shares it (n_eff {neff(rs).min().item():.2f} and up); the per-pixel loss refuses a temperature")
+    # 2. the transition loss with tau scores the bridge mixture; the responsibilities at tau = 1 rank the winners
+    torch.manual_seed(4)
+    gm = dict(means=torch.randn(6, 8, 3, 8, 8), logweights=torch.randn(6, 8, 1, 1, 1).log_softmax(1), logstd=0.3 * torch.randn(6, 1, 1, 1, 1))
+    x_low, x_high = torch.randn(6, 3, 8, 8), torch.randn(6, 3, 8, 8)
+    sh = torch.rand(6).view(-1, 1, 1, 1) * 0.9 + 0.05; sl = 0.5 * sh
+    bm, bl = G.bridge_mixture(gm, x_high, sh, sl)
+    assert torch.equal(G.transition_nll(gm, x_low, x_high, sh, sl, 40.0), G.gm_nll(x_low, bm, gm["logweights"], bl, 40.0))
+    assert torch.equal(G.transition_resp(gm, x_low, x_high, sh, sl).argmax(1), G.transition_wins(gm, x_low, x_high, sh, sl))
+    # 3. the trainer: the schedule, the refusals, the exact loss from anneal_steps on, the logged tau and r_neff
+    tr = gm_trainer(anneal_tau0=196608, anneal_steps=300)
+    assert tr.tau(0) == 196608.0 and abs(tr.tau(150) / math.sqrt(196608) - 1) < 1e-12 and tr.tau(300) == 1.0 and tr.tau(10 ** 6) == 1.0
+    assert all(gm_trainer().tau(s) == 1.0 for s in (0, 7, 10 ** 6))
+    for kw in (dict(anneal_tau0=0.5, anneal_steps=10), dict(anneal_tau0=10, anneal_steps=0), dict(anneal_tau0=1, anneal_steps=10), dict(anneal_tau0=10, anneal_steps=-1)):
+        try:
+            gm_trainer(**kw)
+            raise RuntimeError(f"accepted {kw}")
+        except AssertionError:
+            pass
+    x, t, y, mask = model_io(8)
+    x1 = x.clamp(-1, 1)
+    torch.manual_seed(5); mi = JiT_T2I(**small, gm_k=8, gm_scope="image")
+    torch.manual_seed(5); mp = JiT_T2I(**small, gm_k=8)
+    base = gm_trainer()
+    torch.manual_seed(2); l_exact = base._impl_trainstep(mi, None, None, x1, y, {"y_mask": mask})["loss"]
+    tr.step = 300
+    torch.manual_seed(2); l_after = tr._impl_trainstep(mi, None, None, x1, y, {"y_mask": mask})["loss"]
+    assert torch.equal(l_after, l_exact), (l_after, l_exact)
+    tr.step, tr.diag_now = 0, True
+    torch.manual_seed(2); res = tr._impl_trainstep(mi, None, None, x1, y, {"y_mask": mask})
+    res["loss"].backward()
+    assert torch.isfinite(res["loss"]) and not torch.equal(res["loss"].detach(), l_exact) and res["gm/tau"].item() == 196608.0, (res["loss"], l_exact, res["gm/tau"])
+    assert 1 <= res["gm/r_neff"].item() <= 8 and mi.final_layer.linear.weight.grad is not None and torch.isfinite(mi.final_layer.linear.weight.grad).all()
+    tr.step = 0
+    try:
+        tr._impl_trainstep(mp, None, None, x1, y, {"y_mask": mask})
+        raise RuntimeError("the per-pixel model trained with a temperature")
+    except AssertionError as e:
+        assert "needs gm_scope image" in str(e), e
+    src = open(os.path.join(REPO, "baselines/PixelGen/src/lightning_model_gpic.py")).read()
+    assert "self.diffusion_trainer.step = self.global_step" in src   # the step comes from Lightning's global step, which a resume restores
+    print(f"  trainer: tau 196608 at step 0, sqrt(196608) at 150, exactly 1 from 300 on; from 300 on the loss equals the exact trainer's bit for bit; at step 0 it"
+          f" differs, logs tau {res['gm/tau'].item():.0f} and r_neff {res['gm/r_neff'].item():.2f}, and the gradient is finite; bad schedules and the per-pixel model refused;"
+          f" the step is Lightning's global step")
+    # 4. the script: --anneal passes the two init args and records anneal.txt; another value, a missing --scope image, bad formats and a run from before are refused
+    tmp = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+    wt_dir = os.path.join(tmp, "project/gpic-wt/anneal_wt")
+    for p, text in (("baselines/PixelGen/configs_h100/gmflow_train.yaml", "lam: 0.5\n"), ("baselines/PixelGen/src/models/transformer/JiT_T2I.py", "gm_spread gm_scope\n"),
+                    ("baselines/PixelGen/src/diffusion/flow_matching/training_gmflow.py", "anneal_tau0\n"), ("jobs/train_ladder.sh", 'echo "LADDER $*"\n'),
+                    ("jobs/evals_gmflow.sh", 'echo "EVALS $*"\n')):
+        os.makedirs(os.path.dirname(os.path.join(wt_dir, p)), exist_ok=True)
+        open(os.path.join(wt_dir, p), "w").write(text)
+    subprocess.run("git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x", shell=True, cwd=wt_dir, check=True)
+    env0 = {k: v for k, v in os.environ.items() if not k.startswith("EVAL_") and k not in ("GMFLOW_WT", "LADDER_RUN_ROOT")}
+    stub_t = os.path.join(tmp, "train.sh")
+    open(stub_t, "w").write(open(os.path.join(REPO, "jobs/train_gmflow.sh")).read().replace("source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh", f"WC={tmp}"))
+    tr_run = lambda *a: subprocess.run(["bash", stub_t, "8", "d640", "640", "9", "2", "128", *a], env=env0, capture_output=True, text=True)
+    rootof = lambda tag: os.path.join(tmp, f"runs/gpic-speed/gmflow_k8_d640_{tag}")
+    r = tr_run("an", "w1147", "--wt", "anneal_wt", "--scope", "image", "--anneal", "196608:300", "64:gm_draw:8")
+    assert r.returncode == 0, r.stdout + r.stderr
+    log = open(os.path.join(rootof("an"), "train.log")).read()
+    assert "--model.diffusion_trainer.init_args.anneal_tau0 196608 --model.diffusion_trainer.init_args.anneal_steps 300" in log and "gm_scope image" in log, log
+    assert open(os.path.join(rootof("an"), "anneal.txt")).read().strip() == "196608:300"
+    assert f"EVALS 8 d640 640 9 2 {rootof('an')} --wt anneal_wt --scope image 64:gm_draw:8" in r.stdout, r.stdout   # the evaluation is unchanged
+    r = tr_run("an", "w1147", "--wt", "anneal_wt", "--scope", "image", "--anneal", "1000:300")
+    assert r.returncode == 2 and "started with anneal 196608:300, not 1000:300" in r.stdout, r.stdout
+    r = tr_run("an", "w1147", "--wt", "anneal_wt", "--scope", "image")
+    assert r.returncode == 2 and "started with anneal 196608:300, not none" in r.stdout, r.stdout
+    for tag, args, msg in (("an2", ["--anneal", "196608:300"], "needs --scope image"), ("an3", ["--scope", "image", "--anneal", "1:300"], "tau0 > 1"),
+                           ("an4", ["--scope", "image", "--anneal", "300"], "tau0 > 1"), ("an5", ["--scope", "image", "--anneal", "2.5:300"], "tau0 > 1"),
+                           ("an6", ["--anneal", "196608:300", "--scope", "image"], "needs --scope image")):
+        r = tr_run(tag, "w1147", "--wt", "anneal_wt", *args)
+        assert r.returncode == 2 and msg in r.stdout and not os.path.exists(rootof(tag)), (tag, r.stdout)
+    old = os.path.join(rootof("old"), "exp_ladder_d640"); os.makedirs(old); open(os.path.join(old, "last.ckpt"), "w").close()
+    open(os.path.join(rootof("old"), "scope.txt"), "w").write("image\n")
+    r = tr_run("old", "w1147", "--wt", "anneal_wt", "--scope", "image", "--anneal", "196608:300")
+    assert r.returncode == 2 and "started with anneal none, not 196608:300" in r.stdout, r.stdout   # a run from before this option has no annealing
+    r = tr_run("plain", "w1147", "--wt", "anneal_wt", "--scope", "image")
+    assert r.returncode == 0 and "anneal" not in open(os.path.join(rootof("plain"), "train.log")).read(), r.stdout   # the command line of before this option
+    shutil.rmtree(tmp)
+    print("  train_gmflow.sh: --anneal 196608:300 passes anneal_tau0 196608 and anneal_steps 300, records anneal.txt, evaluates as before; another value, no value"
+          " on a resume, no --scope image, tau0 1, a missing step count, a decimal, and a run from before the option refused; without it the command line is unchanged")
+
+
 if __name__ == "__main__":
     names = sys.argv[1:] or list(RESULTS)
     failed = []

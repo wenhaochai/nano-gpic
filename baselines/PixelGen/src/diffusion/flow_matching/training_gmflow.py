@@ -5,24 +5,35 @@ the forward transition. The network sees (x_high, t) and gives a per-pixel mixtu
     sum_k A_k N(c1 x_high + c2 mu_x,k, (c2^2 s_x^2 + c3) I),   s_x = sigma_high s_u,
 as -logsumexp over K, summed over the 3 channels, averaged over the pixels, times 2 (GMFlow's weight_scale), averaged over the batch.
 lam = 1 gives c1 = 0, c2 = 1, c3 = 0: the plain NLL of x under the x-mixture. There is no t_eps clamp: the NLL over x and over v differ by a constant in theta.
+One mixture per image can anneal the posterior over its K candidates (anneal_tau0, anneal_steps; docs/gmflow.md section 16): tau = anneal_tau0 at step 0, geometric
+down to 1 at step anneal_steps, then 1, the exact loss. The defaults (1, 0) keep the exact loss at every step.
 """
 import os
 
 import torch
 
-from src.diffusion.flow_matching.gmflow import EPS, forward_transition, image_scope, transition_nll, transition_wins
+from src.diffusion.flow_matching.gmflow import EPS, forward_transition, image_scope, transition_nll, transition_resp, transition_wins
 from src.diffusion.flow_matching.training_JiT import JiTTrainer, time_shift_fn
 
 SIGMA_BINS = (0.0, 0.25, 0.5, 0.75, 1.0 + 1e-6)
 
 
 class GMFlowTrainer(JiTTrainer):
-    def __init__(self, *args, lam=0.5, weight_scale=2.0, **kwargs):
+    def __init__(self, *args, lam=0.5, weight_scale=2.0, anneal_tau0=1.0, anneal_steps=0, **kwargs):
         super().__init__(*args, **kwargs)
         assert 0 < lam <= 1, lam
+        assert anneal_tau0 >= 1 and anneal_steps >= 0 and (anneal_tau0 == 1) == (anneal_steps == 0), (anneal_tau0, anneal_steps)
         self.lam, self.weight_scale = lam, weight_scale
+        self.anneal_tau0, self.anneal_steps = float(anneal_tau0), int(anneal_steps)
+        self.step = 0   # the global step, set by LightningModel.training_step (a resumed launch gets the checkpoint's step), for the temperature
         self.diag_now = False   # set by LightningModel.training_step on the steps whose logs are written: the diagnostics run only then, with no host sync
         self._print_every, self._calls = int(os.environ.get("GPIC_GM_PRINT") or 0), 0   # smoke test only: a host sync on these steps
+
+    def tau(self, step):
+        """The temperature of one mixture per image at a global step: anneal_tau0 ** (1 - step / anneal_steps) before anneal_steps, then exactly 1."""
+        if step >= self.anneal_steps:
+            return 1.0
+        return self.anneal_tau0 ** (1 - step / self.anneal_steps)
 
     def _impl_trainstep(self, net, ema_net, solver, x, y, metadata=None):
         B = x.shape[0]
@@ -43,35 +54,43 @@ class GMFlowTrainer(JiTTrainer):
         gm = net(x_high, t_net, y, gm_mode="full") if y_mask is None else net(x_high, t_net, y, y_mask=y_mask, gm_mode="full")
         with torch.autocast(device_type=x.device.type, enabled=False):
             gm = {k: v.float() for k, v in gm.items()}
-            nll = transition_nll(gm, x_low, x_high, sigma_high, sigma_low)            # (B, H, W); (B, 1, 1) for one mixture per image (section 15)
+            tau = self.tau(self.step)
+            assert tau == 1 or image_scope(gm), "annealing tempers the posterior over whole candidate images: it needs gm_scope image"
+            nll = transition_nll(gm, x_low, x_high, sigma_high, sigma_low, tau)       # (B, H, W); (B, 1, 1) for one mixture per image (section 15)
             per_sample = self.weight_scale * nll.mean((1, 2))
             out = dict(loss=per_sample.mean(), loss_per_sample=per_sample.detach())
             if self.diag_now:
                 out.update(self.diagnostics(gm, sigma_high.view(-1)), **{"gm/nll": nll.detach().mean()})
                 if image_scope(gm):
-                    out.update(self.win_stats(gm, x_low, x_high, sigma_high, sigma_low))
+                    out.update(self.win_stats(gm, x_low, x_high, sigma_high, sigma_low, tau))
         if self._print_every:
             self._calls += 1
             if self._calls % self._print_every == 0:
                 d = self.diagnostics(gm, sigma_high.view(-1))
                 pix = f" logsu_pix_mean {d['gm/logsu_pix_mean'].item():.4f} logsu_pix_std {d['gm/logsu_pix_std'].item():.4f}" if "gm/logsu_pix_std" in d else ""
                 if image_scope(gm):
-                    ws = self.win_stats(gm, x_low, x_high, sigma_high, sigma_low)
+                    ws = self.win_stats(gm, x_low, x_high, sigma_high, sigma_low, tau)
                     pix += f" win_max {ws['gm/win_max'].item():.3f} win_alive {int(ws['gm/win_alive'].item())} w_dead {ws['gm/w_dead'].item():.4f}"
+                    if self.anneal_steps:
+                        pix += f" step {self.step} tau {tau:.6g} r_neff {ws['gm/r_neff'].item():.3f}"
                 print(f"[gmflow] call {self._calls}: loss {out['loss'].item():.5f} s_u {d['gm/s_u'].item():.4f} n_eff {d['gm/n_eff'].item():.3f} max_w {d['gm/max_w'].item():.3f}{pix}", flush=True)
         return out
 
     @staticmethod
     @torch.no_grad()
-    def win_stats(gm, x_low, x_high, sigma_high, sigma_low):
+    def win_stats(gm, x_low, x_high, sigma_high, sigma_low, tau=1.0):
         """One mixture per image (section 15): in this batch (one rank's images), the largest share of images that one component wins (gets the gradient of its mean),
         the number of components that win at least one image, and w_dead, the mean weight A on the components that win none: a component that never wins is never
         trained, and its weight still sends draws to its untrained candidate (review_image_mix S1). n_eff and max_w do not show this. one_hot, not bincount: bincount
-        on CUDA syncs the host."""
+        on CUDA syncs the host. The winners are those of the exact posterior at every tau. Also tau and r_neff (section 16): exp(entropy) of the responsibilities that
+        weight the gradient at this tau, averaged over the images (1: one candidate gets it all; K: shared equally)."""
         wins = transition_wins(gm, x_low, x_high, sigma_high, sigma_low)
         share = torch.nn.functional.one_hot(wins, gm["means"].shape[1]).float().mean(0)                  # (K,)
         A = gm["logweights"].exp().flatten(1).mean(0)                                                     # (K,)
-        return {"gm/win_max": share.max(), "gm/win_alive": (share > 0).sum().float(), "gm/w_dead": (A * (share == 0)).sum()}
+        r = transition_resp(gm, x_low, x_high, sigma_high, sigma_low, tau)                                # (B, K)
+        r_neff = torch.exp(-(r * torch.log(r.clamp(min=1e-30))).sum(1)).mean()
+        return {"gm/win_max": share.max(), "gm/win_alive": (share > 0).sum().float(), "gm/w_dead": (A * (share == 0)).sum(),
+                "gm/tau": r.new_full((), tau), "gm/r_neff": r_neff}   # new_full: a fill kernel; torch.tensor(float, device) is a pageable copy (a host sync, perf C7)
 
     @staticmethod
     @torch.no_grad()

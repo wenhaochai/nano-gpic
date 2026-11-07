@@ -223,6 +223,8 @@ class LightningModel(pl.LightningModule):
         self._log_now = self.logger is not None and self.trainer._logger_connector.should_update_logs
         if hasattr(self.diffusion_trainer, "diag_now"):   # GMFlow: its diagnostics only on the steps whose logs are written
             self.diffusion_trainer.diag_now = self._log_now
+        if hasattr(self.diffusion_trainer, "anneal_steps"):   # GMFlow: the temperature of one mixture per image follows the global step (restored on a resume)
+            self.diffusion_trainer.step = self.global_step
         loss = self.diffusion_trainer(self.denoiser, self.ema_denoiser, self.diffusion_sampler, x, condition, uncondition, metadata)
 
         # --- GPIC: log per-caption-type training loss ---
