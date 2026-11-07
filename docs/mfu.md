@@ -58,7 +58,9 @@ GPIC_MFU_LOCAL_OPT=1; G<k>: GPIC_MFU_FSDP_GROUP=k; K: GPIC_MFU_FUSED_NORM=1; K2:
 TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 (d1280 -1.9% before K); F
 (GPIC_MFU_ASYNC_CKPT=1) for the checkpoints. GPU-h-weighted over the full ladder: 22.9% with levers off, 28.4% before
 K + K2, 29.5% with this table. The running ladder (d1280-d1792 on f6713be with A+B+C+D+F, d640-d1024 on the frozen
-code): 26.2%. In test: X (CUDA graphs, w1474), F8 (FP8 GEMMs, a numerics change the owner asked for, w1478).
+code): 26.2%. Measured since: X (CUDA graphs) off; F8 (FP8) pays only at d1536 / d1792 and the new ladders stay bf16;
+the per-rank caption length costs 6-28% (the shared bucket S fixes it for the new ladders); the new ladders run Muon at
+global batch 1024 (sections below).
 
 ## Production path (Lightning, real GPIC Lite batches, 8 GPUs, the same batches in every arm), 2026-11-06
 
@@ -356,6 +358,79 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   same mode. A new caption length records new graphs once.
 - Test (w1470): d1024 and d1280 with and without X, X with Inductor's Python launcher, d768 under DDP. Expectation:
   the forward becomes GPU-bound; bitwise the same losses.
+- Result (w1470, w1474; the step's late part, steps >= 1024, median, without -> with graphs): d1024 39.7 -> 39.4 ms,
+  d1280 62.9 -> 62.5, d896 34.4 -> 32.2 (-6.4%). torch 2.7 skips CUDA graphs with Inductor's C++ launcher ("skipping
+  cudagraphs due to cpp wrapper enabled"), so X needs the Python launcher (letter Y); FA3's cached sequence offsets had
+  to be made per call (a tensor cached during a warm-up lives in the graphs' pool outside every output, which cudagraph
+  trees refuse). Every new caption length records every block again, and new lengths keep coming through 2048 steps:
+  the mean is far worse (d896 36.5 -> 80.2 ms).
+- Conclusion: the launches are not what binds d1024 and d1280 (py-spy without --native could not tell a launching
+  host from a blocked one); X is off. What binds them is below (rank imbalance).
+
+### F8. FP8 GEMMs in the blocks (`GPIC_MFU_FP8=tensorwise|rowwise`, src/utils/fp8.py; owner 2026-11-06 23:5x)
+- torchao 0.11 float8 training (outside the shared env: envs/mfu-extra/torchao011) of the blocks' Linear layers (72 at
+  d1024); adaLN, the embedders, the timestep MLP and the final layer stay bf16. Changes the numerics.
+- Result (w1478, batch 256, FSDP2 + K + K2, 2048 steps, mean step bf16 -> FP8 tensorwise): d1024 39.91 -> 44.97 ms
+  (+12.7%), d1280 61.06 -> 61.85 (+1.3%), d1536 91.69 -> 89.22 (-2.7%), d1792 131.43 -> 121.81 (-7.3%, MFU 38.3% ->
+  41.3%); rowwise scaling at d1792 141.20 (+7.4%). The loss over the last 500 steps is within the same-math spread at
+  every width (d1792 0.109857 bf16, 0.109769 tensorwise, 0.109492 rowwise). The casts (an amax and a cast per GEMM
+  input, every micro-batch) cost more than the faster GEMMs below d1536.
+- Decision (genmodel, 2026-11-07 01:5x): the new ladders stay bf16 at every width, so each ladder keeps one recipe; FP8
+  for later runs is the owner's call.
+
+### Rank imbalance: each rank pads to its own longest caption (w1482, step_bench, 8 GPUs, A + K + K2)
+- Own T per rank against one T for all ranks, mean step: d640 (DDP) 25.13 vs 19.70 ms (+28%), d1024 (FSDP2) 48.58 vs
+  45.73 (+6%), d1280 70.69 vs 61.60 (+15%), d1792 139.81 vs 130.97 (+7%). Per-sample padded lengths are bimodal
+  (16-64: 90% of the samples; a second mode at 136-192: about 9%), so with 8 ranks about 57% of the steps hold one
+  rank with T >= 72, and with 32 ranks about 97%. The largest lever left, and it grows with the GPU count.
+- In the padded layout no deal of samples over the ranks helps: the rank that holds the longest caption pads to it.
+  Options: packed captions (the same math; lever E's packed path cost more host time than it saved), or one length
+  bucket per step for every rank (a change of which samples share a batch). The owner chose the second for the new
+  ladders (popup 2026-11-07 01:3x; they start from scratch).
+
+### S. The shared caption-length bucket (`data.train_dataset.init_args.shared_bucket: true`; tests: GPIC_SHARED_BUCKET=1)
+- Buckets are padded lengths: 16 to 64 by 8, then 144, 176 and 320; a batch pads to its bucket's edge (mean padded T
+  per micro-batch 50.3, against 51.5 for the per-rank grouping). Shares from the text cache's index (32 shards): 16:
+  9.9%, 24: 27.4%, 32: 9.0%, 40: 10.5%, 48: 16.3%, 56: 13.5%, 64: 3.8%, 144: 2.7%, 176: 5.7%, 320: 1.3%.
+- The workers (GPICWebDataset._group_shared) emit full batches of one bucket, greedily, holding fewer than one batch
+  per bucket. On every rank SharedBucketLoader (src/data/shared_bucket_loader.py) keeps one pool of batches per bucket
+  and takes each micro-batch from the bucket every rank holds most of: one gloo all-reduce (MIN) of 10 pool sizes per
+  micro-batch, the same argmax on every rank. So every rank trains micro-batch k on the same bucket, also after any
+  resume (the choice is made together each time; a resume restarts the pools empty on every rank), the pools stay
+  bounded, the buckets come at their data share, nothing is dropped.
+- A first version drew each micro-batch's bucket from one RNG shared by all ranks (no communication): its per-bucket
+  queues are random walks against the draws and grow without bound (the CPU test dropped thousands of samples).
+- CPU test (tools/mfu/tests/test_shared_bucket.py: 4 ranks x 8 workers, threads, the all-reduce as a barrier): the same
+  bucket on every rank in all 3000 micro-batches, every sample in its bucket, shares within 7% of the data, pools at
+  most 37 batches, nothing dropped or repeated. GPU check: w1576 (step time with and without at d640, d1280, d1792;
+  every rank's T compared micro-batch by micro-batch, also after a resume).
+
+### Muon (src/optim/muon.py, src/optim/muon_fsdp.py; owner 2026-11-07 00:5x, recipe from the popup at 01:0x)
+- The question-5 reference (branch muon a403ed1: MuonAdamW for the blocks' matrices, AdamW for the rest; under DDP one
+  owner rank per matrix part does the bf16 Newton-Schulz, one all_gather spreads the updates) with an update_scale
+  switch: mup (the new ladders: -lr sqrt(d_out / d_in) msign, per split part) or moonlight (question 5's 0.2 sqrt(max)).
+- ShardMuonAdamW (FSDP2): momentum and AdamW on the row shards; each part's Nesterov input goes to its owner in the
+  Newton-Schulz dtype (all_to_all), the owner orthogonalizes it as the reference's owner does, the update rows come
+  back (all_to_all). CPU test (2 ranks, gloo): bit for bit the reference under DDP (fp32 and bf16 Newton-Schulz, split
+  on and off, both scales, weight decay), and a checkpoint round trip through the full state dicts gives the same bits.
+- configs_h100/muon_ladder.yaml: split on, Nesterov 0.95, 5 steps, wd 0; AdamW 0.9 / 0.95 / 1e-8 / wd 0 at the width's
+  lr; warmup 1000 optimizer steps, then flat; accumulation 4 (global batch 1024 on 8 GPUs); EMA 0.9996, once per
+  optimizer step (the EMA now counts from the resumed step: with accumulation the first micro-batches after a resume
+  end before any optimizer step).
+- GPU (w1484): the reference tests pass on 1 and 2 GPUs; d640 Muon 256 optimizer steps (loss 0.2460 -> 0.0468); a stop
+  at step 128 and its resume continue (0.0780 -> 0.0710 -> 0.0458, the uninterrupted run 0.0468). Cost per optimizer
+  step (4 micro-batches): d640 91.5 against AdamW 88.8 ms (+3.0%), d1024 158.9 against 152.4 (+4.3%).
+- 9928ffe was frozen for the lr search (muon_search_run 33dfdf4) and the narrow widths of the new ladders
+  (muon_ladder_run 4607c61).
+
+### Batch 1024: accumulation on DDP and FSDP2 (NoSyncModelParallelStrategy, widths.sh letter N)
+- With accumulation, DDP syncs the gradients only in the last micro-batch (no_sync); Lightning blocks the sync only for
+  DDP, so FSDP2 would all-gather and reduce-scatter in every micro-batch. NoSyncModelParallelStrategy does for FSDP2
+  what no_sync does for DDP: before the last micro-batch, no reduce-scatter (the unsharded gradients add up in FSDP2's
+  fp32 reduce dtype) and no reshard after the backward (the next micro-batch needs no all-gather).
+- A d1024 micro-batch under DDP with accumulation costs 39.7 ms (w1484, A C D, no K), about FSDP2 + K + K2's 40.2 at
+  batch 256. Measurements per width: w1574 (d1280-d1792: DDP + K + K2 against FSDP2 + K + K2 with and without N),
+  w1530 (d640-d1024).
 
 ### E. Packed captions, the samples of each step dealt over the ranks (`GPIC_MFU_PACK=1 GPIC_MFU_REBALANCE=1`)
 - Hypothesis: each rank pads to its own longest caption, and the step waits for the slowest rank; long-caption batches
