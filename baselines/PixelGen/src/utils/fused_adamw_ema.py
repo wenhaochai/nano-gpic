@@ -110,29 +110,40 @@ class _Tables:
     step and EMA; per program its tensor and offset. Rebuilt when an address changes (FSDP2 hands new gradient tensors)."""
 
     def __init__(self):
-        self.key = None
+        self.key, self.n, self.rebuilds = None, None, 0
+
+    @staticmethod
+    def _check(ts, dev):
+        for t in ts:
+            assert t.dtype == torch.float32 and t.is_contiguous() and t.device == dev, (t.dtype, t.shape)
 
     def get(self, lists, dev):
         key = tuple(t.data_ptr() for ts in lists for t in ts)
-        if key != self.key:
-            n = [t.numel() for t in lists[0]]
+        if key == self.key:
+            return self
+        n = [t.numel() for t in lists[0]]
+        if n != self.n:   # first build (or other tensors): the per-program tables, which depend on the sizes only
             for k, ts in enumerate(lists[1:], 1):   # list 4 holds the step counts (one element each)
                 assert [t.numel() for t in ts] == (n if k != 4 else [1] * len(n))
             for ts in lists:
-                for t in ts:
-                    assert t.dtype == torch.float32 and t.is_contiguous() and t.device == dev, (t.dtype, t.shape)
-            keep = [i for i, k in enumerate(n) if k > 0]   # an empty shard gets no program
-            ptr = torch.tensor([[ts[i].data_ptr() for i in keep] for ts in lists], dtype=torch.int64)
-            nb = [-(-n[i] // BLOCK) for i in keep]
-            tid = torch.repeat_interleave(torch.arange(len(keep), dtype=torch.int32), torch.tensor(nb))
+                self._check(ts, dev)
+            self.keep = [i for i, k in enumerate(n) if k > 0]   # an empty shard gets no program
+            nb = [-(-n[i] // BLOCK) for i in self.keep]
+            tid = torch.repeat_interleave(torch.arange(len(self.keep), dtype=torch.int32), torch.tensor(nb, dtype=torch.long))
             toff = torch.cat([torch.arange(b, dtype=torch.int64) * BLOCK for b in nb]) if nb else torch.zeros(0, dtype=torch.int64)
-            self.ptr = ptr.pin_memory().to(dev, non_blocking=True)
-            self.numel = torch.tensor([n[i] for i in keep], dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
+            self.numel = torch.tensor([n[i] for i in self.keep], dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
             self.tid = tid.pin_memory().to(dev, non_blocking=True)
             self.toff = toff.pin_memory().to(dev, non_blocking=True)
             self.programs = int(tid.numel())
-            self.key = key
-            self.rebuilds = getattr(self, "rebuilds", 0) + 1
+            self.n = n
+        else:   # the same sizes, new addresses (FSDP2 hands new gradient tensors each step): the gradients' checks only
+            assert [t.numel() for t in lists[1]] == n
+            self._check(lists[1], dev)
+        # a new device tensor each time: a kernel still queued keeps reading the old table (stream order)
+        ptr = torch.tensor([[ts[i].data_ptr() for i in self.keep] for ts in lists], dtype=torch.int64)
+        self.ptr = ptr.pin_memory().to(dev, non_blocking=True)
+        self.key = key
+        self.rebuilds += 1
         return self
 
 
