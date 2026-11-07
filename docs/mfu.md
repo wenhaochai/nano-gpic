@@ -41,6 +41,24 @@ backward 115.5, optimizer 27.8. The backward is 2.7-2.85 x the forward: it inclu
 NCCL picks NVLS + Simple for the 1000 MiB buckets; a 1 GB bucket takes 13-15 ms while the backward runs beside it and 5.6
 ms alone (334 GB/s), so the all-reduce and the backward kernels slow each other.
 
+## Best measured configuration per width (2026-11-06 evening; production path, 8 H100, the same batches)
+
+| width | switches (jobs/train_ladder.sh) | step | MFU | levers off | job |
+|---|---|---|---|---|---|
+| d640 | A C D (defaults) | 24.4 ms | 13.8% | 26.3 ms, 12.8% | w1394 |
+| d768 | A C D | 29.1 ms | 18.2% | 31.6 ms, 16.8% | w1396 |
+| d896 | A B C D + L + G11 | 35.6 ms | 22.0% | 41.4 ms, 18.9% | w1422 |
+| d1024 | A B C D + L + G6 | 41.3 ms | 27.1% | 52.1 ms, 21.5% | w1418, w1422 |
+| d1280 | A B C D + L + G7, T | 64.3 ms (G7); T -1.9% | 31.3% (32%) | 83.9 ms, 24.0% | w1422, w1421 |
+| d1536 | A B C D | 95.9 ms | 34.6% | 126.0 ms, 26.3% | w1398, w1416 |
+| d1792 | A B C D | 136.2 ms | 36.9% | 178.9 ms, 28.1% | w1398, w1416 |
+
+A: GPIC_MFU_ATTN=fa3; B: GPIC_MFU_FSDP=1 (ModelParallelStrategy); C: GPIC_MFU_GPU_RESIZE=1; D: GPIC_MFU_UINT8=1; L:
+GPIC_MFU_LOCAL_OPT=1; G<k>: GPIC_MFU_FSDP_GROUP=k; T: TORCHINDUCTOR_MAX_AUTOTUNE_POINTWISE=1
+TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1; F (GPIC_MFU_ASYNC_CKPT=1) for the checkpoints. GPU-h-weighted over the full
+ladder: 22.9% with levers off, 28.4% with this table. The running ladder (d1280-d1792 on f6713be with A+B+C+D+F,
+d640-d1024 on the frozen code): 26.2%. Next: B3 (flat FSDP2 units) for d896-d1280, w1427.
+
 ## Production path (Lightning, real GPIC Lite batches, 8 GPUs, the same batches in every arm), 2026-11-06
 
 Mean step over 1024-1216 steps (jobs/mfu/v1_parity.sh, probe11, widths.sh; mean of every step after the first 100):
