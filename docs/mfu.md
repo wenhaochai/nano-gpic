@@ -571,8 +571,16 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   d1536 (each activation is read twice for its amax and its cast; the SwiGLU product's two passes read the 4C-wide z
   twice; dz is written in bf16 and read again for its FP8 copy; the weights' transposes). w1918 profiles bf16 and phase 2
   in the shared-bucket setting at d1024 and d1536 to measure them.
-- Next: the amax as a by-product of the producers (K's outputs, the SwiGLU), or delayed scaling, to fold the cast into
-  one pass; FP8 weight gradients.
+- Phase 3 (native3, 93dc39b): delayed scaling. Each activation site (6 per block: the inputs of qkv_x, proj and w12, the
+  SwiGLU product, the MLP's dy and dz) keeps its last 16 amaxes; the scale is 448 / their max, so the cast is one pass
+  that also records this step's amax, and the SwiGLU backward writes dz's FP8 copy itself. A site without history (the
+  first step; CompileWarmup resets the state after its dummy batches) is cast with its own amax, the phase 1/2
+  arithmetic bit for bit. Block 0's attention input rolls every site's history first. The casts that touch the state are
+  opaque custom ops, so the compiler sees pure functions and their order is the data's. The weights' FP8 copies and
+  transposes come from one pass in the forward (bit for bit tcast's), so the backward makes no transposed copy.
+  Expected: the amax passes, the second read of z and of dz, and the backward's weight transposes, about 2 GB a block at
+  d1536.
+- Next: FP8 weight gradients; the casts fused into K's outputs.
 
 ### C2. GPU JPEG decoding (`GPIC_MFU_GPU_DECODE=1|2`, with lever C; owner 2026-11-07: 「可以用GPU解码」)
 - Why: the workers' JPEG decode binds d640 and d768 (96 cores give about 13.4k images/s; d640 median step 61-66 ms, mean
