@@ -243,8 +243,8 @@ def sync_replicated_grads(params):
         return
     flat = torch._utils._flatten_dense_tensors(grads)
     dist.all_reduce(flat, op=dist.ReduceOp.AVG)
-    for g, f in zip(grads, torch._utils._unflatten_dense_tensors(flat, grads)):
-        g.copy_(f)
+    # one multi-tensor copy instead of one kernel per gradient (about 68 at d1280: py-spy 1.5% of the main thread)
+    torch._foreach_copy_(grads, torch._utils._unflatten_dense_tensors(flat, grads))
 
 
 @torch.no_grad()
