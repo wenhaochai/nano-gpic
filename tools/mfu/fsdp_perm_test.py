@@ -17,9 +17,12 @@ sys.path.insert(0, "/scratch/gpfs/GROUP/USER/project/gpic-wt/heldout_loss_run/to
 import heldout_loss as H  # noqa: E402
 sys.path[:] = [p for p in sys.path if not p.startswith(H.REPO)]
 sys.path.insert(0, os.path.join(code, "baselines", "PixelGen"))
-dist.init_process_group("nccl")
+CPU = os.environ.get("PERM_TEST_CPU") == "1"   # gloo on CPU: FSDP2's own logic without NCCL or the GPU kernels
+dev = "cpu" if CPU else "cuda"
+dist.init_process_group("gloo" if CPU else "nccl")
 rank, world = dist.get_rank(), dist.get_world_size()
-torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+if not CPU:
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 from torch.distributed.device_mesh import init_device_mesh  # noqa: E402
 from torch.distributed.tensor import DTensor  # noqa: E402
 from src.models.transformer.JiT_T2I import JiT_T2I  # noqa: E402
@@ -31,8 +34,8 @@ sub = {k[len("denoiser."):]: v for k, v in sd.items() if k.startswith("denoiser.
 with torch.device("meta"):
     net = JiT_T2I(**kw)
 net.load_state_dict(sub, strict=True, assign=True)
-net = net.cuda().float()
-mesh = init_device_mesh("cuda", (world,), mesh_dim_names=("data_parallel",))
+net = net.to(dev).float()
+mesh = init_device_mesh(dev, (world,), mesh_dim_names=("data_parallel",))
 shard(net, mesh, compute_bf16=True, compile_blocks=len(sys.argv) > 3, names={m: n for n, m in net.named_modules()})
 watch = ["final_layer.linear", "x_embedder.proj1", "x_embedder.proj2", "t_embedder.mlp.0", "t_embedder.mlp.2",
          "y_embedder.proj", "blocks.0.attn.qkv_x", "blocks.15.mlp.w3", "text_refine_blocks.0.attn.qkv"]
@@ -46,14 +49,15 @@ for name in watch:
                 seen[f"{name}.{pn}"] = (p.full_tensor() if isinstance(p, DTensor) else p).detach().float().cpu()
     mods[name].register_forward_pre_hook(hook)
 B, T = 2, 32
-g = torch.Generator(device="cuda").manual_seed(0)
-x = torch.randn(B, 3, 256, 256, device="cuda", generator=g)
-t = torch.rand(B, device="cuda", generator=g)
-y = torch.randn(B, T, kw.get("txt_embed_dim", 2048), device="cuda", generator=g)
-mask = torch.ones(B, T, dtype=torch.bool, device="cuda")
-with torch.autocast("cuda", dtype=torch.bfloat16):
+g = torch.Generator(device=dev).manual_seed(0)
+x = torch.randn(B, 3, 256, 256, device=dev, generator=g)
+t = torch.rand(B, device=dev, generator=g)
+y = torch.randn(B, T, kw.get("txt_embed_dim", 2048), device=dev, generator=g)
+mask = torch.ones(B, T, dtype=torch.bool, device=dev)
+with torch.autocast(dev, dtype=torch.bfloat16):
     net(x, t, y, y_mask=mask)
-torch.cuda.synchronize()
+if not CPU:
+    torch.cuda.synchronize()
 
 
 def block_perm(a, ref):
