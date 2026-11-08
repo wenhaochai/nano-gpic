@@ -29,6 +29,11 @@ import torch.distributed as dist
 from torch.optim.adam import adam as _adam_fn
 
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
+# MFU lever MA (GPIC_MFU_MUON_ADD=1): the step's W += alpha * O over every matrix part in one Triton launch (a table of
+# addresses, lengths and alphas), in place of one torch add_ per part (fp32 += bf16, torch's non-vectorized mixed-dtype
+# kernel: 220 launches and 2.2 ms a step at d15 under DDP, 137 at d20 under FSDP2; w1866 / w1918 profiles). The same
+# arithmetic, w + alpha * float(o) in fp32 (tools/mfu/tests/test_muon_add.py checks it bit for bit against add_).
+_MUON_ADD = os.environ.get("GPIC_MFU_MUON_ADD", "0") == "1"
 # MFU lever NS (GPIC_MFU_NS_FUSED=1): each Newton-Schulz step's scalings and sums inside the GEMMs (addmm / baddbmm with beta
 # and alpha), so the step is 3 GEMMs and no element-wise pass: the same polynomial, rounded once per GEMM (fp32 accumulate)
 # instead of after every product and sum. d1536 under FSDP2 spent about 8 ms a step on those passes (w1918's profile:
@@ -79,6 +84,19 @@ def msign(G, steps=5, dtype=torch.bfloat16, fused=None):
         B = b * A + c * (A @ A)
         X = a * X + B @ X
     return X.mT if tall else X
+
+
+def add_units(dsts, srcs, alphas):
+    """dst += alpha * src for every (fp32 dst, bf16 src, float alpha), dst and src contiguous and of one size each: one
+    Triton launch under GPIC_MFU_MUON_ADD=1 on CUDA, else torch's add_ per pair."""
+    if not dsts:
+        return
+    if not (_MUON_ADD and dsts[0].is_cuda):
+        for d, s_, a in zip(dsts, srcs, alphas):
+            d.add_(s_, alpha=a)
+        return
+    from src.optim.muon_add import add_units_triton
+    add_units_triton(dsts, srcs, alphas)
 
 
 class MuonAdamW(torch.optim.Optimizer):
@@ -189,10 +207,13 @@ class MuonAdamW(torch.optim.Optimizer):
             full = shard
         if wd:
             torch._foreach_mul_(params, 1 - lr * wd)
+        D, S_, A = [], [], []
         for u in plan["units"]:   # W <- W - lr * coef * O (update_coef), the bf16 O promoted to fp32 in the add
             o0 = u["owner"] * plan["shard"] + u["off"]
-            upd = full[o0:o0 + math.prod(u["shape"])].view(u["shape"])
-            params[u["p"]][u["r0"]:u["r1"]].add_(upd, alpha=-lr * self.update_coef(group, u["shape"]))
+            S_.append(full[o0:o0 + math.prod(u["shape"])].view(u["shape"]))
+            D.append(params[u["p"]][u["r0"]:u["r1"]])
+            A.append(-lr * self.update_coef(group, u["shape"]))
+        add_units(D, S_, A)
 
     @torch.no_grad()
     def _adamw_step(self, group):
