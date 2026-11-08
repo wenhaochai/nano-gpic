@@ -4,7 +4,7 @@ the d1536 runs hold its 8 row blocks of 96 rows, the FSDP2 Shard(0) pieces, in a
 used; the permutation changes between jobs). For each checkpoint, separately for the raw (denoiser.*) and EMA
 (ema_denoiser.*) weights: the low-noise predictions of 32 held-out val images give, for every output block k of the 768
 patch features, the target block pi[k] it reproduces (mean matched correlation; every block must match one block, above
-0.9, and pi must be a permutation); then final_layer.linear.weight and .bias are re-ordered (new block j = old block k with
+0.9, and pi must be a permutation); then final_layer.linear.weight is re-ordered (new block j = old block k with
 pi[k] = j), and the held-out loss of 8 images x 4 levels must drop. Writes runs/gpic-speed/fixed_view/<root>/exp_ladder_<size>/
 ms-step=<step>.ckpt (state_dict and the keys the evaluation reads, as tmp/ladder_prof/make_raw_view.py) and copies the
 run's config files. A checkpoint whose pi is the identity for both weights is copied as it is (state_dict only).
@@ -26,7 +26,8 @@ R = "/scratch/gpfs/GROUP/USER/runs/gpic-speed"
 root, size, steps = sys.argv[1].strip("/"), sys.argv[2], [int(s) for s in sys.argv[3:]]
 assert steps, __doc__
 dev = "cuda"
-NAMES = ("final_layer.linear.weight", "final_layer.linear.bias")
+NAMES = ("final_layer.linear.weight",)   # only the weight: w2077 (debug-finalperm) shows the forward reads the bias in
+# order; re-ordering the bias too changed the held-out loss by 1e-5 (views of 2026-11-08 00:xx carry it)
 data = H.load_data(H.data_path(3072, 3072), "cpu")
 split = data["val"]
 idx32 = split["order"][::96][:32]
