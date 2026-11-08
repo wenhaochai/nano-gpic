@@ -9,7 +9,7 @@
 #FETCHABLE
 # FP8 branch runs (gpic-28; owner 2026-11-08 「可以」): where does FP8 lose the d16 check (FD +9.9% at C0; held-out -0.09% at 10200 but
 # +0.10% at 13600)? The check's last 3400 steps (10200 -> 13600: 680 steps at the peak rate, then the linear cooldown over 2720 steps to
-# 3e-5) re-run from either arm's 10200 weights (raw; GPIC_INIT_CKPT, a fresh optimizer with a 1% warmup), each in bf16 or FP8 native3,
+# 3e-5; here 3392 = 672 + 2720, a multiple of 32 as train_ladder.sh requires) re-run from either arm's 10200 weights (raw; GPIC_INIT_CKPT, a fresh optimizer with a 1% warmup), each in bf16 or FP8 native3,
 # all on one data order (shard seed) and one torch seed except the noise replicate. Otherwise genmodel's recipe as in train_sweep_fp8.sh:
 # d16 (width 1536, 16 + 4 blocks), FSDP2 G1, 128 x 1, batch 1024, Muon 6.8e-3, AdamW 0.000179, no weight decay, no EMA, NVLS off.
 # Root runs/gpic-speed/muon_fp8branch/<tag>.
@@ -23,7 +23,7 @@ TAG=$1 INIT=$2 F8=$3 SSEED=$4 TSEED=$5
 case $F8 in none) F8= ;; native3) ;; *) echo "fp8 must be none or native3"; exit 2 ;; esac
 [ -f "$INIT" ] || { echo "no $INIT"; exit 2; }
 [[ $TAG =~ ^[0-9a-z.-]+$ && $SSEED =~ ^[0-9]+$ && $TSEED =~ ^[0-9]+$ ]] || { echo "bad tag or seed"; exit 2; }
-WD=1536 NB=16 NT=4 S=3400 MLR=6.8e-3 ALR=0.000179 WDK=0 GB=1024 CD=2720 WU=34 MB=128
+WD=1536 NB=16 NT=4 S=3392 MLR=6.8e-3 ALR=0.000179 WDK=0 GB=1024 CD=2720 WU=33 MB=128   # train_ladder.sh wants a multiple of 32: 672 + 2720
 SIZE=d$WD PAT='gpic_train_{00000..07999}.tar'
 WT=$WC/project/gpic-wt/fp8_branch_run
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }
