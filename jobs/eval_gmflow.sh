@@ -135,4 +135,17 @@ python -m torch.distributed.run --standalone --nproc_per_node ${EVAL_DEVICES:-8}
 t2=$(date +%s)
 echo "{\"predict_s\": $((t1-t0)), \"eval_s\": $((t2-t1))}" | tee $OUT/phase_times.json
 cat $OUT/metrics.json
-rm -f "$NPZ"   # 50K x 196 KB; metrics.json keeps the result
+# the official evaluation's Inception metrics (FD, PRDC, MMD) on the same samples, before they are deleted (owner 2026-11-07: record every
+# metric the official evaluation gives); a failure here leaves the DINOv2 result in place and says so
+XDG_CACHE_HOME=$WC/cache/gpic_eval_xdg CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES%%,*} $WC/envs/gpic-eval-tf/bin/python $WT/tools/official_inception.py \
+  "$NPZ" $WC/data/gpic/reference_stats/test_stats.npz $OUT/metrics_inception.json > $OUT/inception.log 2>&1 \
+  || echo "inception metrics failed (see $OUT/inception.log)"
+t3=$(date +%s); echo "{\"predict_s\": $((t1-t0)), \"eval_s\": $((t2-t1)), \"inception_s\": $((t3-t2))}" > $OUT/phase_times.json
+# held-out loss (EMA and raw) of the evaluated checkpoint, once per checkpoint (tools/heldout_loss.py skips what is done)
+if [ "${EVAL_HELDOUT:-1}" = 1 ]; then
+  ( HWT=$WC/project/gpic-wt/heldout_loss_run; export PYTHONPATH=$HWT/baselines/PixelGen WT=$HWT OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+    source $HWT/jobs/heldout_loss_lib.sh
+    HELDOUT_TRAIN_SHARDS="00787" heldout_run $WC/tmp/heldout_loss/heldout_loss.jsonl 3072 3072 ${EVAL_DEVICES:-8} "$CKPT" ) > $OUT/heldout.log 2>&1 \
+    || echo "held-out loss failed (see $OUT/heldout.log)"
+fi
+rm -f "$NPZ"   # 50K x 196 KB; metrics.json and metrics_inception.json keep the result
