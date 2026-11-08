@@ -401,6 +401,13 @@ class LightningModel(pl.LightningModule):
         return samples
 
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
+        # this definition shadows the earlier state_dict, so the EMA join of review S1 lives here; GPIC_MFU_NO_EMA: the EMA
+        # slot of every checkpoint holds the raw weights (SimpleEMA.mirror)
+        tracker = getattr(self, "ema_tracker", None)
+        if tracker is not None:
+            tracker._join()
+            if getattr(tracker, "off", False):
+                tracker.mirror()
         if destination is None:
             destination = {}
         self._save_to_state_dict(destination, prefix, keep_vars)
