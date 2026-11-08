@@ -20,7 +20,8 @@ SCAN=$(cd "$(dirname "$0")" && pwd)/pub_scan.py   # this script's own scanner (t
 MAP=(prod:main ar:ar dist-step:dist-step energy-head:energy-head eval-par:eval-par gmflow:gmflow heldout-loss:heldout-loss
      implicit-nodrop:implicit-nodrop ladder:ladder ladder-p:ladder-p ladder-pns:ladder-pns mfu:mfu muon:muon muon-search2:muon-search2
      ladder-pnsr:ladder-pnsr ladder-pnsr-ma:ladder-pnsr-ma ladder-sweep:ladder-sweep sweep-noema:sweep-noema sweep-noema-cap:sweep-noema-cap
-     ladder-noema:ladder-noema ladder-datamem:ladder-datamem eval-official:eval-official)   # 2026-11-08: the no-EMA sweep's and the later ladder segments' code
+     ladder-noema:ladder-noema ladder-datamem:ladder-datamem eval-official:eval-official
+     cooldown:cooldown ladder-full:ladder-full gmflow-b2:gmflow-b2 ladder-pns-fp8:ladder-pns-fp8)   # 2026-11-08: the code of every run the page records
 git -C $SRC fetch -q origin
 RD=$(git -C $SRC log -1 --format=%cs origin/prod -- README.md)
 [ "$RD" = "$(date +%F)" ] || { echo "README.md on prod was last rewritten on $RD: rewrite it (the ladder, the goals, what works, figures) first"; exit 1; }
