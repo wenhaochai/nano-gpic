@@ -728,6 +728,10 @@ def _swiglu_bwd_dt_kernel(Z, DA, DQ, DQT, S, M, H, sz, sda, ST, site, L: tl.cons
         tl.store(S, dq)
 
 
+# Tiles of the transposing casts (BM, BK or BH, num_warps); tools/mfu/fp8_tile_sweep.py times the choices.
+TILES = {"cast": (64, 64, 4), "swiglu": (64, 64, 4), "bwd": (64, 64, 4)}
+
+
 def _fmt(grad):
     e5 = grad and _GRAD_E5
     return (E5, 57344.0, True) if e5 else (E4, FMAX, False)
@@ -748,8 +752,9 @@ def dcast_t(x: torch.Tensor, st: torch.Tensor, site: int, roll: bool, grad: bool
     if xc.numel():
         _launch(_ds_amax_kernel)[(triton.cdiv(xc.numel(), BLOCK),)](xc, xc.numel(), st, site, L=L_HIST, W=W_ST, BLOCK=BLOCK,
                                                           num_warps=8)
-        _launch(_ds_cast_t_kernel)[(triton.cdiv(M, 64), triton.cdiv(K, 64))](xc, q, qt, s, M, K, st, site, L=L_HIST, W=W_ST,
-                                                                      FMAX=fmax, E5M2=e5, BM=64, BK=64, num_warps=4)
+        BM, BK, nw = TILES["cast"]
+        _launch(_ds_cast_t_kernel)[(triton.cdiv(M, BM), triton.cdiv(K, BK))](xc, q, qt, s, M, K, st, site, L=L_HIST, W=W_ST,
+                                                                      FMAX=fmax, E5M2=e5, BM=BM, BK=BK, num_warps=nw)
     return q, qt, s
 
 
@@ -773,8 +778,9 @@ def swiglu_dcast_t(z: torch.Tensor, st: torch.Tensor, site: int) -> tuple[torch.
         BH = _bh(H)
         _launch(_swiglu_ds_amax_kernel)[(M, triton.cdiv(H, BH))](zc, H, zc.stride(0), st, site, L=L_HIST, W=W_ST, BH=BH,
                                                          num_warps=8)
-        _launch(_swiglu_ds_cast_t_kernel)[(triton.cdiv(M, 64), triton.cdiv(H, 64))](zc, q, qt, s, M, H, zc.stride(0), st, site,
-                                                                             L=L_HIST, W=W_ST, BM=64, BH=64, num_warps=4)
+        BM, BH2, nw = TILES["swiglu"]
+        _launch(_swiglu_ds_cast_t_kernel)[(triton.cdiv(M, BM), triton.cdiv(H, BH2))](zc, q, qt, s, M, H, zc.stride(0), st, site,
+                                                                             L=L_HIST, W=W_ST, BM=BM, BH=BH2, num_warps=nw)
     return q, qt, s
 
 
@@ -795,11 +801,12 @@ def swiglu_bwd_dt(z: torch.Tensor, da: torch.Tensor, st: torch.Tensor, site: int
     dqt = torch.empty(H2, M, dtype=dt, device=z.device)
     s = torch.empty(1, dtype=torch.float32, device=z.device)
     if M:
-        g = (triton.cdiv(M, 64), triton.cdiv(H, 64))
-        _launch(_swiglu_bwd_ds_amax_kernel)[g](zc, dac, M, H, zc.stride(0), dac.stride(0), st, site, L=L_HIST, W=W_ST, BM=64,
-                                      BH=64, num_warps=4)
+        BM, BH, nw = TILES["bwd"]
+        g = (triton.cdiv(M, BM), triton.cdiv(H, BH))
+        _launch(_swiglu_bwd_ds_amax_kernel)[g](zc, dac, M, H, zc.stride(0), dac.stride(0), st, site, L=L_HIST, W=W_ST, BM=BM,
+                                      BH=BH, num_warps=nw)
         _launch(_swiglu_bwd_dt_kernel)[g](zc, dac, dq, dqt, s, M, H, zc.stride(0), dac.stride(0), st, site, L=L_HIST, W=W_ST,
-                                 FMAX=fmax, E5M2=e5, BM=64, BH=64, num_warps=4)
+                                 FMAX=fmax, E5M2=e5, BM=BM, BH=BH, num_warps=nw)
     return dq, dqt, s
 
 
