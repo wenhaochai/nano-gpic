@@ -717,3 +717,83 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
 - d640 is bound by the node's CPUs (7.3 ms of worker CPU per image on vis1: decode 2.79, crop and resize 2.25, ToTensor
   0.35, Normalize 0.21, collate 0.25). Same-math candidates: uint8 batches normalized on the GPU (the same float32 ops);
   an exact GPU copy of Pillow's 8-bit bicubic resample (fixed-point coefficients, the same integer arithmetic).
+
+### NS. Muon's Newton-Schulz iterations fused (`GPIC_MFU_NS_FUSED=1`; owner popup 2026-11-07 18:5x)
+- Result (pairs, ladder setting, mean step off -> on): d1024 134.3 -> 129.9 ms (-3.2%), d1536 337.8 -> 328.8 (-2.7%),
+  d1792 (64 x 2) 519.8 -> 495.7 (-4.6%); bit-identical for the first 18-32 steps, losses over the last 200 steps equal
+  to 1e-4.
+- Decision: adopted (ladder-pns 8ed7b82). With P, the ladder's record is 419 H100-h at 37.3% MFU.
+
+### MA. Muon's per-part weight updates in one Triton launch (`GPIC_MFU_MUON_ADD=1`); S2. the loader ahead (`GPIC_SHARED_BUCKET_AHEAD=k`)
+- MA, bit for bit with torch's add_: d1024 132.7 -> 129.1 ms (-2.7%), d1536 331.0 -> 326.8 (-1.3%). Adopted after the
+  owner dropped the 3% bar (2026-11-07 22:xx: every speed-up is wanted): ladder-pnsr-ma 1eb7aae, in genmodel's sweep code
+  e83641d.
+- S2, the loader's pulls and decisions two batches ahead in a thread: d1024 +0.6%, d1280 +1.4%. The loader is not on the
+  critical path; S2 stays out.
+
+### No EMA (`GPIC_MFU_NO_EMA=1`; owner 2026-11-08: 「ema是一定不能用」)
+- The switch skips every EMA update; the module's state_dict mirrors the raw weights into the EMA slot, so every tool
+  that samples from the EMA evaluates the raw model (tools/mfu/tests/test_no_ema.py).
+- Speed (w2076, pairs, mean step on -> off): d640 -2.7% (median -1.1%), d1024 +3.3% (+0.8%), d1280 +1.2% (+1.3%): none.
+  The lerp runs on its own stream behind the step.
+- Decision: adopted on policy (ladder-noema 04d03a9; genmodel's sweep-noema dc8c02d).
+
+### F8. FP8 (native3) against bf16
+- Phase 4 (FP8 weight gradients and attention dgrads; w1961, tiles fixed in e676144): native3 -> native4 d1024 +6.3%,
+  d1536 +1.0%, d1792 +0.5%: dropped. The checks use native3 (d1536 -9.6% per step against bf16).
+- d17 check on the old flat-rate recipe (w1955-w1957 against bf16 w1684, same seed and code): FAIL. Raw held-out
+  +0.00/+0.21/+0.32% at 5600/11200/22400 (limit 0.15%); FD +2.8/+7.2/+3.4% (limit 5%). The step is 4.4% faster, but
+  FP8 needs about 13% more steps to reach bf16's loss at 22400.
+- Why (tools/mfu/fp8_site_error.py on w1684 step 22400, casts simulated, fp32 sums): every GEMM's output is off by 3-4%
+  (median over the blocks: qkv 3.0%, proj 3.8%, w12 4.0%, w3 3.2%, the two dgrads 2.9% and 3.7%). Rowwise scales and
+  1x128 / 128x128 blocks give nearly the same (2.4-3.9%); e5m2 gradients are worse (4.5-5.9%). Crest factors: 14-30
+  for activations, 91 for the SwiGLU product, 69-257 for gradients. So the error is e4m3's 3 mantissa bits at every
+  GEMM, not outliers, scale granularity or a few blocks.
+- Practice elsewhere (the owner's question): Megatron-LM can keep the first and last layers in bf16
+  (first_last_layers_bf16) and the weight-gradient GEMMs in high precision (fp8_wgrad off); Transformer Engine's HYBRID
+  recipe uses e4m3 forward and e5m2 backward; DeepSeek-V3 uses 1x128 activation and 128x128 weight blocks with
+  higher-precision accumulation; NVIDIA's NVFP4 pretraining keeps about 15% of the layers in bf16; torchao's
+  rowwise_with_gw_hp keeps the weight-gradient GEMM in high precision. All keep embeddings, the output layer, norms and
+  the optimizer in high precision, as our FP8 does (only the image blocks' 64 GEMMs are FP8).
+- d20 check under the new recipe (owner popups 2026-11-08 03:4x and 11:2x; logs/mfu_fp8_d20_recipe.yaml): bf16 and
+  native3 from scratch on genmodel's current recipe code (no EMA, the pool cap; ladder-sweep-fp8-cap 47ab59d), 13600
+  steps (1C0), Muon 6.8e-3, AdamW 1.79e-4, linear cooldown to 3e-5: w2172, w2173; FD w2174, w2175; held-out w2176.
+  Early step time (steps 1199-2199, two nodes): 330.8 vs 296.7 ms (-10.3%).
+
+### S3. The shared bucket's pools bounded (`GPIC_SHARED_BUCKET_POOL_CAP`, default 40; genmodel 2026-11-08: w1682's host OOM)
+- Cause: each rank's pools grow like a random walk (about the square root of the steps). w1682 held 41-51 GB of pinned
+  host memory per rank at its final save after 340 min.
+- Fix (ladder-datamem 2e4ee4b): when any rank's pools reach the cap, every rank takes a free step. The decision's
+  all-reduce carries the flag, and each rank takes a batch from its own largest pool. Prefetch halved
+  (GPIC_TRAIN_PREFETCH=2). With 8 threaded ranks the largest pool is 47 batches instead of 667
+  (tools/mfu/tests/test_shared_bucket_cap.py).
+- In genmodel's sweep-noema-cap 8e1b9ef; its d11 FD check runs (w2166 without, w2168 with). The d20 FP8 arms stayed
+  under the cap for their first 2000 steps (largest pool 31).
+
+### The d1536 checkpoint fault: NCCL 2.26.2's NVLS rank order (2026-11-08; logs/mfu_nccl_nvls.yaml, mfu_nccl_new_speed.yaml)
+- Symptom (genmodel): the d1536 checkpoints scored held-out ~0.25, the other widths ~0.067. The 8 row blocks of
+  final_layer.linear.weight (its FSDP2 Shard(0) pieces) were stored out of order; re-ordering them gives ~0.065.
+- Where (branch debug-finalperm, w2077-w2089): training is right; the forward's gather and the shards agree at every
+  step. DTensor.full_tensor(), which the checkpoint save uses, returns the blocks permuted ([0,2,3,1,4,6,5,7] and others).
+  A load splits by position, so every resume scrambled the trained final layer once. No lever is involved (bisect w2081).
+- Cause (plain torch.distributed; w2090, w2093, w2147): NCCL 2.26.2 (torch 2.7.1's) puts the ranks' blocks in the wrong
+  order in single-node NVLS all-gather and reduce-scatter at 576 KB per rank. That is exactly the d1536 final layer's
+  shard (147456 fp32). All-reduce and every real FSDP2 unit size are right. NCCL_NVLS_ENABLE=0 or NCCL_ALGO=Ring: 0
+  errors; NCCL_PROTO=Simple: 156 of 180 cases wrong. On one node with one test, 2.26.2 is wrong with the device list in
+  order and permuted, and 2.27.7-2.32.3 are right; 2.21.5 does not load into torch 2.7.1. Upstream: NVIDIA/nccl #1906.
+- Fix: NCCL_NVLS_ENABLE=0 in every job. The six d1536 checkpoints have fixed views (tools/mfu/make_fixed_view.py);
+  last.ckpt was converted for the resume (tools/mfu/fix_final_layer_ckpt.py); the d1536 training path with NVLS off
+  passed every check (w2130).
+- NCCL 2.27.7 preloaded (LD_PRELOAD=envs/nccl/2.27.7/libnccl.so.2), NVLS on. Median step while both halves train
+  (tools/mfu/pair_window.py), 4-GPU halves: 2.26.2 NVLS on -> off (w2094) d640 -0.5%, d1024 +0.9%, d1280 +1.8%;
+  2.26.2 NVLS off -> 2.27.7 NVLS on (w2148) d640 -1.9%, d1024 -0.9%, d1280 -1.3%. The d1536 training-path gate passed
+  (w2171: forward 30 of 30 and save-path gather 3 of 3 in order; 2.27.7 on all 8 ranks; NVLS buffers on every rank).
+  genmodel moves new runs to 2.27.7; queued comparisons stay on NVLS off.
+- Lesson: torch.cuda.nccl.version() prints the compiled version (2.26.2) even when another libnccl is loaded. Read the
+  loaded library from /proc/self/maps or with NCCL_DEBUG=VERSION.
+
+### Paired halves: the measurement window (2026-11-08)
+- pairs.sh's summary takes each arm's second half of steps. Half B starts 150 s later, so A's window overlaps B's
+  compile, and B's last arm runs partly alone. tools/mfu/pair_window.py compares the halves only while both train in
+  steady state. Even so, a no-op pair (noema: EMA off cannot be slower) reads +0.2/+0.4/+1.1% at d640/d1024/d1280. A
+  pair's noise is about 1%: a smaller effect needs agreement across widths or pairs.
