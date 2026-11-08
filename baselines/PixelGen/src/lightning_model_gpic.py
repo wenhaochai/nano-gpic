@@ -261,7 +261,40 @@ class LightningModel(pl.LightningModule):
             opt.ema_of = dict(zip(self.denoiser.parameters(), self.ema_denoiser.parameters()))
             opt.ema_weight = 1.0 - self.ema_tracker.decay
             self.ema_tracker.fused = True
+        if os.environ.get("GPIC_DEBUG_OPT_STATE") == "1":
+            self._debug_opt_state()
         print(f"[rank {self.trainer.global_rank}] on_train_start done")
+
+    @torch.no_grad()
+    def _debug_opt_state(self):
+        """gpic-28 2026-11-08 (resume test): the optimizer state as training starts, after a resume's restore. Per param group: the
+        params with state and, for each state key, the sum of squares over every param (a DTensor state sharded over the ranks: its
+        local shards summed over the ranks; a replicated one or a plain tensor: counted once). Printed by rank 0 as [optstate]."""
+        import torch.distributed as dist
+        from torch.distributed.tensor import DTensor
+        opt, rank = self.trainer.optimizers[0], dist.get_rank()
+        for gi, g in enumerate(opt.param_groups):
+            sums = torch.zeros(4, dtype=torch.float64, device=self.device)   # exp_avg, exp_avg_sq, momentum_buffer, params with state
+            for p in g["params"]:
+                st = opt.state.get(p, {})
+                sums[3] += 1.0 if st else 0.0
+                for j, k in enumerate(("exp_avg", "exp_avg_sq", "momentum_buffer")):
+                    v = st.get(k)
+                    if v is None:
+                        continue
+                    if isinstance(v, DTensor):
+                        s = v.to_local().double().pow(2).sum()
+                        if not any(pl.is_shard() for pl in v.placements) and rank != 0:
+                            s = s * 0
+                    else:
+                        s = v.double().pow(2).sum() if rank == 0 else torch.zeros((), dtype=torch.float64, device=self.device)
+                    sums[j] += s.to(self.device)
+            n_state = sums[3].item()   # every rank holds every param (its shard), so the count is rank 0's
+            sums[3] = 0
+            dist.all_reduce(sums)
+            if rank == 0:
+                print(f"[optstate] group {gi}: {len(g['params'])} params, {int(n_state)} with state; sum of squares exp_avg {sums[0].item():.9e} "
+                      f"exp_avg_sq {sums[1].item():.9e} momentum_buffer {sums[2].item():.9e}", flush=True)
 
     def on_load_checkpoint(self, checkpoint):
         if "state_dict" not in checkpoint:   # MFU lever B: ModelParallelStrategy loaded the model itself and took the key (smoke w1395)
