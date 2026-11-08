@@ -2,7 +2,7 @@
 #SBATCH -J gpic-mfu-ncclver
 #SBATCH --gres=gpu:8
 #SBATCH -c 96
-#SBATCH --time=00:40:00
+#SBATCH --time=01:00:00
 #SBATCH --mem=400G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
@@ -18,10 +18,13 @@ TOOLS=${1:?tools worktree} CODE=${2:?code worktree}
 cd $TOOLS
 source $WC/envs/pixgen/bin/activate
 export TMPDIR=$WC/tmp/job/${FETCHED_JOB_ID:-$SLURM_JOB_ID}; mkdir -p $TMPDIR; trap 'rm -rf $TMPDIR' EXIT
-for d in $WC/tmp/nccl_wheels/*/; do
-  lib=$d/nvidia/nccl/lib/libnccl.so.2
-  [ -f $lib ] || continue
-  echo "== $(basename $d)"
-  LD_PRELOAD=$lib torchrun --standalone --nproc_per_node 8 tools/mfu/nccl_ag_test.py 2>&1 | grep -v -i warn | grep -E "NCCL \(|  n " | head -4
-  LD_PRELOAD=$lib torchrun --standalone --nproc_per_node 8 tools/mfu/nccl_rs_test.py $CODE 2>&1 | grep -v -i warn | grep -E "bad cases|  n " | head -3
+# the bundled 2.26.2 is the control; a permuted CUDA_VISIBLE_DEVICES triggers the bug on any node (NVIDIA/nccl #1906), the
+# in-order one only on some nodes; the tests print the libnccl actually mapped (w2134 printed the compiled version only)
+for d in bundled $WC/tmp/nccl_wheels/*/; do
+  if [ $d = bundled ]; then pre=; else lib=$d/nvidia/nccl/lib/libnccl.so.2; [ -f $lib ] || continue; pre=LD_PRELOAD=$lib; fi
+  for cvd in 0,1,2,3,4,5,6,7 0,2,3,1,4,6,5,7; do
+    echo "== $(basename $d) CUDA_VISIBLE_DEVICES=$cvd"
+    env $pre CUDA_VISIBLE_DEVICES=$cvd torchrun --standalone --nproc_per_node 8 tools/mfu/nccl_ag_test.py 2>&1 | grep -v -i warn | grep -E "NCCL \(|  n |Error|error" | head -3 | cut -c1-400
+    env $pre CUDA_VISIBLE_DEVICES=$cvd torchrun --standalone --nproc_per_node 8 tools/mfu/nccl_rs_test.py $CODE 2>&1 | grep -v -i warn | grep -E "bad cases|Error|error" | head -2
+  done
 done

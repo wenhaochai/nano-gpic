@@ -61,7 +61,8 @@ for n in cases:
                     bad.append(f"n {n} ({n * torch.empty((), dtype=dt).element_size() / 1024:.0f} KB, {units.get(n, 'sweep')}) "
                                f"{str(dt)[6:]} rep {rep}: reduce-scatter rank->chunk {rs_bad or 'ok'}; all-reduce wrong on {ar_bad or 'none'}")
 if r == 0:
-    env = {k: v for k, v in os.environ.items() if k.startswith("NCCL_")}
+    env = {k: v for k, v in os.environ.items() if k.startswith(("NCCL_", "CUDA_VISIBLE"))}
+    env["libnccl"] = sorted({l.split()[-1] for l in open("/proc/self/maps") if "libnccl" in l})   # the library actually loaded
     print(f"NCCL {torch.cuda.nccl.version()}, env {env}, host {os.uname().nodename}: units {sorted(units.items())}", flush=True)
     print(f"{len(bad)} bad cases of {len(cases) * 2 * 2}", flush=True)
     for b in bad[:40]:
