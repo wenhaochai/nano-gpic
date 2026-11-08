@@ -54,9 +54,10 @@ def reorder(sd, prefix, pi):
 for step in steps:
     src = f"{R}/{root}/exp_ladder_{size}/ms-step={step:06d}.ckpt"
     out_dir = f"{R}/fixed_view/{root}/exp_ladder_{size}"
-    os.makedirs(out_dir, exist_ok=True)
+    if os.environ.get("FIXED_VIEW_CHECK") != "1":
+        os.makedirs(out_dir, exist_ok=True)
     out = f"{out_dir}/ms-step={step:06d}.ckpt"
-    if os.path.exists(out):
+    if os.path.exists(out) and os.environ.get("FIXED_VIEW_CHECK") != "1":
         print("exists", out)
         continue
     kw, lc = H.run_config(os.path.dirname(src))
@@ -99,6 +100,8 @@ for step in steps:
             print(f"{size} {step} {wname}: pi {pi} (block corr {corr}); held-out loss {l0:.4f} -> {l1:.4f}", flush=True)
         else:
             print(f"{size} {step} {wname}: pi is the identity (block corr {corr})", flush=True)
+    if os.environ.get("FIXED_VIEW_CHECK") == "1":   # only estimate and print pi
+        continue
     keep = {k: v for k, v in ck.items() if k not in ("optimizer_states", "lr_schedulers", "callbacks", "loops")}
     keep["state_dict"] = new
     keep["fixed_view_of"] = src
