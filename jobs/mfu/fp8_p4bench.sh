@@ -21,5 +21,5 @@ for spec in "1024 32768" "1280 32768" "1536 32768" "1792 16384" "1024 16384" "12
   i=$((i + 1))
 done
 wait
-for f in $OUT/d*.txt; do grep -v -i warn $f | tail -16; done | tee $OUT/summary.txt
+for f in $OUT/d*.txt; do grep -v -i warn $f | tail -24; done | tee $OUT/summary.txt
 echo "DONE $OUT"

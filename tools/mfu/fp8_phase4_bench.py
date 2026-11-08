@@ -38,10 +38,16 @@ for site in range(16):
     F.dcast(x, st, site, False)
 F.dcast(x, st, 0, True)
 rows = []
+# phase 2's pieces too (current scaling: an amax pass, then the cast): does delayed scaling make a cast cheaper?
+p2 = [("cast x [M,C]", t(lambda: F.tcast(x))), ("cast dy [M,C]", t(lambda: F.tcast(x))),
+      ("swiglu cast z [M,2H]", t(lambda: F.swiglu_tcast(z))), ("swiglu backward", t(lambda: F.swiglu_bwd(z, da)))]
 rows.append(("cast x [M,C]", t(lambda: F.dcast(x, st, 1, False)), t(lambda: F.dcast_t(x, st, 1, False, False))))
 rows.append(("cast dy [M,C]", t(lambda: F.dcast(x, st, 2, False)), t(lambda: F.dcast_t(x, st, 2, False, True))))
 rows.append(("swiglu cast z [M,2H]", t(lambda: F.swiglu_dcast(z, st, 3)), t(lambda: F.swiglu_dcast_t(z, st, 3))))
 rows.append(("swiglu backward", t(lambda: F.swiglu_bwd_ds(z, da, st, 4)), t(lambda: F.swiglu_bwd_dt(z, da, st, 4))))
+w12 = torch.randn(2 * H, C, device=dev).to(BF)
+p2.append(("weight w12 cast (+ transpose)", t(lambda: (F.tcast(w12), F.tcast(w12.t().contiguous())))))
+rows.append(("weight w12 cast (+ transpose)", t(lambda: F.tcast_t(w12)), t(lambda: F.tcast_t(w12))))
 xq, xqt, sx = F.dcast_t(x, st, 1, False, False)
 aq, aqt, sa = F.swiglu_dcast_t(z, st, 3)
 dyq, dyqt, sdy = F.dcast_t(x, st, 2, False, True)
@@ -62,10 +68,13 @@ rows.append(("dgrad qkv_x [M,C]", t(lambda: dy3 @ w3), t(lambda: F._mmo(dy3q, s3
 w1 = torch.randn(C, C, device=dev).to(BF)
 w1q, sw1, w1tq = F.tcast_t(w1)
 rows.append(("dgrad proj [M,C]", t(lambda: x @ w1), t(lambda: F._mmo(dyq, sdy, w1tq, sw1, torch.bfloat16))))
+print(f"d{C}, M {M}: ms per call, phase 2 (current scaling) / phase 3 (delayed scaling)")
+for (name, a2), (_, a3, _) in zip(p2, rows):
+    print(f"  {name:30s} {a2:7.3f} {a3:7.3f}  {a3 - a2:+7.3f}")
 print(f"d{C}, M {M}: ms per call, phase 3 piece / phase 4 piece")
 tot3 = tot4 = 0.0
 for name, a, b in rows:
     tot3 += a; tot4 += b
-    print(f"  {name:24s} {a:7.3f} {b:7.3f}  {b - a:+7.3f}")
-print(f"  {'sum (one block)':24s} {tot3:7.3f} {tot4:7.3f}  {tot4 - tot3:+7.3f}")
+    print(f"  {name:30s} {a:7.3f} {b:7.3f}  {b - a:+7.3f}")
+print(f"  {'sum (one block)':30s} {tot3:7.3f} {tot4:7.3f}  {tot4 - tot3:+7.3f}")
 print("FP8_PHASE4_BENCH DONE")
