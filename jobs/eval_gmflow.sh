@@ -142,7 +142,7 @@ XDG_CACHE_HOME=$WC/cache/gpic_eval_xdg CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVIC
   || echo "inception metrics failed (see $OUT/inception.log)"
 t3=$(date +%s); echo "{\"predict_s\": $((t1-t0)), \"eval_s\": $((t2-t1)), \"inception_s\": $((t3-t2))}" > $OUT/phase_times.json
 # held-out loss (EMA and raw) of the evaluated checkpoint, once per checkpoint (tools/heldout_loss.py skips what is done)
-if [ "${EVAL_HELDOUT:-1}" = 1 ]; then
+if [ "${EVAL_HELDOUT:-0}" = 1 ]; then   # off by default: one checkpoint keeps 1 of 8 GPUs busy; batched held-out jobs (heldout_backfill.sh) run 8 checkpoints side by side
   ( HWT=$WC/project/gpic-wt/heldout_loss_run; export PYTHONPATH=$HWT/baselines/PixelGen WT=$HWT OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
     source $HWT/jobs/heldout_loss_lib.sh
     HELDOUT_TRAIN_SHARDS="00787" heldout_run $WC/tmp/heldout_loss/heldout_loss.jsonl 3072 3072 ${EVAL_DEVICES:-8} "$CKPT" ) > $OUT/heldout.log 2>&1 \
