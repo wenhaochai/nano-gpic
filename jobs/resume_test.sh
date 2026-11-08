@@ -35,6 +35,7 @@ bash $WT/jobs/train_ladder.sh d1536 1536 16 4 $S \
   --data.train_batch_size 128 --trainer.accumulate_grad_batches 1 --data.train_dataset.init_args.shared_bucket true \
   --data.train_dataset.init_args.tar_pattern 'gpic_train_{00000..07999}.tar' --seed_everything 0 \
   --trainer.logger.init_args.name resumetest_${TAG} --trainer.logger.init_args.id resumetest-$TAG 2>&1 | tee $ROOT/train.log | grep -a -E "optstate|Restor|resuming|Traceback|Error"
+source $WC/envs/pixgen/bin/activate   # w2322 ran this with the system python (no torch); its sums matched by hand on vis1
 python $WT/tools/opt_state_sums.py $SRC/last.ckpt | tee $ROOT/ckpt_sums.txt
 python - $ROOT/train.log $ROOT/ckpt_sums.txt <<'PY'
 import re, sys
