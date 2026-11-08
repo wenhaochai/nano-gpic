@@ -4,7 +4,7 @@
 the DataLoader's order (batch k from worker k % W), one SharedBucketLoader per rank in its own thread, the gloo all-reduce
 replaced by a barrier that takes the elementwise minimum. Checks: every rank's micro-batch k has the same bucket and pads
 to its edge; every sample lies in its bucket; the buckets come at their share of the data; every worker holds fewer than
-one batch per bucket and every pool stays small; no sample twice, none lost. Then the share estimate from the cache.
+one batch per bucket and every pool stays small; no sample twice, none lost. Then the share estimate from the cache.\nLever S2: the same run with ahead=2 (a background thread per rank) gives the same samples in every micro-batch.
 usage: python test_shared_bucket.py"""
 import os, sys, bisect, threading
 import numpy as np
@@ -121,5 +121,23 @@ if os.path.isdir(emb):
     real.bucket_edges, real.bucket_index_shards = EDGES, 32
     e2, s2 = GPICWebDataset.bucket_shares(real)
     print("shares from the cache index (32 shards):", ", ".join(f"{e}: {s:.4f}" for e, s in zip(e2, s2)))
+# lever S2: the same run with the pulls and decisions 2 batches ahead in a background thread per rank: the same batches
+ex2, emitted2, got2 = Exchange(R), [[] for _ in range(R)], [[] for _ in range(R)]
+
+
+def run2(r):
+    it = iter(SharedBucketLoader(rank_loader(ds, r, emitted2), EDGES, allreduce_min=lambda c, r=r: ex2(r, c), ahead=2))
+    for _ in range(K):
+        got2[r].append(next(it))
+
+
+th = [threading.Thread(target=run2, args=(r,)) for r in range(R)]
+for t in th:
+    t.start()
+for t in th:
+    t.join()
+same2 = all([s["id"] for s in got[r][k][3]] == [s["id"] for s in got2[r][k][3]] for r in range(R) for k in range(K))
+ok &= same2
+print(f"2 batches ahead in a thread: the same samples in every rank's micro-batch k ({R} x {K}): {same2}")
 print("SHARED_BUCKET_TEST " + ("PASS" if ok else "FAIL"))
 sys.exit(0 if ok else 1)
