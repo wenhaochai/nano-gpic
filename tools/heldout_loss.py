@@ -390,6 +390,23 @@ def evaluate(nets, tr, split, ts, seed=SEED, batch=BATCH, device="cpu", autocast
 
 
 # -------------------------------------------------------------------------------------------------------------- model
+def run_global_batch(run_dir):
+    """images per optimizer step of the run (train_batch_size x accumulate_grad_batches x devices x nodes), from its last saved
+    config; None when the config does not say"""
+    import yaml
+    cfgs = sorted(glob.glob(os.path.join(run_dir, "config-TrainerFn.FITTING-*.yaml")))
+    if not cfgs:
+        return None
+    with open(cfgs[-1]) as f:
+        c = yaml.safe_load(f)
+    try:
+        tr, dt = c["trainer"], c["data"]
+        dev = tr.get("devices", 8); dev = len(dev) if isinstance(dev, list) else (8 if dev in (None, "auto", -1) else int(dev))
+        return int(dt["train_batch_size"]) * int(tr.get("accumulate_grad_batches") or 1) * dev * int(tr.get("num_nodes") or 1)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def run_config(run_dir):
     """Denoiser kwargs and the loss settings from the run's saved configs (all launches must agree)."""
     import yaml
@@ -569,8 +586,15 @@ def run_task(spec, weights, data, a, device):
     t0 = time.time()
     log = lambda msg: print(f"[heldout] {spec['size']} step {spec['step']} {spec['ladder']}: {msg}", flush=True)
     kw, loss = run_config(os.path.dirname(spec["ckpt"]))
-    assert (kw["hidden_size"], kw["num_blocks"], kw["num_text_blocks"]) == (spec.get("d", kw["hidden_size"]),
-            spec.get("nb", kw["num_blocks"]), spec.get("nt", kw["num_text_blocks"])), (kw, spec)
+    shape = (kw["hidden_size"], kw["num_blocks"], kw["num_text_blocks"])
+    gb = run_global_batch(os.path.dirname(spec["ckpt"]))
+    if shape != (spec.get("d", shape[0]), spec.get("nb", shape[1]), spec.get("nt", shape[2])):
+        # 2026-11-08 (genmodel): a shape the ladder table does not hold at this width (the no-EMA sweep's depth arms, e.g. width 1280
+        # with 4 + 2 blocks): the run's own config sets the shape; its FLOPs are not in the table
+        spec.update(d=shape[0], nb=shape[1], nt=shape[2], train_flops=None, flops_source="shape outside docs/ladder_runs.json")
+    elif gb and gb != GLOBAL_BATCH and spec.get("train_flops"):
+        # the Muon runs train at batch 1024 (the table's GFLOP per image times the run's own images)
+        spec.update(train_flops=spec["train_flops"] * gb / GLOBAL_BATCH, flops_source=spec["flops_source"] + f", batch {gb}")
     ck = torch.load(spec["ckpt"], map_location="cpu", mmap=True, weights_only=False)
     assert ck["global_step"] == spec["step"], (ck["global_step"], spec["step"])
     prefixes = dict(WEIGHTS)
