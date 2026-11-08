@@ -6,7 +6,9 @@ the other (w916, 2026-11-02: fewer than 80 steps in 14 minutes). This callback r
 encoder, CFG dropout, denoiser forward and backward, under the training precision context) on dummy batches at T = 64,
 128, 320 and 192 on every rank together: the second T gives the graphs a dynamic T, 320 is the slice of the whole
 position embedding (its own guard), and 192 checks that no new graph is needed. The gradients are discarded before the first step, and DDP's reducer ignores this backward because it runs
-before any DDP forward. The only trace left in training is the position of the RNG streams.
+before any DDP forward. Every RNG stream is put back afterwards (cudagraph-bucket, 2026-11-08: lever X's warm-up makes 20
+calls, the default 4, and the RNG position left behind changed every draw of the first training step, w2178), so
+nothing of the warm-up is left in training.
 """
 import contextlib
 import os
@@ -33,6 +35,9 @@ class CompileWarmup(Callback):
             # record its graphs at the second call, so two calls per edge record every graph before the first step, on
             # all ranks together, and none for a length that never comes (the default lengths' 128 and 192).
             lengths = tuple(e for e in ds.bucket_edges for _ in range(2))
+        import random
+        import numpy as np
+        rng = (torch.get_rng_state(), torch.cuda.get_rng_state(dev), random.getstate(), np.random.get_state())
         for T in lengths:
             t0 = time.time()
             mask = torch.zeros(B, T, dtype=torch.bool, device=dev)
@@ -68,5 +73,6 @@ class CompileWarmup(Callback):
             trainer.strategy.barrier()
             if trainer.is_global_zero:
                 print(f"[warmup] T={T}: {time.time() - t0:.1f} s", flush=True)
+        torch.set_rng_state(rng[0]); torch.cuda.set_rng_state(rng[1], dev); random.setstate(rng[2]); np.random.set_state(rng[3])
         if trainer.is_global_zero:
             print("[warmup] done", flush=True)
