@@ -44,12 +44,13 @@ def child(r, world, init, code, steps, out):
     it, step, epochs, trained = iter(sb), 0, 1, []
     while step < steps:
         try:
+            f0 = it.free_steps
             b = next(it)
         except StopIteration:   # Lightning: the epoch ends on this rank, and the next epoch starts a new iterator
             epochs += 1
             it = iter(sb)
             continue
-        trained.append([list(b[1]), int(b[2]["text_mask"].shape[1])])
+        trained.append([list(b[1]), int(b[2]["text_mask"].shape[1]), it.free_steps > f0])   # free: above the pool cap
         t = torch.ones(1)
         dist.all_reduce(t)   # the step's gradient all-reduce
         step += 1
@@ -93,11 +94,13 @@ def main():
     bad = [(r, p.exitcode) for r, p in enumerate(procs) if p.exitcode != 0]
     assert not bad, f"ranks exited with errors: {bad}"
     res = [json.load(open(o)) for o in outs]
-    seqs = [[T for _, T in x["trained"]] for x in res]
+    seqs = [[T for _, T, _ in x["trained"]] for x in res]
+    free = [[f for _, _, f in x["trained"]] for x in res]
     assert all(len(q) == a.steps for q in seqs), [len(q) for q in seqs]
-    assert all(q == seqs[0] for q in seqs), "the ranks trained different buckets"
+    assert all(f == free[0] for f in free), "the ranks disagree on the free micro-batches"
+    assert all(q[k] == seqs[0][k] for q in seqs for k in range(a.steps) if not free[0][k]), "the ranks trained different buckets"
     for x in res:
-        ids = [tuple(i) for i, _ in x["trained"]]
+        ids = [tuple(i) for i, _, _ in x["trained"]]
         pooled = [tuple(i) for i in x["pooled"]]
         pulled = [tuple(i) for i in x["pulled"]]
         assert len(set(ids)) == len(ids), f"rank {x['rank']}: a batch trained twice"
@@ -110,7 +113,7 @@ def main():
     ends = [x["passes_ended"] for x in res]
     pool_end = [len(x["pooled"]) for x in res]
     print(f"PASS: {a.world} ranks x {a.steps} micro-batches in {time.time() - t0:.1f} s, one epoch each, the same bucket on "
-          f"every rank at every micro-batch, nothing lost; pass ends per rank {ends}; batches pooled at the end {pool_end}")
+          f"every rank at every micro-batch but the {sum(free[0])} free ones, nothing lost; pass ends per rank {ends}; batches pooled at the end {pool_end}")
 
 
 if __name__ == "__main__":
