@@ -25,7 +25,15 @@ class CompileWarmup(Callback):
         # the data's per-GPU batch when the DataModule has one (new ladders: micro-batches of 64 or 128 for global 1024)
         B, dev = getattr(getattr(trainer, "datamodule", None), "train_batch_size", None) or self.batch_size, pl_module.device
         cached = not hasattr(pl_module.conditioner, "tokenizer")   # outputs read from the batch (cached_text.py)
-        for T in self.lengths:
+        lengths = self.lengths
+        ds = getattr(getattr(trainer, "datamodule", None), "train_dataset", None)
+        if os.environ.get("GPIC_PROF_DEN_COMPILE_MODE") == "reduce-overhead" and getattr(ds, "shared_bucket", False):
+            # MFU lever X with the shared bucket (cudagraph-bucket, owner 2026-11-08): every micro-batch pads to a bucket
+            # edge, so the compiled denoiser sees only those lengths. Cudagraph trees run a new length once to warm up and
+            # record its graphs at the second call, so two calls per edge record every graph before the first step, on
+            # all ranks together, and none for a length that never comes (the default lengths' 128 and 192).
+            lengths = tuple(e for e in ds.bucket_edges for _ in range(2))
+        for T in lengths:
             t0 = time.time()
             mask = torch.zeros(B, T, dtype=torch.bool, device=dev)
             mask[:, :T // 2] = True   # with padding, as real batches have: HF skips the mask when nothing is padded
