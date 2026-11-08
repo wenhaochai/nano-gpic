@@ -729,7 +729,7 @@ def _swiglu_bwd_dt_kernel(Z, DA, DQ, DQT, S, M, H, sz, sda, ST, site, L: tl.cons
 
 
 # Tiles of the transposing casts (BM, BK or BH, num_warps); tools/mfu/fp8_tile_sweep.py times the choices.
-TILES = {"cast": (64, 64, 4), "swiglu": (64, 64, 4), "bwd": (64, 64, 4)}
+TILES = {"cast": (128, 64, 4), "swiglu": (128, 64, 4), "bwd": (64, 32, 8)}   # w1960: the fastest at every width (d1536, M 32768: 0.39 -> 0.22, 1.41 -> 0.73, 2.50 -> 1.35 ms; bit for bit)
 
 
 def _fmt(grad):
