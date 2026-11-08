@@ -37,7 +37,8 @@ for n in sizes:
                     bad.append(f"n {n} ({n * torch.empty((), dtype=dt).element_size() / 1024:.0f} KB) {str(dt)[6:]} {mode} rep {rep}: "
                                + "; ".join(f"rank {q} blocks from {s}" for q, s in enumerate(allr) if s != list(range(W))))
 if r == 0:
-    env = {k: v for k, v in os.environ.items() if k.startswith("NCCL_")}
+    env = {k: v for k, v in os.environ.items() if k.startswith(("NCCL_", "CUDA_VISIBLE"))}
+    env["libnccl"] = sorted({l.split()[-1] for l in open("/proc/self/maps") if "libnccl" in l})   # the library actually loaded
     print(f"NCCL {torch.cuda.nccl.version()}, env {env}, host {os.uname().nodename}: {len(bad)} bad cases of "
           f"{len(sizes) * 2 * 2 * 3}", flush=True)
     for b in bad[:30]:
