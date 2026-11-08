@@ -37,6 +37,45 @@ net.load_state_dict(sub, strict=True, assign=True)
 net = net.to(dev).float()
 mesh = init_device_mesh(dev, (world,), mesh_dim_names=("data_parallel",))
 shard(net, mesh, compute_bf16=True, compile_blocks=len(sys.argv) > 3, names={m: n for n, m in net.named_modules()})
+# the root unit's all-gather (the unit that holds final_layer.linear): after FSDP2's copy-out, (1) is row r of the all-gather
+# output what rank r sent (a second all_gather of each rank's own row), (2) is each parameter's unsharded data the
+# matching column slice of the output (FSDP2's split_with_sizes_copy)
+import torch.distributed.fsdp._fully_shard._fsdp_param_group as FPG  # noqa: E402
+_orig_copy_out = FPG.foreach_all_gather_copy_out
+diag = []
+
+
+def _copy_out(all_gather_result, fsdp_params, group):
+    _orig_copy_out(all_gather_result, fsdp_params, group)
+    mods_ = [fp._module_info.module for fp in fsdp_params]
+    if net.final_layer.linear not in mods_ or len(diag) >= 1:
+        return
+    out = all_gather_result.all_gather_output
+    W = group.size()
+    rows = out.view(W, -1)
+    me = rows[group.rank()].clone()
+    got = [torch.empty_like(me) for _ in range(W)]
+    dist.all_gather(got, me, group=group)
+    rows_ok = [bool(torch.equal(rows[r], got[r])) for r in range(W)]
+    off, slices = 0, []
+    sizes = all_gather_result.all_gather_input_split_sizes
+    k = 0
+    for fp, numels in zip(fsdp_params, all_gather_result.param_all_gather_input_numels):
+        for n, t in zip(numels, fp.all_gather_outputs):
+            want = rows[:, off:off + n]
+            have = t.view(W, -1)
+            ok = bool(torch.equal(want.reshape(-1).view(torch.uint8) if out.dtype == torch.uint8 else want, have))
+            if not ok:   # which source row does each destination row hold?
+                src = [next((q for q in range(W) if torch.equal(have[r], rows[q, off:off + n])), -1) for r in range(W)]
+            else:
+                src = list(range(W))
+            slices.append((fp._param_fqn or fp._module_info.param_name, n, off, ok, src))
+            off += n
+            k += 1
+    diag.append((rows_ok, slices, str(out.dtype), out.numel(), out.data_ptr() % 4096))
+
+
+FPG.foreach_all_gather_copy_out = _copy_out
 watch = ["final_layer.linear", "x_embedder.proj1", "x_embedder.proj2", "t_embedder.mlp.0", "t_embedder.mlp.2",
          "y_embedder.proj", "blocks.0.attn.qkv_x", "blocks.15.mlp.w3", "text_refine_blocks.0.attn.qkv"]
 mods = dict(net.named_modules())
@@ -75,6 +114,10 @@ def block_perm(a, ref):
 
 if rank == 0:
     print(f"{os.path.basename(os.path.dirname(ck))} {os.path.basename(ck)}, world {world}, compile {len(sys.argv) > 3}")
+    for rows_ok, slices, dt, numel, mis in diag:
+        print(f"  root unit all-gather: dtype {dt}, numel {numel}, output address mod 4096 = {mis}; row r == rank r's data: {rows_ok}")
+        for name, n, off, ok, src in slices:
+            print(f"    {name:36s} numel/rank {n:9d} offset {off:9d} copy-out == slice: {ok}; rows from {src}")
     for k in sorted(seen):
         ref = sub[k].float()
         inside = seen[k]
