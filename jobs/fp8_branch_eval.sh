@@ -22,9 +22,9 @@ for TAG in "$@"; do
     --wt eval_official_run2 3392:euler:50
   echo "$TAG FD rc=$?"
 done
-HW=$WC/project/gpic-wt/heldout_loss_run
-export PYTHONPATH=$HW/baselines/PixelGen OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
-source $HW/jobs/heldout_loss_lib.sh
+WT=$WC/project/gpic-wt/heldout_loss_run   # heldout_loss_lib.sh reads WT (w2311 ran without it: no held-out lines)
+export PYTHONPATH=$WT/baselines/PixelGen OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+source $WT/jobs/heldout_loss_lib.sh
 CK=(); for TAG in "$@"; do CK+=($WC/runs/gpic-speed/muon_fp8branch/$TAG/exp_ladder_d1536/ms-step=003392.ckpt); done
 HELDOUT_TRAIN_SHARDS="00787" heldout_run $WC/tmp/heldout_loss/heldout_loss.jsonl 3072 3072 8 "${CK[@]}"
 echo FP8_BRANCH_EVAL_DONE
