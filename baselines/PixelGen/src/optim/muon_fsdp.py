@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 from torch.optim.adam import adam as _adam_fn
 
-from src.optim.muon import MuonAdamW, msign
+from src.optim.muon import MuonAdamW, add_units, msign
 
 
 def _is_dt(t):
@@ -149,15 +149,18 @@ class ShardMuonAdamW(MuonAdamW):
         if wd:
             torch._foreach_mul_(w_loc, 1 - lr * wd)
         off = 0
+        D, S_, A = [], [], []
         for d in range(world):   # W <- W - lr * coef * O, the reference's add (update_coef), on my rows
             for u in units:
                 if u["owner"] == d:
                     a, b = u["pieces"][rank]
                     if b > a:
                         k = (b - a) * u["shape"][1]
-                        upd = recv2[off:off + k].view(b - a, u["shape"][1])
-                        w_loc[u["p"]][a - s0[u["p"]]:b - s0[u["p"]]].add_(upd, alpha=-lr * self.update_coef(group, u["shape"]))
+                        S_.append(recv2[off:off + k].view(b - a, u["shape"][1]))
+                        D.append(w_loc[u["p"]][a - s0[u["p"]]:b - s0[u["p"]]])
+                        A.append(-lr * self.update_coef(group, u["shape"]))
                         off += k
+        add_units(D, S_, A)
 
     @torch.no_grad()
     def _adamw_step(self, group):
