@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.join(code, "baselines", "PixelGen"))
 sys.path.insert(1, "/scratch/gpfs/GROUP/USER/project/gpic-wt/heldout_loss_run/tools")
 dev = "cuda"
 B, LV = 8, [1, 5, 10, 14]
-env = {k: v for k, v in os.environ.items() if k.startswith("GPIC_MFU")}
+env = {k: v for k, v in os.environ.items() if k.startswith(("GPIC_MFU", "KVE_"))}
 res = {"env": env, "loss": {}, "out": {}}
 data = H.load_data(H.data_path(3072, 3072), "cpu")
 split = data["val"]
@@ -50,6 +50,9 @@ for ck in ckpts:
     tag = os.path.basename(os.path.dirname(ck))[len("exp_ladder_"):] + "_" + os.path.basename(ck)[8:14]
     for wname, prefix in H.WEIGHTS:
         net = H.build_denoiser(kw, sd, prefix, dev)
+        if os.environ.get("KVE_COMPILE") == "1":   # as training under FSDP2: every text and image block compiled on its own
+            for blk in list(net.text_refine_blocks) + list(net.blocks):
+                blk.compile()
         with torch.no_grad():
             ls = [H.level_loss(net, tr, x, y, mask, ts[k].to(dev), noise[:, k], True).mean().item() for k in LV]
             t = ts[LV[1]].to(dev).expand(B)

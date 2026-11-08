@@ -2,7 +2,7 @@
 #SBATCH -J gpic-mfu-kve
 #SBATCH --gres=gpu:4
 #SBATCH -c 48
-#SBATCH --time=00:45:00
+#SBATCH --time=01:00:00
 #SBATCH --mem=400G
 #SBATCH -o /scratch/gpfs/GROUP/USER/project/gpic/logs/%x_%j.out
 #SBATCH --comment=fetchable
@@ -29,5 +29,8 @@ run 1 kp GPIC_MFU_FUSED_NORM=1 GPIC_MFU_PATCHIFY=1
 run 2 fa3 GPIC_MFU_ATTN=fa3
 run 3 train GPIC_MFU_ATTN=fa3 GPIC_MFU_FUSED_QK=1 GPIC_MFU_FUSED_NORM=1 GPIC_MFU_PATCHIFY=1
 wait
-for t in eager kp fa3 train; do echo "== $t"; grep -v -i warn $O/$t.log | tail -8; done
-for t in kp fa3 train; do echo "== eager vs $t"; python tools/mfu/kernel_vs_eager.py compare $O/eager.pt $O/$t.pt; done
+run 0 train_c GPIC_MFU_ATTN=fa3 GPIC_MFU_FUSED_QK=1 GPIC_MFU_FUSED_NORM=1 GPIC_MFU_PATCHIFY=1 KVE_COMPILE=1   # + blocks compiled
+run 1 eager_c KVE_COMPILE=1
+wait
+for t in eager kp fa3 train train_c eager_c; do echo "== $t"; grep -v -i warn $O/$t.log | tail -8; done
+for t in kp fa3 train train_c eager_c; do echo "== eager vs $t"; python tools/mfu/kernel_vs_eager.py compare $O/eager.pt $O/$t.pt; done
