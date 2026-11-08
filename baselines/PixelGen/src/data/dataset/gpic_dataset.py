@@ -804,7 +804,9 @@ class GPICWebDataset(IterableDataset):
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=num_workers > 0,
-            prefetch_factor=4 if num_workers > 0 else None,
+            # 2 batches ahead per worker (GPIC_TRAIN_PREFETCH; was 4): every prefetched batch sits in pinned host memory, and
+            # with 32 workers 4 ahead meant up to 128 batches per rank; the order of the batches does not depend on it
+            prefetch_factor=int(os.environ.get("GPIC_TRAIN_PREFETCH", "2")) if num_workers > 0 else None,
             **({"collate_fn": self._collate_cached if self.emb_dir else self._collate_grouped} if self.group_text_len else {}),
         )
         self._dataloader = loader.pipeline[0]
