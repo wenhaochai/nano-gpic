@@ -23,6 +23,8 @@ waiting for the DataLoader and in the all-reduce (the d640 data wait at 128 x 1,
 repetition arms).
 """
 import os
+import queue
+import threading
 import time
 from collections import deque
 
@@ -48,8 +50,11 @@ class SharedBucketLoader:
     rank, as without the shared bucket), so the full rank's pools shrink by one. Until a rank first reaches the cap the
     loader takes the very same batches as before."""
 
-    def __init__(self, loader, edges, pool_min=None, allreduce_min=None, pool_cap=None):
+    def __init__(self, loader, edges, pool_min=None, allreduce_min=None, pool_cap=None, ahead=None):
         self.loader, self.edges = loader, list(edges)
+        # MFU lever S2 (GPIC_SHARED_BUCKET_AHEAD=k, mfu 9b28f47): the pulls and decisions run k batches ahead in one background
+        # thread; each decision depends only on the pools, which the loader fills in its fixed order (the batch sequence is unchanged)
+        self.ahead = int(os.environ.get("GPIC_SHARED_BUCKET_AHEAD", "0")) if ahead is None else ahead
         self.pool_min = pool_min or 2 * len(self.edges)
         self.pool_cap = pool_cap or int(os.environ.get("GPIC_SHARED_BUCKET_POOL_CAP", "40"))
         self._allreduce_min = allreduce_min   # tests: a stand-in for the gloo all-reduce
@@ -58,7 +63,7 @@ class SharedBucketLoader:
         self.passes = 0     # data passes this rank finished (restarts of the wrapped loader)
 
     def __iter__(self):
-        return _Iter(self)
+        return _AheadIter(_Iter(self), self.ahead) if self.ahead > 0 else _Iter(self)
 
     def __getattr__(self, name):   # everything else (e.g. the dataset) from the wrapped loader
         return getattr(self.__dict__["loader"], name)
@@ -149,3 +154,58 @@ class _Iter:
                   f"{st['rounds'] / n:.2f} decisions and {st['pulls'] / n:.2f} pulls per micro-batch, waits per micro-batch: "
                   f"DataLoader {1000 * st['pull_s'] / n:.1f} ms, all-reduce {1000 * st['ar_s'] / n:.1f} ms", flush=True)
         st.update(rounds=0, pulls=0, pull_s=0.0, ar_s=0.0, pool_max=0, free=0)
+
+
+class _AheadIter:
+    """Lever S2: _Iter's next() in a daemon thread, k batches ahead through a queue; an exception in the thread reaches
+    the training thread at its next next(). The gloo group is made on the training thread first (making a group is a
+    collective of every rank, kept off the helper thread)."""
+
+    def __init__(self, inner, k):
+        self.inner, self.k, self.q, self.th = inner, k, queue.Queue(maxsize=k), None
+        self.stopping, self.held = threading.Event(), None
+
+    def __getattr__(self, name):   # pools, st, ... from the inner iterator (tests)
+        return getattr(self.__dict__["inner"], name)
+
+    def __iter__(self):
+        return self
+
+    def _run(self):
+        while not self.stopping.is_set():
+            try:
+                b = next(self.inner)
+            except BaseException as e:   # passed on, then the thread ends
+                self.q.put(e)
+                return
+            self.held = b
+            while not self.stopping.is_set():
+                try:
+                    self.q.put(b, timeout=0.1)
+                    self.held = None
+                    break
+                except queue.Full:
+                    pass
+
+    def stop(self):
+        """Tests: end the thread once every rank's thread waits with a full queue; returns the batches it decided that
+        nobody took (queued, then the one it held)."""
+        self.stopping.set()
+        self.th.join()
+        out = []
+        while not self.q.empty():
+            out.append(self.q.get())
+        return out + ([self.held] if self.held is not None else [])
+
+    def __next__(self):
+        if self.th is None:
+            p = self.inner.p
+            if p._allreduce_min is None and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1 \
+                    and p.group is None:
+                p.group = dist.new_group(backend="gloo")
+            self.th = threading.Thread(target=self._run, name="shared_bucket_ahead", daemon=True)
+            self.th.start()
+        b = self.q.get()
+        if isinstance(b, BaseException):
+            raise b
+        return b
