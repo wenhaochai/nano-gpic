@@ -56,6 +56,72 @@ def _pass_kernel(src_ptr, src_off_ptr, out_ptr, out_off_ptr, xmin_ptr, kk_ptr,
     tl.store(out + 2, tl.minimum(tl.maximum(acc2 >> 22, 0), 255).to(tl.uint8), mask=m)
 
 
+# The same passes split by axis so that each kernel reads memory along its contiguous axis (the generic kernel above read
+# the vertical pass across rows, one row per lane, and recomputed 64-bit addresses for every tap; 1.0 ms per pass for 128
+# crops, w1866). The arithmetic is the generic kernel's, term by term in the same order, so the result is the same bit for bit.
+@triton.jit
+def _rows_kernel(src_ptr, src_off_ptr, out_ptr, out_off_ptr, xmin_ptr, kk_ptr, sel_ptr, n_i_ptr, s_in_ptr, len_a_ptr,
+                 s_out_ptr, p, K: tl.constexpr, BLOCK_O: tl.constexpr, BLOCK_Q: tl.constexpr, NOUT: tl.constexpr):
+    """The vertical pass of sample sel[pid 0] (it resamples the rows): out[o, q] = clip8(2^21 + sum_j in[xmin[o] + j, q] *
+    kk[o, j]), q over the bytes of a row (columns x 3 channels: the channels are filtered alike, so a row is one byte vector)."""
+    b = tl.load(sel_ptr + tl.program_id(0))
+    qb = tl.program_id(1)
+    ob = tl.program_id(2)
+    n_q = tl.load(n_i_ptr + b).to(tl.int32) * 3
+    if qb * BLOCK_Q >= n_q:
+        return
+    q = qb * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    o = ob * BLOCK_O + tl.arange(0, BLOCK_O)
+    mq = (q < n_q)[None, :]
+    s_in = tl.load(s_in_ptr + b).to(tl.int32)
+    len_a = tl.load(len_a_ptr + b).to(tl.int32)
+    s_out = tl.load(s_out_ptr + b).to(tl.int32)
+    src = src_ptr + tl.load(src_off_ptr + b)
+    dst = out_ptr + tl.load(out_off_ptr + b)
+    tab = (b * 2 + p) * NOUT
+    xmin = tl.load(xmin_ptr + tab + o)
+    acc = tl.full([BLOCK_O, BLOCK_Q], 1 << 21, tl.int32)
+    for j in tl.static_range(K):
+        k = tl.load(kk_ptr + (tab + o) * K + j)
+        a = tl.minimum(xmin + j, len_a - 1)
+        v = tl.load(src + (a * s_in)[:, None] + q[None, :], mask=mq, other=0)
+        acc += v.to(tl.int32) * k[:, None]
+    tl.store(dst + (o * s_out)[:, None] + q[None, :], tl.minimum(tl.maximum(acc >> 22, 0), 255).to(tl.uint8), mask=mq)
+
+
+@triton.jit
+def _cols_kernel(src_ptr, src_off_ptr, out_ptr, out_off_ptr, xmin_ptr, kk_ptr, sel_ptr, n_i_ptr, s_in_ptr, len_a_ptr,
+                 s_out_ptr, p, K: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_Q: tl.constexpr, NOUT: tl.constexpr):
+    """The horizontal pass of sample sel[pid 0] (it resamples the columns): out[r, 3 o + c] = clip8(2^21 + sum_j
+    in[r, 3 (xmin[o] + j) + c] * kk[o, j]), over the 3 x NOUT output bytes of a row (BLOCK_Q divides 3 x NOUT)."""
+    b = tl.load(sel_ptr + tl.program_id(0))
+    rb = tl.program_id(1)
+    qb = tl.program_id(2)
+    n_r = tl.load(n_i_ptr + b).to(tl.int32)
+    if rb * BLOCK_R >= n_r:
+        return
+    r = rb * BLOCK_R + tl.arange(0, BLOCK_R)
+    q = qb * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    o = q // 3
+    c = q - 3 * o
+    mr = (r < n_r)[:, None]
+    s_in = tl.load(s_in_ptr + b)
+    len_a = tl.load(len_a_ptr + b).to(tl.int32)
+    s_out = tl.load(s_out_ptr + b).to(tl.int32)
+    src = src_ptr + tl.load(src_off_ptr + b)
+    dst = out_ptr + tl.load(out_off_ptr + b)
+    tab = (b * 2 + p) * NOUT
+    xm = tl.load(xmin_ptr + tab + o)
+    row = src + r.to(tl.int64)[:, None] * s_in
+    acc = tl.full([BLOCK_R, BLOCK_Q], 1 << 21, tl.int32)
+    for j in tl.static_range(K):
+        k = tl.load(kk_ptr + (tab + o) * K + j)
+        a = tl.minimum(xm + j, len_a - 1)
+        v = tl.load(row + (3 * a + c)[None, :], mask=mr, other=0)
+        acc += v.to(tl.int32) * k[None, :]
+    tl.store(dst + (r * s_out)[:, None] + q[None, :], tl.minimum(tl.maximum(acc >> 22, 0), 255).to(tl.uint8), mask=mr)
+
+
 def _geometry(hw, axis, p):
     """Per-sample loop sizes and byte strides of pass p: input hw[:, p] (rows, cols), output hw[:, p + 1]."""
     rows, cols = hw[:, p, 0].astype(np.int64), hw[:, p, 1].astype(np.int64)
@@ -99,7 +165,14 @@ def pack(items, K=None):
     g2, _ = _geometry(hw, axis, 1)
     mid_off = np.zeros(B, dtype=np.int64)
     mid_off[1:] = np.cumsum(mid_bytes)[:-1]
-    return {"src": flat, "src_off": torch.from_numpy(off), "xmin": torch.from_numpy(xmin), "kk": torch.from_numpy(kk),
+    sel, sel_slices, sel_max = [], [], []   # per pass: the samples it resamples vertically, then horizontally (_rows/_cols_kernel)
+    for p, g in enumerate((g1, g2)):
+        v, h = np.nonzero(axis[:, p] == 0)[0], np.nonzero(axis[:, p] == 1)[0]
+        sel_slices.append([(len(sel), len(v)), (len(sel) + len(v), len(h))])
+        sel_max.append([int(3 * g[0][v].max()) if len(v) else 0, int(g[0][h].max()) if len(h) else 0])
+        sel += [int(x) for x in v] + [int(x) for x in h]
+    return {"sel": torch.tensor(sel, dtype=torch.int32), "sel_slices": sel_slices, "sel_max": sel_max,
+            "src": flat, "src_off": torch.from_numpy(off), "xmin": torch.from_numpy(xmin), "kk": torch.from_numpy(kk),
             "geo": torch.from_numpy(np.stack([g1, g2])),     # [2 passes, 6, B] int64
             "mid_off": torch.from_numpy(mid_off), "out_off": torch.arange(B, dtype=torch.int64) * (OUT * OUT * 3),
             "K": int(K), "B": B, "mid_bytes": int(mid_bytes.sum()), "n_i_max": [int(g1[0].max()), int(g2[0].max())],
@@ -112,11 +185,27 @@ def run(job):
     mid = torch.empty(job["mid_bytes"], dtype=torch.uint8, device=dev)
     out = torch.empty(B, OUT, OUT, 3, dtype=torch.uint8, device=dev)
     geo = job["geo"]
-    BI, BO = 32, 64
-    for p, (s_ptr, s_off, d_ptr, d_off) in enumerate([(job["src"], job["src_off"], mid, job["mid_off"]),
-                                                      (mid, job["mid_off"], out, job["out_off"])]):
-        g = geo[p]
-        grid = (B, triton.cdiv(job["n_i_max"][p], BI), OUT // BO)
-        _pass_kernel[grid](s_ptr, s_off, d_ptr, d_off, job["xmin"], job["kk"], g[0], g[1], g[2], g[3], g[4], g[5], p,
-                           K=job["K"], BLOCK_I=BI, BLOCK_O=BO, NOUT=OUT)
+    passes = [(job["src"], job["src_off"], mid, job["mid_off"]), (mid, job["mid_off"], out, job["out_off"])]
+    if "sel" not in job:   # a job built elsewhere (lever E2's repacking): the generic kernel
+        BI, BO = 32, 64
+        for p, (s_ptr, s_off, d_ptr, d_off) in enumerate(passes):
+            g = geo[p]
+            grid = (B, triton.cdiv(job["n_i_max"][p], BI), OUT // BO)
+            _pass_kernel[grid](s_ptr, s_off, d_ptr, d_off, job["xmin"], job["kk"], g[0], g[1], g[2], g[3], g[4], g[5], p,
+                               K=job["K"], BLOCK_I=BI, BLOCK_O=BO, NOUT=OUT)
+        return out
+    sel, K = job["sel"], job["K"]
+    RO, RQ, CR, CQ = 32, 128, 16, 256   # rows kernel: 32 output rows x 128 bytes; cols kernel: 16 rows x 256 output bytes
+    for p, (s_ptr, s_off, d_ptr, d_off) in enumerate(passes):
+        g = geo[p]   # n_i, s_in_i, s_in_a, len_a, s_out_i, s_out_o (_geometry)
+        (v0, nv), (h0, nh) = job["sel_slices"][p]
+        qmax, rmax = job["sel_max"][p]
+        if nv:   # vertical: the row stride is s_in_a in, s_out_o out
+            _rows_kernel[(nv, triton.cdiv(qmax, RQ), OUT // RO)](s_ptr, s_off, d_ptr, d_off, job["xmin"], job["kk"],
+                                                                 sel[v0:v0 + nv], g[0], g[2], g[3], g[5], p,
+                                                                 K=K, BLOCK_O=RO, BLOCK_Q=RQ, NOUT=OUT)
+        if nh:   # horizontal: the row stride is s_in_i in, s_out_i out
+            _cols_kernel[(nh, triton.cdiv(rmax, CR), 3 * OUT // CQ)](s_ptr, s_off, d_ptr, d_off, job["xmin"], job["kk"],
+                                                                     sel[h0:h0 + nh], g[0], g[1], g[3], g[4], p,
+                                                                     K=K, BLOCK_R=CR, BLOCK_Q=CQ, NOUT=OUT)
     return out
