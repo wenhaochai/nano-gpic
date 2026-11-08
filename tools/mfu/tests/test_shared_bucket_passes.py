@@ -53,7 +53,12 @@ def child(r, world, init, code, steps, out):
         t = torch.ones(1)
         dist.all_reduce(t)   # the step's gradient all-reduce
         step += 1
-    pooled = [list(x[1]) for q in it.pools for x in q]
+    ahead = []
+    if hasattr(it, "stop"):   # lever S2 (GPIC_SHARED_BUCKET_AHEAD): batches decided ahead but not trained yet
+        dist.barrier()
+        time.sleep(2)   # every rank's thread decides until its queue is full and it holds one more
+        ahead = [list(x[1]) for x in it.stop()]
+    pooled = [list(x[1]) for q in it.pools for x in q] + ahead
     with open(out, "w") as f:
         json.dump(dict(rank=r, trained=trained, pooled=pooled, pulled=loader.yielded, epochs=epochs,
                        passes_started=loader.passes, passes_ended=getattr(sb, "passes", None)), f)
