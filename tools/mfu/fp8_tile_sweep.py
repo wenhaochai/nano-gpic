@@ -63,6 +63,17 @@ for k, fn in ops.items():
     best[k] = res[0]
     print(f"  {k}: " + ", ".join(f"{bm}x{bk}x{nw} {ms:.3f}{'' if same is True else ' (' + str(same) + ')'}" for ms, bm, bk, nw, same in res[:6]))
     F.TILES[k] = res[0][1:4]
+# phase 3's row cast (dcast): elements per program and warps
+ref = bits(F.dcast(x, st, 1, False))
+res = []
+for rb in (1024, 2048, 4096, 8192, 16384):
+    for nw in (4, 8, 16):
+        F.ROW_CAST = (rb, nw)
+        same = all(torch.equal(a, b) for a, b in zip(bits(F.dcast(x, st, 1, False)), ref))
+        res.append((t(lambda: F.dcast(x, st, 1, False)), rb, nw, same))
+res.sort()
+print("  row cast: " + ", ".join(f"{rb}x{nw} {ms:.3f}{'' if same else ' (differs)'}" for ms, rb, nw, same in res[:6]))
+F.ROW_CAST = res[0][1:3]
 # two passes: the row-major cast of phase 3, then a transpose of the FP8 copy
 two = {"cast": lambda: (lambda q: (q, q.view(torch.uint8).t().contiguous()))(F.dcast(x, st, 1, False)[0]),
        "swiglu": lambda: (lambda q: (q, q.view(torch.uint8).t().contiguous()))(F.swiglu_dcast(z, st, 2)[0]),
