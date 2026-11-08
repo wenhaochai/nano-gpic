@@ -100,6 +100,13 @@ class LightningModel(pl.LightningModule):
 
     def configure_model(self) -> None:
         self.trainer.strategy.barrier()
+        init = os.environ.get("GPIC_INIT_CKPT")
+        if init:   # gpic-28 2026-11-08 (FP8 branch runs): start from a checkpoint's raw weights with a fresh optimizer; the job sets it only
+            # without a last.ckpt, and a resume's restore would overwrite these weights anyway
+            sd = torch.load(init, map_location="cpu", mmap=True, weights_only=False)["state_dict"]
+            self.denoiser.load_state_dict({k[len("denoiser."):]: v for k, v in sd.items() if k.startswith("denoiser.")}, strict=True)
+            del sd
+            print(f"[init] rank {self.trainer.global_rank}: denoiser weights from {init}", flush=True)
         copy_params(src_model=self.denoiser, dst_model=self.ema_denoiser)
 
         # disable grad for conditioner and vae
