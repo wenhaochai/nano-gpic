@@ -37,6 +37,9 @@ WT=$WC/project/gpic-wt/sweep_fp8_run
 case "$WD:$NB" in 1280:14) MB=128 FS=1 G=7 ;; 1536:*) MB=128 FS=1 G=1 ;; 1792:*) MB=64 FS=1 G=1 ;; *) MB=128 FS=0 G=1 ;; esac
 [ $((GB / 8)) -ge $MB ] || MB=$((GB / 8))   # small global batches: fewer images per GPU, no accumulation
 export GPIC_MFU_FSDP=$FS GPIC_MFU_FSDP_GROUP=$G GPIC_MFU_FSDP_NOSYNC=1 GPIC_MFU_FUSED_NORM=1 GPIC_MFU_FUSED_QK=1 GPIC_MFU_PATCHIFY=$FS GPIC_MFU_NS_FUSED=1 GPIC_MFU_LOCAL_OPT=$FS GPIC_MFU_MUON_ADD=1 GPIC_MFU_FP8=$F8
+# NCCL 2.26.2's NVLS all-gather returns ranks' blocks out of order at some sizes (the d1536 final layer's 576 KB per rank
+# at every save; gpic-28 2026-11-08, NVIDIA/nccl #1906): off until NCCL has the fix
+export NCCL_NVLS_ENABLE=0
 export LADDER_WT=$WT LADDER_RUN_ROOT=$WC/runs/gpic-speed/muon_fp8recipe/$TAG LADDER_LAST_EVERY=$((S / 8))
 mkdir -p $LADDER_RUN_ROOT/exp_ladder_$SIZE
 [ -s $LADDER_RUN_ROOT/exp_ladder_$SIZE/shard_seed.txt ] || echo $SEED > $LADDER_RUN_ROOT/exp_ladder_$SIZE/shard_seed.txt
