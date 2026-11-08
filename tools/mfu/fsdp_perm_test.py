@@ -18,21 +18,28 @@ import heldout_loss as H  # noqa: E402
 sys.path[:] = [p for p in sys.path if not p.startswith(H.REPO)]
 sys.path.insert(0, os.path.join(code, "baselines", "PixelGen"))
 CPU = os.environ.get("PERM_TEST_CPU") == "1"   # gloo on CPU: FSDP2's own logic without NCCL or the GPU kernels
+GLOO_CUDA = os.environ.get("PERM_TEST_GLOO_CUDA") == "1"   # every rank on cuda:0, collectives by gloo: the CUDA copy kernels without NCCL
 dev = "cpu" if CPU else "cuda"
-dist.init_process_group("gloo" if CPU else "nccl")
+dist.init_process_group("cpu:gloo,cuda:gloo" if GLOO_CUDA else ("gloo" if CPU else "nccl"))
 rank, world = dist.get_rank(), dist.get_world_size()
 if not CPU:
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(0 if GLOO_CUDA else int(os.environ["LOCAL_RANK"]))
 from torch.distributed.device_mesh import init_device_mesh  # noqa: E402
 from torch.distributed.tensor import DTensor  # noqa: E402
 from src.models.transformer.JiT_T2I import JiT_T2I  # noqa: E402
 from src.utils.fsdp_setup import shard  # noqa: E402
 
 kw, _ = H.run_config(os.path.dirname(ck))
+SMALL = os.environ.get("PERM_TEST_SMALL") == "1"   # one image and one text block: the root unit's shapes, less memory
+if SMALL:
+    kw = dict(kw, num_blocks=1, num_text_blocks=1)
 sd = torch.load(ck, map_location="cpu", mmap=True, weights_only=False)["state_dict"]
 sub = {k[len("denoiser."):]: v for k, v in sd.items() if k.startswith("denoiser.")}
 with torch.device("meta"):
     net = JiT_T2I(**kw)
+if SMALL:
+    want = set(net.state_dict())
+    sub = {k: v for k, v in sub.items() if k in want}
 net.load_state_dict(sub, strict=True, assign=True)
 net = net.to(dev).float()
 mesh = init_device_mesh(dev, (world,), mesh_dim_names=("data_parallel",))
@@ -77,7 +84,7 @@ def _copy_out(all_gather_result, fsdp_params, group):
 
 FPG.foreach_all_gather_copy_out = _copy_out
 watch = ["final_layer.linear", "x_embedder.proj1", "x_embedder.proj2", "t_embedder.mlp.0", "t_embedder.mlp.2",
-         "y_embedder.proj", "blocks.0.attn.qkv_x", "blocks.15.mlp.w3", "text_refine_blocks.0.attn.qkv"]
+         "y_embedder.proj", "blocks.0.attn.qkv_x", "text_refine_blocks.0.attn.qkv"] + ([] if SMALL else ["blocks.15.mlp.w3"])
 mods = dict(net.named_modules())
 seen = {}
 for name in watch:
