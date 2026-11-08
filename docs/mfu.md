@@ -797,3 +797,27 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   compile, and B's last arm runs partly alone. tools/mfu/pair_window.py compares the halves only while both train in
   steady state. Even so, a no-op pair (noema: EMA off cannot be slower) reads +0.2/+0.4/+1.1% at d640/d1024/d1280. A
   pair's noise is about 1%: a smaller effect needs agreement across widths or pairs.
+
+### C2 at the narrow shapes (2026-11-08; logs/mfu_gpu_decode_narrow.yaml)
+- GPU JPEG decoding a step ahead, ported onto genmodel's sweep code (branch sweep-gpudec 6dd3524), against CPU decoding, full 8-GPU
+  arms in turn, the same batches (w2177): mean step width 448 (21 + 2 blocks) 80.6 -> 75.2 ms (-6.6%), 512 (16 + 2) 77.3 -> 69.5
+  (-10.1%), 640 (9 + 2) 74.7 -> 60.2 (-19.4%). The training loss reads +0.4% because nvJPEG's pixels are the target; the held-out loss
+  on CPU-decoded val images was equal in the d9 FD arm. genmodel keeps the iso-FLOP grid on CPU decoding and may take it for the final
+  ladder's narrow rungs.
+
+### X per caption bucket (2026-11-08; logs/mfu_cudagraph_bucket.yaml)
+- CompileWarmup records lever X's CUDA graphs once per shared-bucket edge before the first step (mfu f8334d7) and restores every RNG
+  stream afterwards (d4b1102). Mean step A -> A + X (w2178): d9 -0.2% (median -17.3%; the CPU JPEG decode still binds the mean), d10
+  -4.1% (both-steady window -2.9%), d11 -1.9%. Losses bit for bit equal for 33/29/25 steps at d9/d10/d11 and the last-200-step means
+  equal to 5 digits (w2180): X does not change the numerics. Ready for the sweep code as branch sweep-cgbucket 3878f13.
+
+### F8: evaluated as trained, and the branch runs (2026-11-08; logs/mfu_fp8_eval.yaml, logs/mfu_fp8_branch.yaml)
+- The d16 check's C0 FD gap (+9.9%) is not an evaluation artifact: through the training's FP8 GEMMs (eval-fp8 592f089, w2296) the FP8
+  arm samples FD 884.0 (bf16 sampling 882.6) and the bf16 arm 811.6 (802.7); held-out in each arm's own precision 0.06726 vs 0.06721.
+  The master weights are not trapped on e4m3 rounding boundaries (share within 0.05 of the boundary 0.102, uniform 0.100).
+- Branch runs (fp8-branch d694806, w2306-w2311): the check's last 3392 steps re-run from either arm's 10200 weights with a fresh
+  optimizer, one data order. FD / FID at the end: bf16 trunk + bf16 847.5 / 61.73; the same with another data order and seed 846.2 /
+  60.95; FP8 trunk + FP8 849.8 / 60.80; bf16 trunk + FP8 847.8 / 60.48; FP8 trunk + bf16 875.5 / 63.96. Full FP8 equals bf16 (+0.3%
+  FD, branch noise 0.15%): the +9.9% of the check is not FP8 precision. Candidates: the FP8 arm's resume at 11900, or run-to-run
+  variance of independent runs. A fresh optimizer at 10200 costs FD 847.5 against the uninterrupted 802.7, so a resume test (w2322:
+  the optimizer state after restore against the checkpoint's) is running.
