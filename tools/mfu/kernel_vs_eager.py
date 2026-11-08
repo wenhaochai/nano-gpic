@@ -41,6 +41,9 @@ split = data["val"]
 idx = split["order"][::len(split["order"]) // B][:B]
 x = H.to_input(split["img"][torch.tensor(idx)]).to(dev)
 y, mask = H.text_batch(split, idx, dev)
+if os.environ.get("KVE_NOMASK") == "1":   # the official unmasked path: y zero-padded to text_max_length, no mask
+    y = torch.nn.functional.pad(y, (0, 0, 0, split["text_max_length"] - y.shape[1]))
+    mask = None
 noise = torch.stack([H.image_noise(H.SEED, j, 16, tuple(x.shape[1:])) for j in idx]).to(dev)
 for ck in ckpts:
     kw, loss_cfg = H.run_config(os.path.dirname(ck))
