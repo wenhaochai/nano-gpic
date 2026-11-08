@@ -27,6 +27,7 @@ E4 = torch.float8_e4m3fn
 FMAX = 448.0          # the largest finite e4m3fn value
 TINY = 1e-12          # an all-zero tensor keeps scale FMAX / TINY: its values stay 0
 BLOCK = 4096          # elements per program of the flat kernels
+ROW_CAST = (4096, 8)  # phase 3's row cast (elements per program, warps); tools/mfu/fp8_tile_sweep.py times the choices
 
 
 # Tensorwise scaling (torch 2.7's rowwise-scaled _scaled_mm is slower than bf16 below d1280 at our shapes, w1880; the
@@ -474,9 +475,10 @@ def dcast(x: torch.Tensor, st: torch.Tensor, site: int, roll: bool) -> tuple[tor
     q = torch.empty(x.shape, dtype=E4, device=x.device)
     s = torch.empty(1, dtype=torch.float32, device=x.device)
     if n:
-        g = (triton.cdiv(n, BLOCK),)
-        _launch(_ds_amax_kernel)[g](xc, n, st, site, L=L_HIST, W=W_ST, BLOCK=BLOCK, num_warps=8)
-        _launch(_ds_cast_kernel)[g](xc, q, s, n, st, site, L=L_HIST, W=W_ST, BLOCK=BLOCK, num_warps=8)
+        RB, rw = ROW_CAST
+        g = (triton.cdiv(n, RB),)
+        _launch(_ds_amax_kernel)[g](xc, n, st, site, L=L_HIST, W=W_ST, BLOCK=RB, num_warps=rw)
+        _launch(_ds_cast_kernel)[g](xc, q, s, n, st, site, L=L_HIST, W=W_ST, BLOCK=RB, num_warps=rw)
     return q, s
 
 
