@@ -9,7 +9,8 @@
 #FETCHABLE
 # One evaluation job for a group of runs (gpic-28 2026-11-09, for genmodel: the no-EMA sweeps score each run once, at its last step, so
 # one job covers several runs, each with its own root, size, d, nb, nt and step). For each task: the raw view of
-# runs/gpic-speed/<rel>/exp_ladder_<size>/ms-step=<step>.ckpt (tmp/ladder_prof/make_raw_view.py: the ema slot holds the raw weights), then
+# runs/gpic-speed/<rel>/exp_ladder_<size>/ms-step=<step>.ckpt (tools/make_raw_view.py: a link to the checkpoint when its EMA slot
+# already holds the raw weights, as in every no-EMA run; else a copy with the raw weights in that slot; run11, 2026-11-09), then
 # the official evaluation of runs/gpic-speed/raw_view/<rel> at <step>:euler:50 with jobs/evals_gmflow.sh (Euler 50, official noise,
 # CFG 1, 50K test captions), so directories and logs are the ones wsd_eval.sh gives. The predicts and the scoring run as a chain
 # (jobs/eval_chain_lib.sh, run6: the next predict sets up beside the current one; scoring beside both), and the raw views are written in the background ahead of their predict. A task whose checkpoint is
@@ -23,7 +24,7 @@ export NCCL_NVLS_ENABLE=0   # NCCL 2.26.2 NVLS all-gather can permute rank block
 set -o pipefail
 WC=/scratch/gpfs/GROUP/USER
 source $WC/project/gpic/jobs/env.sh
-WTN=eval_official_run9
+WTN=eval_official_run11
 if [ "$1" = "--wt" ]; then WTN=$2; shift 2; [[ $WTN =~ ^[A-Za-z0-9_-]+$ ]] || { echo "--wt takes a worktree name under gpic-wt/"; exit 2; }; fi
 [ $# -ge 1 ] || { echo "usage: evals_group.sh [--wt <worktree>] <rel>:<size>:<d>:<nb>:<nt>:<step> ..."; exit 2; }
 WT=$WC/project/gpic-wt/$WTN
@@ -45,7 +46,7 @@ MK=$(mktemp -d)   # per task: ok, missing or failed, written by the raw-view loo
 ( for i in $(seq 0 $((N - 1))); do
     if [ -f ${OUTD[$i]}/metrics.json ] || [ -f ${RAW[$i]} ]; then echo ok > $MK/$i; continue; fi
     if [ ! -f ${SRC[$i]} ]; then echo missing > $MK/$i; continue; fi
-    if RAW_SRC=${REL[$i]} $WC/envs/pixgen/bin/python -I $WC/tmp/ladder_prof/make_raw_view.py ${SZ[$i]} ${ST[$i]} > $MK/$i.log 2>&1
+    if RAW_SRC=${REL[$i]} $WC/envs/pixgen/bin/python -I $WT/tools/make_raw_view.py ${SZ[$i]} ${ST[$i]} > $MK/$i.log 2>&1
     then echo ok > $MK/$i; else echo failed > $MK/$i; fi
   done ) &
 RVPID=$!
