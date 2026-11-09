@@ -56,7 +56,10 @@ class SaveImagesHook(Callback):
     def save_end(self):
         if self.save_compressed and len(self.samples) > 0:
             samples = numpy.concatenate(self.samples)
-            numpy.savez(f'{self.target_dir}/output.npz', arr_0=samples)
+            if os.environ.get("GPIC_EVAL_SAMPLES_NPY") == "1":   # gpic-28 2026-11-09: no zip CRC pass; the scorers map their own slice
+                numpy.save(f'{self.target_dir}/output.npy', samples)
+            else:
+                numpy.savez(f'{self.target_dir}/output.npz', arr_0=samples)
         self.executor_pool.shutdown(wait=True)
         self.target_dir = None
         self.executor_pool = None
@@ -110,6 +113,9 @@ class SaveImagesHook(Callback):
         return self.process_batch(trainer, pl_module, samples, batch)
 
     def on_predict_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        done = os.environ.get("GPIC_EVAL_DONE_FILE")   # gpic-28 2026-11-09 (eval chain): every rank's last batch is gathered, so the next
+        if done and trainer.is_global_zero:              # predict may sample while this one saves and exits
+            open(done + ".tmp", "w").close(); os.replace(done + ".tmp", done)
         self.save_end()
 
     def state_dict(self) -> Dict[str, Any]:

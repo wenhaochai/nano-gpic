@@ -71,8 +71,8 @@ run_task() {   # <task>: one evaluation, skipped if it has its metrics.json; ret
 }
 fail=0
 if [ $PAR = 0 ]; then
-  # gpic-28 2026-11-09 (the eval idle-GPU work): with several tasks, task i's scoring (DINOv2 on the GPUs, Inception beside it) runs in
-  # the background while task i+1's predict starts, whose start-up and first compile leave the GPUs idle for about a minute; at most one
+  # gpic-28 2026-11-09 (the eval idle-GPU work; run6: jobs/eval_chain_lib.sh): with several tasks, task i's scoring (DINOv2 on the GPUs, Inception beside it) runs in
+  # the background while task i+1's predict runs; the predict after it sets up and compiles beside them and waits at its batch 1; one
   # scoring overlaps one predict. The samples wait in a job-level directory in /dev/shm, removed at exit (env.sh's EXIT trap kept).
   # A caller's EVAL_PHASE (jobs/evals_group.sh: one task per call) passes through to eval_gmflow.sh unchanged.
   if [ $# -gt 1 ] && [ "${EVAL_PHASE:-all}" = all ] && [ "${EVAL_PIPELINE:-1}" = 1 ] && [ -z "${EVAL_LIMIT_BATCHES:-}" ] && [ -d /dev/shm ]; then
@@ -81,15 +81,12 @@ if [ $PAR = 0 ]; then
     _prev_exit_cmd=$(trap -p EXIT | sed -E "s/^trap -- '(.*)' EXIT$/\1/; s/'\\\\''/'/g")
     _on_exit() { rm -rf -- "$EVAL_SHM_ROOT"; eval "$_prev_exit_cmd"; }
     trap _on_exit EXIT
-    spid=""
-    for t in "$@"; do
-      if EVAL_PHASE=predict run_task $t; then
-        if [ -n "$spid" ]; then wait $spid || fail=1; fi
-        EVAL_PHASE=score run_task $t & spid=$!
-        echo "eval $t predicted, scoring in the background; fail=$fail"
-      else fail=1; echo "eval $t predict failed"; fi
-    done
-    if [ -n "$spid" ]; then wait $spid || fail=1; fi
+    source $WT/jobs/eval_chain_lib.sh   # run6: the next predict sets up beside this one (no idle gap between predicts)
+    TASKS=("$@"); NEXT=0
+    chain_next() { if [ $NEXT -lt ${#TASKS[@]} ]; then CHAIN_I=$NEXT; NEXT=$((NEXT + 1)); else CHAIN_I=-1; fi; }
+    chain_cmd() { EVAL_PHASE=$1 run_task ${TASKS[$2]}; }
+    chain_run
+    for i in $CHAIN_FAILED; do echo "eval ${TASKS[$i]} failed"; fail=1; done
     exit $fail
   fi
   for t in "$@"; do run_task $t || fail=1; echo "eval $t fail=$fail"; done

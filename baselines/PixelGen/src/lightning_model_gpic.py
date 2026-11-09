@@ -46,6 +46,20 @@ SAMPLE_CAPTIONS = [
 
 CFG_SCALES = [1.0, 1.5, 2.0, 4.0, 7.5]
 
+def _eval_gate(rank):
+    """GPIC_EVAL_GO_FILE: wait until it exists (the previous predict's last batch is done). GPIC_EVAL_STARTED_FILE: rank 0 writes the wait in s."""
+    import time
+    go, started = os.environ.get("GPIC_EVAL_GO_FILE"), os.environ.get("GPIC_EVAL_STARTED_FILE")
+    t = time.time()
+    if go:
+        while not os.path.exists(go):
+            time.sleep(0.2)
+    if started and rank == 0:
+        with open(started + ".tmp", "w") as f:
+            f.write(f"{time.time() - t:.1f}\n")
+        os.replace(started + ".tmp", started)
+
+
 class LightningModel(pl.LightningModule):
     def __init__(self,
                  vae: BaseAE,
@@ -264,6 +278,8 @@ class LightningModel(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx):
         xT, y, metadata = batch
+        if batch_idx == 1:   # gpic-28 2026-11-09 (eval chain, jobs/eval_chain_lib.sh): set up and compiled on batch 0, wait for the predict before
+            _eval_gate(self.global_rank)   # this one to finish sampling, then say that this one samples (no env: nothing happens)
         # gpic-28 2026-11-08 (w2353: the fixed cost of a predict): a short last batch (50K / 8 ranks = 6250 = 195 x 32 + 10) recompiled the
         # denoiser for 10 samples; it is padded with copies of its last sample to the first batch's size and the copies are dropped after
         # sampling (every sample has its own noise from the dataset, so the kept samples are unchanged)
