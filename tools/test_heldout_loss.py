@@ -13,6 +13,9 @@ H4 input: to_input equals val_transform's ToTensor + Normalize bit for bit, and 
 H5 tasks: an end-to-end CPU run on fake ms checkpoints (strict load of the EMA and the raw weights from a run config)
    writes one line per (checkpoint, weights) with the asked fields; the task list skips done entries, lists a
    checkpoint with one weights missing, and a second run adds no line; the lockf counter hands out each index once
+H6 one pass: a checkpoint whose EMA slot holds the raw weights' bytes (as independent tensors, or on one storage) gives two
+   records from one pass, marked one_pass, with the values of two passes (GPIC_HELDOUT_ONE_PASS=0); one bit of difference,
+   a missing key or a single missing record gives the two-pass path
 Each test prints PASS or FAIL; the exit code is the number of failed tests."""
 import json
 import math
@@ -323,8 +326,84 @@ def H5():
         assert got == list(range(100)), got
 
 
+@test
+def H6():
+    """a checkpoint whose EMA slot holds the raw weights: one pass, two records, the two-pass values"""
+    with tempfile.TemporaryDirectory() as tmp:
+        ck = write_run(tmp, "d64", [100, 200, 300], [(21, 21), (22, 22), (23, 23)])   # the same seed: equal bytes, two tensors
+        c = torch.load(ck[1], weights_only=False)                                      # 200: both keys on one storage
+        for k in [k for k in c["state_dict"] if k.startswith("ema_denoiser.")]:
+            c["state_dict"][k] = c["state_dict"]["denoiser." + k[len("ema_denoiser."):]]
+        torch.save(c, ck[1])
+        c = torch.load(ck[2], weights_only=False)                                      # 300: one bit apart in one tensor
+        c["state_dict"]["ema_denoiser.final_layer.linear.weight"].view(torch.int32)[0, 0] ^= 1
+        torch.save(c, ck[2])
+        for p in ck:
+            os.utime(p, (1, 1))
+        load = lambda p: torch.load(p, map_location="cpu", mmap=True, weights_only=False)["state_dict"]
+        sds = [load(p) for p in ck]
+        assert [H.twin_weights(sd) for sd in sds] == [True, True, False]
+        k0 = "final_layer.linear.weight"
+        assert sds[0]["denoiser." + k0].data_ptr() != sds[0]["ema_denoiser." + k0].data_ptr()
+        assert sds[1]["denoiser." + k0].data_ptr() == sds[1]["ema_denoiser." + k0].data_ptr()
+        short = dict(sds[0]); short.pop("ema_denoiser." + k0)
+        assert not H.twin_weights(short) and not H.twin_weights({k: v for k, v in sds[0].items() if not k.startswith("ema_")})
+        del sds, short
+        n_val, n_train = 4, 3
+        data = dict(version=1, n_val=n_val, n_train=n_train, train_shard="/x/gpic_train_00787.tar",
+                    val=H.pack_split(None, fake_split(n_val, 5)["img"], [torch.randn(L, 32) for L in (3, 5, 2, 7)], {}),
+                    train=H.pack_split(None, fake_split(n_train, 6)["img"], [torch.randn(L, 32) for L in (4, 1, 6)], {}))
+        for s in ("val", "train"):
+            data[s]["text_max_length"] = SMALL["txt_max_length"]
+        dpath = os.path.join(tmp, "data.pt")
+        torch.save(data, dpath)
+        common = ["--n-val", str(n_val), "--n-train", str(n_train), "--data", dpath, "--device", "cpu", "--batch", "3", "--threads", "1"]
+        one, two = os.path.join(tmp, "one.jsonl"), os.path.join(tmp, "two.jsonl")
+        built = []
+        orig = H.build_denoiser
+        H.build_denoiser = lambda kw, sd, prefix, device: (built.append(prefix), orig(kw, sd, prefix, device))[1]
+        try:
+            rc, txt = run_main(["work", "--out", one, "--ckpt", *ck] + common)
+            assert rc == 0, txt
+            n_one = list(built); built.clear()
+            os.environ["GPIC_HELDOUT_ONE_PASS"] = "0"
+            try:
+                rc, txt = run_main(["work", "--out", two, "--ckpt", *ck] + common)
+            finally:
+                del os.environ["GPIC_HELDOUT_ONE_PASS"]
+            assert rc == 0, txt
+            n_two = list(built); built.clear()
+            # one record missing: the other one alone is computed, on the two-pass path
+            lines = open(one).read().splitlines()
+            with open(one, "w") as f:
+                f.write("\n".join(l for l in lines if not (json.loads(l)["step"] == 100 and json.loads(l)["weights"] == "ema")) + "\n")
+            rc, txt = run_main(["work", "--out", one, "--ckpt", ck[0]] + common)
+            assert rc == 0 and built == ["ema_denoiser."], (rc, built)
+        finally:
+            H.build_denoiser = orig
+        assert n_one == ["denoiser.", "denoiser.", "ema_denoiser.", "denoiser."], n_one          # 100 and 200: the raw net only
+        assert n_two == ["ema_denoiser.", "denoiser."] * 3, n_two
+        A = {(r["step"], r["weights"]): r for r in map(json.loads, lines)}
+        B = {(r["step"], r["weights"]): r for r in map(json.loads, open(two))}
+        assert sorted(A) == sorted(B) == [(s, w) for s in (100, 200, 300) for w in ("ema", "raw")]
+        worst = 0.0
+        for (step, w), a in A.items():
+            b = B[(step, w)]
+            assert a["one_pass"] == (step != 300) and b["one_pass"] is False, (step, w, a["one_pass"], b["one_pass"])
+            for f_ in ("loss_val_t", "loss_train_t"):
+                worst = max(worst, max(abs(x - y) / abs(y) for x, y in zip(a[f_], b[f_])))
+        for step in (100, 200):   # the copy is exact, and two passes over equal bytes agree to the bit on this machine
+            for f_ in ("loss_val", "loss_train", "loss_val_t", "loss_train_t", "loss_val_se", "loss_train_se"):
+                assert A[(step, "ema")][f_] == A[(step, "raw")][f_], (step, f_)
+        same2 = all(B[(s, "ema")][f_] == B[(s, "raw")][f_] for s in (100, 200) for f_ in ("loss_val_t", "loss_train_t"))
+        last = [json.loads(l) for l in open(one)][-1]
+        assert (last["step"], last["weights"], last["one_pass"], last["weights_in_task"]) == (100, "ema", False, ["ema"]), last
+        print(f"  one pass against two passes: max rel diff per level {worst:.2e}; the two passes' EMA and raw records equal to the bit: {same2}")
+        assert worst < 1e-6, worst
+
+
 def main():
-    tests = [H1, H2, H3, H4, H5]
+    tests = [H1, H2, H3, H4, H5, H6]
     want = set(sys.argv[1:])
     for t in tests:
         if not want or t.__name__ in want:

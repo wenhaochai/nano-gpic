@@ -411,6 +411,29 @@ def build_denoiser(kw, state_dict, prefix, device):
     return net.to(device).float().eval()
 
 
+_BITS = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}   # element size -> a dtype to compare bytes with
+
+
+def twin_weights(state_dict):
+    """True when every ema_denoiser.X holds the bytes of denoiser.X, with the same keys on both sides (a no-EMA checkpoint).
+    Two tensors on one storage (the checkpoint writer's twins) are equal without a read; the others are compared as
+    integers, bit for bit, and the first unequal one ends the check."""
+    ema = {k[len("ema_denoiser."):]: v for k, v in state_dict.items() if k.startswith("ema_denoiser.")}
+    raw = {k[len("denoiser."):]: v for k, v in state_dict.items() if k.startswith("denoiser.")}
+    if not ema or ema.keys() != raw.keys():
+        return False
+    for k, e in ema.items():
+        r = raw[k]
+        if (e.dtype, e.shape) != (r.dtype, r.shape) or e.element_size() not in _BITS:
+            return False
+        if e.numel() == 0 or (e.data_ptr() == r.data_ptr() and e.stride() == r.stride()):
+            continue
+        i = _BITS[e.element_size()]
+        if not torch.equal(e.contiguous().view(i), r.contiguous().view(i)):
+            return False
+    return True
+
+
 # -------------------------------------------------------------------------------------------------------------- tasks
 def size_table():
     """size -> (d, nb, nt, training GFLOP per image, source)."""
@@ -554,7 +577,12 @@ def run_task(spec, weights, data, a, device):
     ck = torch.load(spec["ckpt"], map_location="cpu", mmap=True, weights_only=False)
     assert ck["global_step"] == spec["step"], (ck["global_step"], spec["step"])
     prefixes = dict(WEIGHTS)
-    nets = {w: build_denoiser(kw, ck["state_dict"], prefixes[w], device) for w in weights}
+    # 2026-11-09: a no-EMA checkpoint holds the raw weights in its EMA slot too, and its two records were equal to the last
+    # bit at twice the time (129 of the 549 checkpoints with both records). One pass over the raw weights then gives both
+    # records, each marked one_pass. GPIC_HELDOUT_ONE_PASS=0: two passes always.
+    one_pass = (set(weights) == {"ema", "raw"} and os.environ.get("GPIC_HELDOUT_ONE_PASS", "1") == "1"
+                and twin_weights(ck["state_dict"]))
+    nets = {w: build_denoiser(kw, ck["state_dict"], prefixes[w], device) for w in (("raw",) if one_pass else weights)}
     del ck
     # owner 2026-11-09 (popup 「采用」): the denoiser compiled (probe w2407: 15-33% faster, losses within 2.8e-5 relative of the
     # eager values); every record says which (compiled), so old and new values can be told apart. GPIC_HELDOUT_COMPILE=0: eager.
@@ -564,7 +592,7 @@ def run_task(spec, weights, data, a, device):
     tr = make_trainer(loss)
     ts = levels(loss["P_mean"], loss["P_std"], loss["timeshift"])
     load_s = time.time() - t0
-    log(f"loaded {','.join(weights)} in {load_s:.0f} s")
+    log(f"loaded {','.join(nets)}{' (the EMA slot holds the same bytes: one pass)' if one_pass else ''} in {load_s:.0f} s")
     autocast = torch.device(device).type == "cuda"
     res = {s: evaluate(nets, tr, data[s], ts, SEED, a.batch, device, autocast, a.threads, log=lambda m, s=s: log(f"{s} {m}"))
            for s in a.splits}
@@ -578,11 +606,12 @@ def run_task(spec, weights, data, a, device):
                  train_shard=os.path.basename(data["train_shard"]), t=ts.tolist(),
                  d=kw["hidden_size"], nb=kw["num_blocks"], nt=kw["num_text_blocks"])
         for s in a.splits:
-            lm, im = res[s][w]["level_mean"], res[s][w]["image_mean"]
+            lm, im = (res[s]["raw" if one_pass else w][k] for k in ("level_mean", "image_mean"))
             r[f"loss_{s}"] = float(lm.mean())
             r[f"loss_{s}_t"] = lm.tolist()
             r[f"loss_{s}_se"] = float(im.std() / math.sqrt(len(im)))   # over images, of the mean over levels
-        r.update(elapsed_s=round(elapsed, 1), load_s=round(load_s, 1), weights_in_task=list(weights), gpu=gpu, compiled=compiled,
+        r.update(elapsed_s=round(elapsed, 1), load_s=round(load_s, 1), weights_in_task=list(weights), one_pass=one_pass, gpu=gpu,
+                 compiled=compiled,
                  host=socket.gethostname(), job=os.environ.get("FETCHED_JOB_ID") or os.environ.get("SLURM_JOB_ID", ""),
                  code=_git_head(), tool_sha1=_sha1(os.path.abspath(__file__)),
                  time=time.strftime("%Y-%m-%dT%H:%M:%S"))
