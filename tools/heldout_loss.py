@@ -556,6 +556,11 @@ def run_task(spec, weights, data, a, device):
     prefixes = dict(WEIGHTS)
     nets = {w: build_denoiser(kw, ck["state_dict"], prefixes[w], device) for w in weights}
     del ck
+    # owner 2026-11-09 (popup 「采用」): the denoiser compiled (probe w2407: 15-33% faster, losses within 2.8e-5 relative of the
+    # eager values); every record says which (compiled), so old and new values can be told apart. GPIC_HELDOUT_COMPILE=0: eager.
+    compiled = torch.device(device).type == "cuda" and os.environ.get("GPIC_HELDOUT_COMPILE", "1") == "1"
+    if compiled:
+        nets = {w: torch.compile(n) for w, n in nets.items()}
     tr = make_trainer(loss)
     ts = levels(loss["P_mean"], loss["P_std"], loss["timeshift"])
     load_s = time.time() - t0
@@ -577,7 +582,7 @@ def run_task(spec, weights, data, a, device):
             r[f"loss_{s}"] = float(lm.mean())
             r[f"loss_{s}_t"] = lm.tolist()
             r[f"loss_{s}_se"] = float(im.std() / math.sqrt(len(im)))   # over images, of the mean over levels
-        r.update(elapsed_s=round(elapsed, 1), load_s=round(load_s, 1), weights_in_task=list(weights), gpu=gpu,
+        r.update(elapsed_s=round(elapsed, 1), load_s=round(load_s, 1), weights_in_task=list(weights), gpu=gpu, compiled=compiled,
                  host=socket.gethostname(), job=os.environ.get("FETCHED_JOB_ID") or os.environ.get("SLURM_JOB_ID", ""),
                  code=_git_head(), tool_sha1=_sha1(os.path.abspath(__file__)),
                  time=time.strftime("%Y-%m-%dT%H:%M:%S"))
