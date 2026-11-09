@@ -22,7 +22,7 @@ MAP=(prod:main ar:ar dist-step:dist-step energy-head:energy-head eval-par:eval-p
      ladder-pnsr:ladder-pnsr ladder-pnsr-ma:ladder-pnsr-ma ladder-sweep:ladder-sweep sweep-noema:sweep-noema sweep-noema-cap:sweep-noema-cap
      ladder-noema:ladder-noema ladder-datamem:ladder-datamem eval-official:eval-official
      cooldown:cooldown ladder-full:ladder-full gmflow-b2:gmflow-b2 ladder-pns-fp8:ladder-pns-fp8
-     ladder-sweep-fp8-cap:ladder-sweep-fp8-cap fp8-branch:fp8-branch)   # 2026-11-08: the code of every run the page records
+     ladder-sweep-fp8-cap:ladder-sweep-fp8-cap fp8-branch:fp8-branch sweep-noema-sched:sweep-noema-sched heldout-release:heldout-release)   # 2026-11-08: the code of every run the page records
 git -C $SRC fetch -q origin
 RD=$(git -C $SRC log -1 --format=%cs origin/prod -- README.md)
 [ "$RD" = "$(date +%F)" ] || { echo "README.md on prod was last rewritten on $RD: rewrite it (the ladder, the goals, what works, figures) first"; exit 1; }
