@@ -393,6 +393,12 @@ def make_shard_spec(tar_dir, tar_pattern):
 # GPIC WebDataset Pipeline
 # -------------------------
 
+def _ignore_term(worker_id):
+    """DataLoader workers ignore SIGTERM (src/callbacks/save_on_term.py); they still end with the main process."""
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
 class GPICWebDataset(IterableDataset):
 
     def __init__(
@@ -800,6 +806,7 @@ class GPICWebDataset(IterableDataset):
         # non_blocking=True), so it overlaps the previous step instead of stalling the device (perf C1)
         loader = wds.WebLoader(
             dataset,
+            worker_init_fn=_ignore_term,   # the pilot's cut TERMs the whole process group: the main process saves first (save_on_term.py)
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=True,
