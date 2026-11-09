@@ -69,3 +69,13 @@ class CompileWarmup(Callback):
             ds_reset()
         if trainer.is_global_zero:
             print("[warmup] done", flush=True)
+        if os.environ.get("GPIC_RESEED_AFTER_WARMUP"):   # resume isolation R4 (gpic-28 2026-11-09): fresh random streams after the
+            import random                                # warm-up, the same seed on every rank (the ranks stay in step); a resume
+            import numpy as np                           # otherwise replays the run's first noise, timesteps and worker seeds
+            seed = int(os.environ["GPIC_RESEED_AFTER_WARMUP"])
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            np.random.seed(seed % 2**32)
+            random.seed(seed)
+            if trainer.is_global_zero:
+                print(f"[warmup] random streams reseeded with {seed}", flush=True)
