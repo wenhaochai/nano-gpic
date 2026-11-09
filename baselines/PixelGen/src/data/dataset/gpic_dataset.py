@@ -793,6 +793,10 @@ class GPICWebDataset(IterableDataset):
 
     def build_dataloader(self, batch_size, num_workers):
         self.group_batch = batch_size   # ladder: one length-sorted chunk per per-GPU batch, whatever the config says
+        sub = int(os.environ.get("GPIC_SHARED_BUCKET_SUB", "1")) if self.shared_bucket else 1   # shared_bucket_loader.py
+        assert batch_size % sub == 0, (batch_size, sub)
+        if sub > 1:   # the workers emit sub-batches of one bucket; SharedBucketLoader joins sub of them per micro-batch
+            self.group_batch = batch_size // sub
         self._num_workers = num_workers   # repetition arms: EpochShuffledShards sizes the copies per pass by it
         assert not self.group_text_len or self.group_window % batch_size == 0, (self.group_window, batch_size)
         dataset = self.create_dataset()
@@ -800,7 +804,7 @@ class GPICWebDataset(IterableDataset):
         # non_blocking=True), so it overlaps the previous step instead of stalling the device (perf C1)
         loader = wds.WebLoader(
             dataset,
-            batch_size=batch_size,
+            batch_size=self.group_batch if self.shared_bucket else batch_size,
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=num_workers > 0,

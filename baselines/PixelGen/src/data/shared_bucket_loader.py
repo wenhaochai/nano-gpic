@@ -30,6 +30,28 @@ import torch
 import torch.distributed as dist
 
 
+def _cat(ts):
+    """torch.cat of CPU tensors into pinned memory when the parts are pinned (the DataLoader pinned each sub-batch)."""
+    out = torch.empty((sum(t.shape[0] for t in ts), *ts[0].shape[1:]), dtype=ts[0].dtype, pin_memory=ts[0].is_pinned())
+    return torch.cat(ts, out=out)
+
+
+def merge(parts):
+    """One micro-batch from GPIC_SHARED_BUCKET_SUB sub-batches of one bucket (gpic-28 2026-11-09): the images stay one packed
+    GPU-resize job per sub-batch (a list; training_step resizes each and concatenates, sample by sample the same pixels),
+    or are concatenated when they are tensors; captions and per-sample lists are joined, tensors concatenated."""
+    if len(parts) == 1:
+        return parts[0]
+    xs, ys, ms = zip(*parts)
+    x = list(xs) if isinstance(xs[0], dict) else _cat(list(xs))
+    y = [c for yy in ys for c in yy]
+    m = {}
+    for k in ms[0]:
+        v = [mm[k] for mm in ms]
+        m[k] = _cat(v) if torch.is_tensor(v[0]) else [e for vv in v for e in vv] if isinstance(v[0], list) else v[0]
+    return x, y, m
+
+
 def choose(min_counts):
     """The bucket every rank holds most of (the first among ties), or None if no bucket is held by every rank."""
     best = max(range(len(min_counts)), key=lambda i: (min_counts[i], -i))
@@ -52,6 +74,13 @@ class SharedBucketLoader:
         self.loader, self.edges = loader, list(edges)
         self.pool_min = pool_min or 2 * len(self.edges)
         self.pool_cap = pool_cap or int(os.environ.get("GPIC_SHARED_BUCKET_POOL_CAP", "40"))
+        # GPIC_SHARED_BUCKET_SUB = k (gpic-28 2026-11-09; default 1, the loader of before): the workers emit sub-batches of
+        # batch / k samples (GPICWebDataset.build_dataloader) and a micro-batch joins k sub-batches of one bucket. Every new
+        # process starts with empty worker queues, and a worker emits a bucket only when its queue holds a whole batch: with
+        # 32 workers bucket 320 (1.3-1.8% of the micro-batches) first came at step 2047 of a run, and a resume inside the
+        # cooldown trained its last 1696 steps without it (FP8 resume test: FD +5.3%). Pools, pool_min and pool_cap count
+        # micro-batches (k sub-batches each).
+        self.sub = int(os.environ.get("GPIC_SHARED_BUCKET_SUB", "1"))
         self._allreduce_min = allreduce_min   # tests: a stand-in for the gloo all-reduce
         self.taken = [0] * len(self.edges)
         self.group = None   # the gloo group, made at the first decision of the run, on every rank at once
@@ -71,6 +100,9 @@ class _Iter:
         self.st = dict(n=0, rounds=0, pulls=0, pull_s=0.0, ar_s=0.0, pool_max=0, free=0)
         self.over, self.free_steps = False, 0   # free_steps: all of this iterator's free micro-batches (st's are per report)
 
+    def _size(self):   # pooled micro-batches (k sub-batches each)
+        return sum(len(q) for q in self.pools) / self.p.sub
+
     def _bucket(self, batch):
         T = batch[2]["text_mask"].shape[1]
         return self.p.edges.index(T)
@@ -83,7 +115,7 @@ class _Iter:
             self.p.passes += 1
             rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
             print(f"[shared_bucket] rank {rank}: data pass {self.p.passes} ended after micro-batch {self.st['n']}; "
-                  f"the next pass starts with {sum(len(q) for q in self.pools)} batches pooled", flush=True)
+                  f"the next pass starts with {self._size():g} batches pooled", flush=True)
             self.it = iter(self.p.loader)
             try:
                 b = next(self.it)
@@ -95,7 +127,7 @@ class _Iter:
 
     def _min_counts(self):
         """The pools' sizes, MIN over the ranks, and one more entry: -1 if any rank holds pool_cap batches (a free step)."""
-        counts = [len(q) for q in self.pools] + [-1 if self.over else 0]
+        counts = [len(q) // self.p.sub for q in self.pools] + [-1 if self.over else 0]
         if self.p._allreduce_min is not None:
             return self.p._allreduce_min(counts)
         if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
@@ -112,15 +144,15 @@ class _Iter:
     def __next__(self):
         # this rank's flag for the micro-batch, from its pools before the pull: at the cap no batch comes in and the
         # micro-batch is free (_min_counts), so the pools shrink by one
-        self.over = sum(len(q) for q in self.pools) >= self.p.pool_cap
+        self.over = self._size() >= self.p.pool_cap
         if self.it is None:
             self.it = iter(self.p.loader)
-        elif not self.over and sum(len(q) for q in self.pools) >= self.p.pool_min:
+        elif not self.over and self._size() >= self.p.pool_min:
             self._pull()   # one batch in for each one out: the decision then rarely fails (one all-reduce, not two)
-        while sum(len(q) for q in self.pools) < self.p.pool_min:
+        while self._size() < self.p.pool_min:
             self._pull()
         st = self.st
-        st["pool_max"] = max(st["pool_max"], sum(len(q) for q in self.pools))
+        st["pool_max"] = max(st["pool_max"], self._size())
         while True:
             t = time.perf_counter()
             mins = self._min_counts()
@@ -128,6 +160,9 @@ class _Iter:
             st["rounds"] += 1
             if mins[-1] < 0:   # a free step: this rank's fullest bucket (the first among ties)
                 b = max(range(len(self.pools)), key=lambda i: (len(self.pools[i]), -i))
+                while len(self.pools[b]) < self.p.sub:   # local pulls only: every rank makes the same all-reduces per micro-batch
+                    self._pull()
+                    b = max(range(len(self.pools)), key=lambda i: (len(self.pools[i]), -i))
                 st["free"] += 1
                 self.free_steps += 1
             else:
@@ -137,7 +172,7 @@ class _Iter:
                 st["n"] += 1
                 if st["n"] % 1000 == 0:
                     self._report()
-                return self.pools[b].popleft()
+                return merge([self.pools[b].popleft() for _ in range(self.p.sub)])
             self._pull()   # no bucket on every rank yet: one more batch, then decide again
 
     def _report(self):

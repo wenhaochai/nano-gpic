@@ -325,6 +325,9 @@ class LightningModel(pl.LightningModule):
         if isinstance(x, dict):   # MFU lever C: the batch's crops resized on the GPU, bit for bit Pillow's
             from src.data.dataset.pil_exact_gpu import run as gpu_resize
             x = gpu_resize(x)
+        elif isinstance(x, list):   # GPIC_SHARED_BUCKET_SUB > 1: one packed job per sub-batch (shared_bucket_loader.merge)
+            from src.data.dataset.pil_exact_gpu import run as gpu_resize
+            x = torch.cat([gpu_resize(j) for j in x])
         if x.dtype == torch.uint8:   # MFU lever D: uint8 HWC from the workers (GPIC_MFU_UINT8=1), the transform's floats here
             from src.data.dataset.gpic_dataset import uint8_to_float
             x = uint8_to_float(x)
