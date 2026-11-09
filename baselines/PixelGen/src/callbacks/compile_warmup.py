@@ -22,6 +22,10 @@ class CompileWarmup(Callback):
         self.batch_size, self.lengths, self.image_size = batch_size, tuple(lengths), image_size
 
     def on_train_start(self, trainer, pl_module):
+        if os.environ.get("GPIC_SKIP_COMPILE_WARMUP") == "1":   # resume isolation R3 (gpic-28 2026-11-09): no dummy batches at all
+            if trainer.is_global_zero:
+                print("[warmup] skipped (GPIC_SKIP_COMPILE_WARMUP=1)", flush=True)
+            return
         # the data's per-GPU batch when the DataModule has one (new ladders: micro-batches of 64 or 128 for global 1024)
         B, dev = getattr(getattr(trainer, "datamodule", None), "train_batch_size", None) or self.batch_size, pl_module.device
         cached = not hasattr(pl_module.conditioner, "tokenizer")   # outputs read from the batch (cached_text.py)

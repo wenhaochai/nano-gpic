@@ -109,7 +109,50 @@ class _Iter:
     def __iter__(self):
         return self
 
+    def _restart_data(self):
+        """Resume isolation C1 (gpic-28 2026-11-09, GPIC_DATA_RESTART_AT=n): at micro-batch n the data path starts again as in a
+        resumed launch, inside the same process: the workers stop, the dataset builds a new loader (its shard stage reads the
+        shard log again, so every shard started so far, the open ones too, is skipped, as a resume skips them), the pools empty."""
+        owner, (bs, nw) = self.p.owner, self.p.build_args
+        it0 = getattr(self.p.loader.pipeline[0], "_iterator", None)
+        others = None   # HostTuning's CPUs for workers and helper threads (the main thread holds one CPU of its own)
+        if it0 is not None and getattr(it0, "_workers", None):
+            try:
+                others = os.sched_getaffinity(it0._workers[0].pid)
+            except OSError:
+                others = None
+        owner.stop_workers()
+        new = owner.build_dataloader(bs, nw)
+        self.p.loader = new.loader
+        self.pools = [deque() for _ in self.p.edges]
+        self.it = iter(self.p.loader)
+        self._pull()   # the first pull forks the new workers (WebLoader starts its DataLoader iterator lazily)
+        if others:     # they inherited the main thread's single CPU: back to HostTuning's set, with the new pin thread
+            import threading
+            for w in getattr(self.p.loader.pipeline[0]._iterator, "_workers", []):
+                try:
+                    for tid in os.listdir(f"/proc/{w.pid}/task"):
+                        os.sched_setaffinity(int(tid), others)
+                except OSError:
+                    pass
+            me = threading.get_native_id()
+            for tid in os.listdir("/proc/self/task"):
+                try:
+                    with open(f"/proc/self/task/{tid}/comm") as f:
+                        name = f.read().strip()
+                    if int(tid) != me and not name.startswith("pt_autograd"):
+                        os.sched_setaffinity(int(tid), others)
+                except OSError:
+                    pass
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        print(f"[data_restart] rank {rank}: new workers and pools at micro-batch {self.st['n']}"
+              f"{f', workers on {len(others)} CPUs' if others else ''}", flush=True)
+
     def __next__(self):
+        if self.it is not None and not getattr(self, "_restarted", False) and \
+                self.st["n"] == int(os.environ.get("GPIC_DATA_RESTART_AT", "-1")):
+            self._restarted = True
+            self._restart_data()
         # this rank's flag for the micro-batch, from its pools before the pull: at the cap no batch comes in and the
         # micro-batch is free (_min_counts), so the pools shrink by one
         self.over = sum(len(q) for q in self.pools) >= self.p.pool_cap

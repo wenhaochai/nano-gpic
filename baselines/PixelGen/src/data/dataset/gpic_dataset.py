@@ -812,7 +812,9 @@ class GPICWebDataset(IterableDataset):
         self._dataloader = loader.pipeline[0]
         if self.shared_bucket:   # new ladders: the same caption-length bucket on every rank in every micro-batch
             from src.data.shared_bucket_loader import SharedBucketLoader
-            return SharedBucketLoader(loader, self.bucket_edges)
+            sb = SharedBucketLoader(loader, self.bucket_edges)
+            sb.owner, sb.build_args = self, (batch_size, num_workers)   # resume isolation C1: the loader can be built again
+            return sb
         if os.environ.get("GPIC_MFU_REBALANCE") == "2":   # MFU lever E2: the deal over the ranks on the host, one step ahead
             assert self.group_text_len and self.emb_dir and _PACK and _GPU_RESIZE, "lever E2 needs the cached, packed collate with lever C"
             from src.data.rebalance_loader import RebalancingLoader
