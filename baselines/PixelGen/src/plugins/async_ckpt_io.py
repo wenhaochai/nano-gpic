@@ -11,6 +11,13 @@ the writes are also awaited at interpreter exit (atexit runs before multiprocess
 the final checkpoints of an FSDP2 run were lost whenever their write outlasted the exit). The file's mtime is set
 to the snapshot time, because jobs/train_ladder.sh keeps the shard-log lines up to a resumed checkpoint's mtime. The file
 is what torch.save writes from the same dict: the values are copies, no math changes.
+Twins (2026-11-09): under GPIC_MFU_NO_EMA the EMA slot of every checkpoint holds the raw weights (SimpleEMA.mirror), so each
+file held the weights twice (d1536: ms 8.98 GB, last.ckpt 13.5 GB; 4.85 TiB of checkpoints in 48 h). A state_dict tensor
+ema_denoiser.X whose bytes equal denoiser.X's (compared here at every save, bit for bit) is not copied again: both keys get
+the same bytes of the buffer and the writer builds both tensors on one storage, which torch.save writes once. torch.load
+gives two tensors with the values the old file gave (they share a storage, as any two views do); load_state_dict copies
+them into the modules as before. ms files halve, last.ckpt loses a third; with an EMA that moves, nothing is equal and
+the file is the old one.
 Use: trainer.plugins += [src.plugins.async_ckpt_io.AsyncShmCheckpointIO] (GPIC_MFU_ASYNC_CKPT=1 in jobs/mfu/arm.sh).
 """
 import atexit
@@ -35,6 +42,31 @@ class _Ref:
         self.off, self.dtype, self.shape = off, dtype, tuple(shape)
 
 
+_INT = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}   # element size -> a dtype to compare bytes with
+
+
+def _twins(checkpoint):
+    """{id(t): r} for each state_dict tensor t = ema_denoiser.X with the bytes of r = denoiser.X (same dtype, shape and
+    device; compared as integers, so a NaN equals itself and -0.0 differs from 0.0)."""
+    sd = checkpoint.get("state_dict") if isinstance(checkpoint, dict) else None
+    out = {}
+    if not isinstance(sd, dict):
+        return out
+    for key, t in sd.items():
+        if not (isinstance(key, str) and key.startswith("ema_denoiser.") and isinstance(t, torch.Tensor)):
+            continue
+        r = sd.get("denoiser." + key[len("ema_denoiser."):])
+        if not isinstance(r, torch.Tensor) or r is t or (r.dtype, r.shape, r.device) != (t.dtype, t.shape, t.device):
+            continue
+        i = _INT.get(t.element_size())
+        try:
+            if i is not None and t.numel() and torch.equal(t.detach().view(i), r.detach().view(i)):
+                out[id(t)] = r
+        except Exception:   # a tensor that has no integer view (e.g. not strided): written on its own, as before
+            pass
+    return out
+
+
 def _writer(jobs, acks):
     """The writer process: rebuild the tensors from the shared buffer, torch.save, rename, set the mtime."""
     # review S3: a SIGTERM to the job's process group must not cut a write short (it left a 13-27 GB *.tmp<pid>); the
@@ -57,20 +89,25 @@ def _writer(jobs, acks):
             if delay:
                 time.sleep(delay)
             st = buf.untyped_storage()
+            parts = {}   # byte offset -> the storage there (tensors with bytes have distinct offsets; twins share one)
 
             def rebuild(r):
                 # review M1: no copy (27 GB of host memory at d1792): each tensor gets its own storage, a slice of the
-                # shared buffer, so torch.save writes the same bytes as for an independent copy
+                # shared buffer, so torch.save writes the same bytes as for an independent copy. Twins (save_checkpoint
+                # gave them one offset) are two tensors on one storage: torch.save writes a storage once.
                 n = int(torch.Size(r.shape).numel()) * torch.empty((), dtype=r.dtype).element_size()
                 if n == 0:   # an empty slice would start where the next tensor starts: torch.save refuses that
                     return torch.empty(r.shape, dtype=r.dtype)
-                return torch.empty(0, dtype=r.dtype).set_(st[r.off:r.off + n], 0, r.shape)
+                if r.off not in parts:
+                    parts[r.off] = st[r.off:r.off + n]
+                return torch.empty(0, dtype=r.dtype).set_(parts[r.off], 0, r.shape)
             ckpt = apply_to_collection(snap, _Ref, rebuild)
             tmp = f"{path}.tmp{os.getpid()}"
             torch.save(ckpt, tmp)
             os.replace(tmp, path)
             os.utime(path, (t_snap, t_snap))
             del ckpt
+            parts.clear()
             acks.put((k, path, None))
         except Exception as e:   # raised in the training process at its next save or at teardown
             acks.put((k, path, repr(e)))
@@ -168,18 +205,22 @@ class AsyncShmCheckpointIO(TorchCheckpointIO):
             if not getattr(self, "_atexit", False):
                 atexit.register(self._teardown_at_exit)
                 self._atexit = True
-        tensors = []
-        apply_to_collection(checkpoint, torch.Tensor, lambda t: tensors.append(t))
+        twin = _twins(checkpoint)
+        one = lambda t: twin.get(id(t), t)   # the tensor whose bytes stand for t: a twin's raw tensor, else t itself
+        distinct = {}
+        apply_to_collection(checkpoint, torch.Tensor, lambda t: distinct.setdefault(id(one(t)), one(t)))
         align = lambda n: (n + 255) // 256 * 256
-        k = self._buffer(sum(align(t.numel() * t.element_size()) for t in tensors))
-        buf, off = self._bufs[k][0], [0]
+        k = self._buffer(sum(align(t.numel() * t.element_size()) for t in distinct.values()))
+        buf, off, refs = self._bufs[k][0], [0], {}
 
         def put(t):
-            n = t.numel() * t.element_size()
-            buf[off[0]:off[0] + n].view(t.dtype).view(t.shape).copy_(t.detach(), non_blocking=t.is_cuda)
-            r = _Ref(off[0], t.dtype, t.shape)
-            off[0] += align(n)
-            return r
+            t = one(t)
+            if id(t) not in refs:   # one copy per distinct tensor
+                n = t.numel() * t.element_size()
+                buf[off[0]:off[0] + n].view(t.dtype).view(t.shape).copy_(t.detach(), non_blocking=t.is_cuda)
+                refs[id(t)] = (_Ref(off[0], t.dtype, t.shape), t)   # t kept: an id is unique only while its object lives
+                off[0] += align(n)
+            return refs[id(t)][0]
         snap = apply_to_collection(checkpoint, torch.Tensor, put)
         if torch.cuda.is_available():
             torch.cuda.synchronize()   # the copies are complete before training changes the tensors
