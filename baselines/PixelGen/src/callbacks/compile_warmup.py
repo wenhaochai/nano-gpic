@@ -62,3 +62,20 @@ class CompileWarmup(Callback):
                 print(f"[warmup] T={T}: {time.time() - t0:.1f} s", flush=True)
         if trainer.is_global_zero:
             print("[warmup] done", flush=True)
+        if trainer.global_step > 0:
+            # a resumed launch (gpic-28 2026-11-09, owner popups 「R3 和 C1 都做」/「做」): it seeds, builds the model and runs this
+            # warm-up exactly as the run's first launch did, so without this it replayed the run's first noise, timesteps and data-worker
+            # seeds; a resume inside the cooldown then cost FD 5-9% at d16 (4 of 4 resumes 851-884 against 812.5 for one-piece runs; with
+            # the streams reseeded here 814.4, w2421). Fresh streams from (seed, step), one for all ranks so they stay in step; a first
+            # launch (step 0) is unchanged. The warm-up's blocks go back to the allocator too (a resume loads the optimizer states first).
+            import random
+            import numpy as np
+            base = int(os.environ.get("PL_GLOBAL_SEED", "0"))
+            seed = (base * 1000003 + trainer.global_step) % (2 ** 31 - 1)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            np.random.seed(seed)
+            random.seed(seed)
+            torch.cuda.empty_cache()
+            if trainer.is_global_zero:
+                print(f"[warmup] resumed at step {trainer.global_step}: random streams reseeded with {seed}", flush=True)
