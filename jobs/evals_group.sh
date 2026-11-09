@@ -57,10 +57,13 @@ trap _on_exit EXIT
 SKIP=() FAIL=() spid="" stask=""
 for i in $(seq 0 $((N - 1))); do
   t=${TASK[$i]}
-  while [ ! -s $MK/$i ]; do sleep 2; done
+  while [ ! -s $MK/$i ]; do   # a raw-view loop that died (killed) without a mark fails the task instead of waiting forever
+    kill -0 $RVPID 2>/dev/null || { [ -s $MK/$i ] || echo failed > $MK/$i; break; }
+    sleep 2
+  done
   case $(cat $MK/$i) in
     missing) echo "task $t: no ${SRC[$i]}; skipped"; SKIP+=("$t"); continue ;;
-    failed) echo "task $t: raw view failed:"; cat $MK/$i.log; FAIL+=("$t"); continue ;;
+    failed) echo "task $t: raw view failed:"; cat $MK/$i.log 2>/dev/null; FAIL+=("$t"); continue ;;
   esac
   [ "$(git -C $WT rev-parse HEAD)" = "$SHA" ] || { echo "$WT moved from $SHA"; FAIL+=("$t"); continue; }
   A=(0 ${SZ[$i]} ${D[$i]} ${NB[$i]} ${NT[$i]} $R/raw_view/${REL[$i]} --wt $WTN ${ST[$i]}:euler:50)
