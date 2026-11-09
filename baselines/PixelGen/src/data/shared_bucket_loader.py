@@ -158,6 +158,9 @@ class _Iter:
         self.over = sum(len(q) for q in self.pools) >= self.p.pool_cap
         if self.it is None:
             self.it = iter(self.p.loader)
+            if os.environ.get("GPIC_RNG_PROBE") == "1":   # resume isolation E1/E2: the data workers' base seed (torch's CPU generator)
+                rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+                print(f"[rng] rank {rank}: data workers' base seed {getattr(self.it, '_base_seed', '?')}", flush=True)
         elif not self.over and sum(len(q) for q in self.pools) >= self.p.pool_min:
             self._pull()   # one batch in for each one out: the decision then rarely fails (one all-reduce, not two)
         while sum(len(q) for q in self.pools) < self.p.pool_min:

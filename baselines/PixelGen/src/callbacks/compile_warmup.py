@@ -16,12 +16,30 @@ import torch
 from lightning.pytorch.callbacks import Callback
 
 
+def _rng_probe(trainer, when):
+    """GPIC_RNG_PROBE=1 (resume isolation E1/E2, gpic-28 2026-11-09): digests of every random stream on ranks 0 and 1."""
+    if os.environ.get("GPIC_RNG_PROBE") != "1" or trainer.global_rank > 1:
+        return
+    import hashlib, random
+    import numpy as np
+    h = lambda b: hashlib.md5(b).hexdigest()[:10]
+    g = torch.cuda.default_generators[torch.cuda.current_device()]
+    try:
+        off = g.get_offset()
+    except Exception:
+        off = "?"
+    print(f"[rng] rank {trainer.global_rank} step {trainer.global_step} {when}: cpu {h(torch.random.get_rng_state().numpy().tobytes())} "
+          f"cuda {h(torch.cuda.get_rng_state().numpy().tobytes())} (seed {g.initial_seed()}, offset {off}) "
+          f"random {h(repr(random.getstate()).encode())} numpy {h(np.random.get_state()[1].tobytes())}", flush=True)
+
+
 class CompileWarmup(Callback):
     def __init__(self, batch_size: int = 32, lengths=(64, 128, 320, 192), image_size: int = 256):
         super().__init__()
         self.batch_size, self.lengths, self.image_size = batch_size, tuple(lengths), image_size
 
     def on_train_start(self, trainer, pl_module):
+        _rng_probe(trainer, "before the warm-up")
         if os.environ.get("GPIC_SKIP_COMPILE_WARMUP") == "1":   # resume isolation R3 (gpic-28 2026-11-09): no dummy batches at all
             if trainer.is_global_zero:
                 print("[warmup] skipped (GPIC_SKIP_COMPILE_WARMUP=1)", flush=True)
@@ -69,13 +87,19 @@ class CompileWarmup(Callback):
             ds_reset()
         if trainer.is_global_zero:
             print("[warmup] done", flush=True)
+        _rng_probe(trainer, "after the warm-up")
         if os.environ.get("GPIC_RESEED_AFTER_WARMUP"):   # resume isolation R4 (gpic-28 2026-11-09): fresh random streams after the
             import random                                # warm-up, the same seed on every rank (the ranks stay in step); a resume
             import numpy as np                           # otherwise replays the run's first noise, timesteps and worker seeds
             seed = int(os.environ["GPIC_RESEED_AFTER_WARMUP"])
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-            np.random.seed(seed % 2**32)
-            random.seed(seed)
+            what = os.environ.get("GPIC_RESEED_WHAT", "all")   # E1 cpu: the CPU streams only (the data workers' base seed is drawn from
+            assert what in ("all", "cpu", "cuda"), what        # torch's CPU generator at the first batch); E2 cuda: the GPU streams only
+            if what in ("all", "cpu"):                         # (timesteps, noise, caption dropout)
+                torch.random.default_generator.manual_seed(seed)
+                np.random.seed(seed % 2**32)
+                random.seed(seed)
+            if what in ("all", "cuda"):
+                torch.cuda.manual_seed_all(seed)
             if trainer.is_global_zero:
-                print(f"[warmup] random streams reseeded with {seed}", flush=True)
+                print(f"[warmup] random streams reseeded with {seed} ({what})", flush=True)
+            _rng_probe(trainer, "after the reseed")
