@@ -5,7 +5,9 @@ other metric the official evaluation gives). gpic_eval.eval_with_ref_stats with 
 subsample, the toolkit's defaults) and MMD. The DINOv2 metrics come from tools/fast_eval.py as before.
 usage: official_inception.py <samples.npz> <ref_stats.npz> <out.json>   (env: envs/gpic-eval-tf; XDG_CACHE_HOME holds gpic_eval/classify_image_graph_def.pb)"""
 import json, sys, time
+import numpy as np
 from gpic_eval.eval import eval_with_ref_stats
+np.random.seed(0)   # gpic_eval draws PRDC's 10K subsample with np.random.choice: seeded as tools/fast_eval.py (run3's Inception PRDC moved between runs)
 sample, ref, out = sys.argv[1:4]
 t0 = time.time()
 r = eval_with_ref_stats(sample_path=sample, ref_path=ref, models=["inception"], batch_size=500)

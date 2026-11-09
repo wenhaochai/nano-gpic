@@ -264,6 +264,17 @@ class LightningModel(pl.LightningModule):
 
     def predict_step(self, batch, batch_idx):
         xT, y, metadata = batch
+        # gpic-28 2026-11-08 (w2353: the fixed cost of a predict): a short last batch (50K / 8 ranks = 6250 = 195 x 32 + 10) recompiled the
+        # denoiser for 10 samples; it is padded with copies of its last sample to the first batch's size and the copies are dropped after
+        # sampling (every sample has its own noise from the dataset, so the kept samples are unchanged)
+        n = xT.shape[0]
+        full = getattr(self, "_pred_full_bs", None) or n
+        self._pred_full_bs = full
+        if n < full:
+            k = full - n
+            xT = torch.cat([xT, xT[-1:].expand(k, *xT.shape[1:])], dim=0)
+            y = list(y) + [y[-1]] * k
+            metadata = list(metadata) + [metadata[-1]] * k
         meta = {}   # a fresh dict: the conditioner writes the text mask into it (masked mode)
         with torch.no_grad():
             condition, uncondition = self.conditioner(y, meta)
@@ -275,7 +286,7 @@ class LightningModel(pl.LightningModule):
             assert float(self.diffusion_sampler.guidance) == 1.0, "CFG is fixed at 1.0 (owner, 2026-11-01)"
             if batch_idx == 0:
                 torch.manual_seed(2000 + self.global_rank)
-            return fp2uint8(self.vae.decode(net.ar_sample(condition, y_mask)))
+            return fp2uint8(self.vae.decode(net.ar_sample(condition, y_mask)))[:n]
         if getattr(net, "code_dim", 0):   # plan A (docs/distribution_step.md 5.2): one z per image, fixed along the path
             assert float(self.diffusion_sampler.guidance) == 1.0, "CFG is fixed at 1.0 (owner, 2026-11-01)"
             # z0 has its own seed, from the prompt's key: each prompt keeps its z on any rank, and z0 is independent of xT. The official xT is the same tensor for all prompts (gpic_jsonl_dataset.py), so z0 must not come from it.
@@ -292,12 +303,21 @@ class LightningModel(pl.LightningModule):
 
             def net(x, t, c, _base=base, _m=y_mask, _n=null, **kw):   # kw: gm_mode of the GMFlow samplers
                 return _base(x, t, c, y_mask=_m if x.shape[0] == _m.shape[0] else torch.cat([_n, _m], dim=0), **kw)
+        # the caption length differs from batch to batch: dynamic from the first call (w2353: a recompile per new length until dynamo
+        # marked it itself), and the RoPE table made eagerly before the first compiled call (its first fill failed the guard)
+        torch._dynamo.maybe_mark_dynamic(condition, 1)
+        if y_mask is not None:
+            torch._dynamo.maybe_mark_dynamic(y_mask, 1)
+        if batch_idx == 0:
+            core = self.denoiser if self.eval_original_model else self.ema_denoiser
+            if hasattr(core, "fetch_pos") and hasattr(core, "patch_size"):
+                core.fetch_pos(xT.shape[-2] // core.patch_size, xT.shape[-1] // core.patch_size, xT.device)
         samples = self.diffusion_sampler(net, xT, condition, uncondition)
 
         samples = self.vae.decode(samples)
         # fp32 -1,1 -> uint8 0,255
         samples = fp2uint8(samples)
-        return samples
+        return samples[:n]
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         # --- GPIC: dataloader_idx=0 is GPIC val set (compute loss) ---

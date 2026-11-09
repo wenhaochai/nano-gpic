@@ -22,7 +22,10 @@ class Qwen3TextEncoder(BaseConditioner):
         # memory-efficient kernel for this mask, 24% tensor-core active under ncu)
         self.model = Qwen3Model.from_pretrained(weight_path, attn_implementation=attn_implementation).to(torch.bfloat16)
         # profiling switches (jobs/prof_ladder.sh), unset in every production run
-        self.model.compile(**({"mode": os.environ["GPIC_PROF_TE_COMPILE_MODE"]} if "GPIC_PROF_TE_COMPILE_MODE" in os.environ else {}))
+        # evaluations (GPIC_EVAL_TE_EAGER=1, jobs/eval_gmflow.sh): eager. One call per batch against 50 denoiser calls, and compiled it
+        # recompiled between the batch-1 null/negative prompts and the batch-32 captions (w2353: ~20 s of every predict)
+        if os.environ.get("GPIC_EVAL_TE_EAGER") != "1":
+            self.model.compile(**({"mode": os.environ["GPIC_PROF_TE_COMPILE_MODE"]} if "GPIC_PROF_TE_COMPILE_MODE" in os.environ else {}))
         self.cudagraphs = os.environ.get("GPIC_PROF_TE_COMPILE_MODE") == "reduce-overhead"
         self.no_padding_mask = bool(os.environ.get("GPIC_PROF_TE_NO_MASK"))
         self.extra = {"use_cache": False} if os.environ.get("GPIC_PROF_TE_NO_CACHE") else {}

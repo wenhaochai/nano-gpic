@@ -110,15 +110,32 @@ echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K spread=$SPREAD sampler=$
 [ $SAMPLER != gm_ode_cal ] || { echo "spread_table=$TABLE sha1=$(sha1sum < "$TABLE" | cut -c1-40)" | tee -a $OUT/ckpt.txt; cp "$TABLE" $OUT/spread_table.json; }
 SPREAD_ARGS=(); [ $SPREAD = image ] || SPREAD_ARGS=(--model.denoiser.init_args.gm_spread $SPREAD)   # image: the command line of before this option
 LIMIT=(); [ -z "${EVAL_LIMIT_BATCHES:-}" ] || LIMIT=(--trainer.limit_predict_batches $EVAL_LIMIT_BATCHES)
+# gpic-28 2026-11-08 (w2353, the fixed cost of a predict): the text encoder runs eager (qwen3_text_encoder.py: compiled, it recompiled
+# between the batch-1 null prompt and the batch-32 captions), and the 50K samples (9.8 GB) go to node memory instead of GPFS (writing
+# them took ~25 s, and the check, DINOv2 and Inception passes read them again). The memory directory is removed at exit (the EXIT
+# trap keeps env.sh's); leftovers of a killed evaluation older than 2 h are swept first.
+export GPIC_EVAL_TE_EAGER=1
+PRED_ROOT=$OUT/pred
+if [ -d /dev/shm ] && [ "$(df --output=avail -BG /dev/shm | tail -1 | tr -dc 0-9)" -gt 40 ]; then
+  find /dev/shm -maxdepth 1 -name 'gpic_eval_*' -user "$USER" -mmin +120 -exec rm -rf {} + 2>/dev/null || true
+  SHM_DIR=$(mktemp -d /dev/shm/gpic_eval_XXXXXX)
+  _prev_exit_cmd=$(trap -p EXIT | sed -E "s/^trap -- '(.*)' EXIT$/\1/; s/'\\\\''/'/g")
+  _on_exit() { rm -rf -- "$SHM_DIR"; eval "$_prev_exit_cmd"; }
+  trap _on_exit EXIT
+  PRED_ROOT=$SHM_DIR/pred
+fi
 t0=$(date +%s)
 WANDB_MODE=disabled python main.py predict --config configs_h100/lite_ladder_sample.yaml "${SARGS[@]}" --trainer.devices ${EVAL_DEVICES:-8} \
-  --trainer.default_root_dir "$OUT/pred" --ckpt_path "$CKPT" --model.diffusion_sampler.init_args.num_steps $CALLS \
+  --trainer.default_root_dir "$PRED_ROOT" --ckpt_path "$CKPT" --model.diffusion_sampler.init_args.num_steps $CALLS \
   --model.denoiser.init_args.hidden_size $WD --model.denoiser.init_args.num_groups $((WD / 64)) \
   --model.denoiser.init_args.num_blocks $NB --model.denoiser.init_args.num_text_blocks $NT --model.denoiser.init_args.gm_k $K "${SPREAD_ARGS[@]}" \
   --data.pred_dataset.init_args.noise_per_prompt $NPP "${LIMIT[@]}" > $OUT/predict.log 2>&1
 t1=$(date +%s)
-NPZ=$(find "$OUT/pred" -name output.npz | head -1)
+NPZ=$(find "$PRED_ROOT" -name output.npz | head -1)
 [ -n "$NPZ" ] || { echo "no output.npz"; exit 4; }
+if [ "$PRED_ROOT" != "$OUT/pred" ]; then   # everything but the samples back beside the metrics, as before
+  mkdir -p "$OUT/pred" && (cd "$PRED_ROOT" && find . -type f ! -name output.npz -exec cp --parents {} "$OUT/pred/" \;)
+fi
 if [ -n "${EVAL_LIMIT_BATCHES:-}" ]; then
   python - "$NPZ" <<'PY' | tee $OUT/sample_check.txt
 import sys, numpy as np
