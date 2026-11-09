@@ -193,7 +193,7 @@ IFD=$(mktemp -d)
   rm -rf "$IFD"; date +%s > $OUT/.inception_end ) &
 IPID=$!
 if ! python -m torch.distributed.run --standalone --nproc_per_node ${EVAL_DEVICES:-8} $WT/tools/fast_eval.py "$NPZ" \
-  $WC/data/gpic/reference_stats/test_stats.npz $OUT/metrics.json --workers ${EVAL_FAST_WORKERS:-6} > $OUT/eval.log 2>&1; then   # 6 x 8 ranks (was 11): the Inception pass beside it starved for CPU (58 -> 100 s)
+  $WC/data/gpic/reference_stats/test_stats.npz $OUT/metrics.json --workers ${EVAL_FAST_WORKERS:-6} --gpu-resize > $OUT/eval.log 2>&1; then   # run10: the transform on the GPU, bit for bit (tools/dino_gpu_resize.py)   # 6 x 8 ranks (was 11): the Inception pass beside it starved for CPU (58 -> 100 s)
   kill $IPID 2>/dev/null || true; wait $IPID 2>/dev/null || true; exit 1
 fi
 t2=$(date +%s)

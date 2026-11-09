@@ -23,7 +23,7 @@ export NCCL_NVLS_ENABLE=0   # NCCL 2.26.2 NVLS all-gather can permute rank block
 set -o pipefail
 WC=/scratch/gpfs/GROUP/USER
 source $WC/project/gpic/jobs/env.sh
-WTN=eval_official_run9
+WTN=eval_official_run10
 if [ "$1" = "--wt" ]; then WTN=$2; shift 2; [[ $WTN =~ ^[A-Za-z0-9_-]+$ ]] || { echo "--wt takes a worktree name under gpic-wt/"; exit 2; }; fi
 [ $# -ge 1 ] || { echo "usage: evals_group.sh [--wt <worktree>] <rel>:<size>:<d>:<nb>:<nt>:<step> ..."; exit 2; }
 WT=$WC/project/gpic-wt/$WTN
