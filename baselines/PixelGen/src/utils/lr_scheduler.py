@@ -28,12 +28,16 @@ class WarmupFlatCooldown:
     """Linear warmup, a flat rate, then a linear cooldown over the last num_cooldown_steps of max_steps.
     min_lr (owner 2026-11-07: 「学习率线性不降到0，而是降低到一个固定值3e-5」): the absolute rate every param group reaches at
     max_steps; each group gets its own lambda, ending at min_lr / its initial rate (the Muon and the Adam groups start at
-    different rates). min_lr = 0 keeps the old schedule exactly (one lambda, down to 0)."""
-    def __init__(self, num_warmup_steps: int, num_cooldown_steps: int, max_steps: int, min_lr: float = 0.0):
+    different rates). min_lr = 0 keeps the old schedule exactly (one lambda, down to 0).
+    shape (owner 2026-11-08, the cooldown sweep after Marin #7717): "linear" (default, unchanged) or "1-sqrt", where the rate falls
+    by sqrt(t) of the way from the peak to the floor over the cooldown's fraction t, so it drops fast first and slowly at the end."""
+    def __init__(self, num_warmup_steps: int, num_cooldown_steps: int, max_steps: int, min_lr: float = 0.0, shape: str = "linear"):
         self.num_warmup_steps = num_warmup_steps
         self.num_cooldown_steps = num_cooldown_steps
         self.max_steps = max_steps
         self.min_lr = min_lr
+        assert shape in ("linear", "1-sqrt"), shape
+        self.shape = shape
 
     def __call__(self, optimizer):
         warmup = self.num_warmup_steps
@@ -48,6 +52,8 @@ class WarmupFlatCooldown:
                     return 1.0
                 else:
                     frac = min(1.0, (step - (total - cooldown)) / max(1, cooldown))
+                    if self.shape == "1-sqrt":
+                        frac = frac ** 0.5
                     return 1.0 - (1.0 - floor) * frac
             return lr_lambda
 
