@@ -66,10 +66,32 @@ run_task() {   # <task>: one evaluation, skipped if it has its metrics.json; ret
   if [ -f $RUN/$D/metrics.json ]; then echo "eval $t done before"; return 0; fi
   [ "$(git -C $WT rev-parse HEAD)" = "$SHA" ] || { echo "$WT moved from $SHA"; return 2; }
   LOG=eval_${STEP}_${S}_$C${N:+_n$N}${NTAG:+_$NTAG}; [ $S != gm_ode_cal ] || LOG=eval_${STEP}_${D#eval_*_}   # the old log names (+ _official); a table's hash for gm_ode_cal
-  EVAL_SUBSTEPS=$N bash $WT/jobs/eval_gmflow.sh $K $STEP $S $C > $ROOT/$LOG.log 2>&1
+  if [ "${EVAL_PHASE:-all}" = score ]; then EVAL_SUBSTEPS=$N bash $WT/jobs/eval_gmflow.sh $K $STEP $S $C >> $ROOT/$LOG.log 2>&1
+  else EVAL_SUBSTEPS=$N bash $WT/jobs/eval_gmflow.sh $K $STEP $S $C > $ROOT/$LOG.log 2>&1; fi
 }
 fail=0
 if [ $PAR = 0 ]; then
+  # gpic-28 2026-11-09 (the eval idle-GPU work): with several tasks, task i's scoring (DINOv2 on the GPUs, Inception beside it) runs in
+  # the background while task i+1's predict starts, whose start-up and first compile leave the GPUs idle for about a minute; at most one
+  # scoring overlaps one predict. The samples wait in a job-level directory in /dev/shm, removed at exit (env.sh's EXIT trap kept).
+  # A caller's EVAL_PHASE (jobs/evals_group.sh: one task per call) passes through to eval_gmflow.sh unchanged.
+  if [ $# -gt 1 ] && [ "${EVAL_PHASE:-all}" = all ] && [ "${EVAL_PIPELINE:-1}" = 1 ] && [ -z "${EVAL_LIMIT_BATCHES:-}" ] && [ -d /dev/shm ]; then
+    find /dev/shm -maxdepth 1 -name 'gpic_evals_*' -user "$USER" -mmin +360 -exec rm -rf {} + 2>/dev/null || true   # a killed job's
+    export EVAL_SHM_ROOT=$(mktemp -d /dev/shm/gpic_evals_XXXXXX)
+    _prev_exit_cmd=$(trap -p EXIT | sed -E "s/^trap -- '(.*)' EXIT$/\1/; s/'\\\\''/'/g")
+    _on_exit() { rm -rf -- "$EVAL_SHM_ROOT"; eval "$_prev_exit_cmd"; }
+    trap _on_exit EXIT
+    spid=""
+    for t in "$@"; do
+      if EVAL_PHASE=predict run_task $t; then
+        if [ -n "$spid" ]; then wait $spid || fail=1; fi
+        EVAL_PHASE=score run_task $t & spid=$!
+        echo "eval $t predicted, scoring in the background; fail=$fail"
+      else fail=1; echo "eval $t predict failed"; fi
+    done
+    if [ -n "$spid" ]; then wait $spid || fail=1; fi
+    exit $fail
+  fi
   for t in "$@"; do run_task $t || fail=1; echo "eval $t fail=$fail"; done
   exit $fail
 fi

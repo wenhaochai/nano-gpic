@@ -84,10 +84,15 @@ fi
 RUN=${LADDER_RUN_ROOT:-$DEF_ROOT}/exp_ladder_$SIZE
 CKPT=$(ls -t $RUN/ms-*$STEP*.ckpt 2>/dev/null | head -1); [ -n "$CKPT" ] || { echo "no ms checkpoint for step $STEP in $RUN"; exit 2; }
 OUT=$RUN/$(eval_dir $STEP $SAMPLER $CALLS "$NSUF" "$TABLE" "$NTAG")
+# gpic-28 2026-11-09: EVAL_PHASE all (default), or predict / score: jobs/evals_gmflow.sh pipelines a job's tasks, task i's scoring beside
+# task i+1's predict (whose start-up and first compile leave the GPUs idle); predict leaves the samples in EVAL_SHM_ROOT for score
+PHASE=${EVAL_PHASE:-all}
+case $PHASE in all|predict|score) ;; *) echo "EVAL_PHASE must be all, predict or score"; exit 2 ;; esac
 [ ! -f $OUT/metrics.json ] || { echo "$OUT/metrics.json exists; not overwriting"; exit 3; }
-[ ! -d $OUT ] || mv $OUT $OUT.unfinished_$(date +%m%d_%H%M%S)
 cd $WT/baselines/PixelGen
 export PYTHONPATH=$PWD
+if [ $PHASE != score ]; then
+[ ! -d $OUT ] || mv $OUT $OUT.unfinished_$(date +%m%d_%H%M%S)
 if [ $SAMPLER = gm_ode_cal ]; then   # the table belongs to this checkpoint and stays under the bound at these calls (F1, F2)
   python -m src.diffusion.flow_matching.gm_spread check "$TABLE" $STEP $CALLS || exit 2
 fi
@@ -116,7 +121,11 @@ LIMIT=(); [ -z "${EVAL_LIMIT_BATCHES:-}" ] || LIMIT=(--trainer.limit_predict_bat
 # trap keeps env.sh's); leftovers of a killed evaluation older than 2 h are swept first.
 export GPIC_EVAL_TE_EAGER=1
 PRED_ROOT=$OUT/pred
-if [ -d /dev/shm ] && [ "$(df --output=avail -BG /dev/shm | tail -1 | tr -dc 0-9)" -gt 40 ]; then
+if [ $PHASE = predict ]; then   # the samples must outlive this script: node memory only in the caller's EVAL_SHM_ROOT (removed by the
+  if [ -d "${EVAL_SHM_ROOT:-}" ] && [ "$(df --output=avail -BG /dev/shm | tail -1 | tr -dc 0-9)" -gt 40 ]; then   # score phase, and at the caller's exit)
+    SHM_DIR=$(mktemp -d $EVAL_SHM_ROOT/task_XXXXXX); PRED_ROOT=$SHM_DIR/pred
+  fi
+elif [ -d /dev/shm ] && [ "$(df --output=avail -BG /dev/shm | tail -1 | tr -dc 0-9)" -gt 40 ]; then
   find /dev/shm -maxdepth 1 -name 'gpic_eval_*' -user "$USER" -mmin +120 -exec rm -rf {} + 2>/dev/null || true
   SHM_DIR=$(mktemp -d /dev/shm/gpic_eval_XXXXXX)
   _prev_exit_cmd=$(trap -p EXIT | sed -E "s/^trap -- '(.*)' EXIT$/\1/; s/'\\\\''/'/g")
@@ -147,6 +156,18 @@ PY
   echo "{\"predict_s\": $((t1-t0))}" | tee $OUT/phase_times.json
   exit 0
 fi
+if [ $PHASE = predict ]; then   # the score phase takes the samples from here
+  echo "$NPZ" > $OUT/.npz_path; echo "${SHM_DIR:-}" > $OUT/.shm_dir; echo "$t0 $t1" > $OUT/.predict_t
+  exit 0
+fi
+ts=$t1
+else
+  NPZ=$(cat $OUT/.npz_path 2>/dev/null || true)
+  [ -n "$NPZ" ] && [ -f "$NPZ" ] || { echo "no samples for $OUT: run EVAL_PHASE=predict first"; exit 4; }
+  read -r t0 t1 < $OUT/.predict_t
+  SHM_DIR=$(cat $OUT/.shm_dir 2>/dev/null || true)
+  ts=$(date +%s)   # the scoring's own start: it may wait for the task before it
+fi
 # the official evaluation's Inception metrics (FD, PRDC, MMD) on the same samples, before they are deleted (owner 2026-11-07: record every
 # metric the official evaluation gives); a failure here leaves the DINOv2 result in place and says so. It runs beside the DINOv2
 # evaluation, on the last visible GPU with TF's memory growth on, so no GPU waits on the one-GPU Inception pass (genmodel 2026-11-08
@@ -158,15 +179,16 @@ IG=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}; IG=${IG##*,}
   date +%s > $OUT/.inception_end ) &
 IPID=$!
 if ! python -m torch.distributed.run --standalone --nproc_per_node ${EVAL_DEVICES:-8} $WT/tools/fast_eval.py "$NPZ" \
-  $WC/data/gpic/reference_stats/test_stats.npz $OUT/metrics.json --workers 11 > $OUT/eval.log 2>&1; then
+  $WC/data/gpic/reference_stats/test_stats.npz $OUT/metrics.json --workers ${EVAL_FAST_WORKERS:-6} > $OUT/eval.log 2>&1; then   # 6 x 8 ranks (was 11): the Inception pass beside it starved for CPU (58 -> 100 s)
   kill $IPID 2>/dev/null || true; wait $IPID 2>/dev/null || true; exit 1
 fi
 t2=$(date +%s)
-echo "{\"predict_s\": $((t1-t0)), \"eval_s\": $((t2-t1))}" | tee $OUT/phase_times.json
+echo "{\"predict_s\": $((t1-t0)), \"eval_s\": $((t2-ts))}" | tee $OUT/phase_times.json
 cat $OUT/metrics.json
 wait $IPID || true
 t3=$(cat $OUT/.inception_end 2>/dev/null || date +%s); rm -f $OUT/.inception_end
-echo "{\"predict_s\": $((t1-t0)), \"eval_s\": $((t2-t1)), \"inception_s\": $((t3-t1)), \"inception_beside_eval\": 1}" > $OUT/phase_times.json
+PIPE=""; [ $PHASE != score ] || PIPE=", \"score_wait_s\": $((ts-t1)), \"pipelined\": 1"   # score_wait_s: predict end to scoring start
+echo "{\"predict_s\": $((t1-t0)), \"eval_s\": $((t2-ts)), \"inception_s\": $((t3-ts)), \"inception_beside_eval\": 1$PIPE}" > $OUT/phase_times.json
 # held-out loss (EMA and raw) of the evaluated checkpoint, once per checkpoint (tools/heldout_loss.py skips what is done)
 if [ "${EVAL_HELDOUT:-0}" = 1 ]; then   # off by default: one checkpoint keeps 1 of 8 GPUs busy; batched held-out jobs (heldout_backfill.sh) run 8 checkpoints side by side
   ( HWT=$WC/project/gpic-wt/heldout_loss_run; export PYTHONPATH=$HWT/baselines/PixelGen WT=$HWT OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
@@ -175,3 +197,4 @@ if [ "${EVAL_HELDOUT:-0}" = 1 ]; then   # off by default: one checkpoint keeps 1
     || echo "held-out loss failed (see $OUT/heldout.log)"
 fi
 rm -f "$NPZ"   # 50K x 196 KB; metrics.json and metrics_inception.json keep the result
+if [ $PHASE = score ]; then [ -z "$SHM_DIR" ] || rm -rf -- "$SHM_DIR"; rm -f $OUT/.npz_path $OUT/.shm_dir $OUT/.predict_t; fi
