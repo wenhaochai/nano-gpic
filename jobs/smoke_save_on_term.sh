@@ -24,7 +24,7 @@ run() {   # <tag> <d> <nb> <nt> <steps> <last every> <mb> <fsdp>: one launch of 
   mkdir -p $root/exp_ladder_$size; [ -s $root/exp_ladder_$size/shard_seed.txt ] || echo 20261106 > $root/exp_ladder_$size/shard_seed.txt
   GPIC_MFU_FSDP=$FS GPIC_MFU_FSDP_GROUP=1 GPIC_MFU_FSDP_NOSYNC=1 GPIC_MFU_FUSED_NORM=1 GPIC_MFU_FUSED_QK=1 GPIC_MFU_PATCHIFY=$FS \
   GPIC_MFU_NS_FUSED=1 GPIC_MFU_LOCAL_OPT=$FS GPIC_MFU_MUON_ADD=1 LADDER_WT=$WT LADDER_RUN_ROOT=$root LADDER_LAST_EVERY=$LAST BENCH_OUT=$root/bench_$(date +%s) \
-  bash $WT/jobs/train_ladder.sh $size $d $nb $nt $S \
+  exec bash $WT/jobs/train_ladder.sh $size $d $nb $nt $S \
     --config configs_h100/muon_ladder.yaml --model.optimizer.init_args.lr 0.00064 --model.optimizer.init_args.muon_lr 1.36e-2 \
     --model.optimizer.init_args.weight_decay 0 --model.optimizer.init_args.muon_weight_decay 0.002752 \
     --model.lr_scheduler.init_args.num_warmup_steps $((S / 100)) --model.lr_scheduler.init_args.num_cooldown_steps $(( (S / 5) / 32 * 32 )) \
