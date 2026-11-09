@@ -23,7 +23,10 @@ class CheckpointHook(ModelCheckpoint):
     not keep its last saved step in the callback state, and with accumulation > 1 the first micro-batch ends with
     global_step unchanged, so it wrote that step again, in the middle of an accumulation window: last.ckpt once more
     at every resume, and ms-step=<step>-v1.ckpt, a copy of the ms file, when the ms interval had changed (width 1792,
-    2 micro-batches a step: 3 copies of 13.4 GiB in muon_full, which stopped two held-out jobs; 2026-11-09)."""
+    2 micro-batches a step: 3 copies of 13.4 GiB in muon_full, which stopped two held-out jobs; 2026-11-09).
+
+    Rank 0 prints one line per save, "[ckpt] step <s> (<n> micro-batches): <file>": n = s x accumulation at the end
+    of a window."""
 
     _current_target = None   # path of the checkpoint being written by any CheckpointHook
 
@@ -49,6 +52,9 @@ class CheckpointHook(ModelCheckpoint):
             super()._save_checkpoint(trainer, filepath)
         finally:
             CheckpointHook._current_target = None
+        if trainer.is_global_zero:   # one line per save: a save in the middle of an accumulation window shows in the log
+            done = trainer.fit_loop.epoch_loop.batch_progress.total.processed
+            print(f"[ckpt] step {trainer.global_step} ({done} micro-batches): {os.path.basename(filepath)}", flush=True)
 
     def on_save_checkpoint(
         self,
