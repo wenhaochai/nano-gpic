@@ -556,6 +556,8 @@ def run_task(spec, weights, data, a, device):
     prefixes = dict(WEIGHTS)
     nets = {w: build_denoiser(kw, ck["state_dict"], prefixes[w], device) for w in weights}
     del ck
+    if os.environ.get("GPIC_HELDOUT_COMPILE") == "1":   # gpic-28 2026-11-09 (optimization scan, probe only): the denoiser compiled
+        nets = {w: torch.compile(n) for w, n in nets.items()}
     tr = make_trainer(loss)
     ts = levels(loss["P_mean"], loss["P_std"], loss["timeshift"])
     load_s = time.time() - t0
