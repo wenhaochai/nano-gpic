@@ -57,7 +57,9 @@ class SaveImagesHook(Callback):
         if self.save_compressed and len(self.samples) > 0:
             samples = numpy.concatenate(self.samples)
             if os.environ.get("GPIC_EVAL_SAMPLES_NPY") == "1":   # gpic-28 2026-11-09: no zip CRC pass; the scorers map their own slice
-                numpy.save(f'{self.target_dir}/output.npy', samples)
+                # contiguous first: the gathered batches are permute(0, 2, 3, 1) views and np.concatenate keeps their stride order;
+                # np.save then writes a non-contiguous array element by element (array.tofile: 3-4 min for 50K samples, run6/run7 smokes)
+                numpy.save(f'{self.target_dir}/output.npy', numpy.ascontiguousarray(samples))
             else:
                 numpy.savez(f'{self.target_dir}/output.npz', arr_0=samples)
         self.executor_pool.shutdown(wait=True)
