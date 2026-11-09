@@ -141,7 +141,7 @@ WANDB_MODE=disabled python main.py predict --config configs_h100/lite_ladder_sam
   --trainer.default_root_dir "$PRED_ROOT" --ckpt_path "$CKPT" --model.diffusion_sampler.init_args.num_steps $CALLS \
   --model.denoiser.init_args.hidden_size $WD --model.denoiser.init_args.num_groups $((WD / 64)) \
   --model.denoiser.init_args.num_blocks $NB --model.denoiser.init_args.num_text_blocks $NT --model.denoiser.init_args.gm_k $K "${SPREAD_ARGS[@]}" \
-  --data.pred_dataset.init_args.noise_per_prompt $NPP "${LIMIT[@]}" > $OUT/predict.log 2>&1
+  --data.pred_dataset.init_args.noise_per_prompt $NPP "${LIMIT[@]}" ${EVAL_PRED_BATCH:+--data.pred_batch_size $EVAL_PRED_BATCH} > $OUT/predict.log 2>&1
 t1=$(date +%s)
 NPZ=$(find "$PRED_ROOT" -name "output.np[yz]" | head -1)
 [ -n "$NPZ" ] || { echo "no output.npy or output.npz"; exit 4; }

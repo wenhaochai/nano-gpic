@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--save-features", default=None, help="rank 0 also saves the features, in image order, as a .npy")
+    ap.add_argument("--gpu-resize", action="store_true", help="the transform on the GPU, bit for bit (tools/dino_gpu_resize.py); 256x256 samples")
     a = ap.parse_args()
     from gpic_eval.backends.dino import build_dinov2, extract_features_from_npz, _dino_transform
     dist.init_process_group("nccl")
@@ -46,9 +47,20 @@ def main():
     arr = np.load(a.samples, mmap_mode="r") if a.samples.endswith(".npy") else np.load(a.samples)["arr_0"]
     n = arr.shape[0]
     lo, hi = rank * n // world, (rank + 1) * n // world
-    loader = DataLoader(Slice(arr, lo, hi, _dino_transform), batch_size=a.batch, num_workers=a.workers)
     model = build_dinov2(dev)
-    feats = extract_features_from_npz(loader, model, dev)
+    if a.gpu_resize:   # the same batches as the CPU path, the transform as an exact GPU copy (gpic-28 2026-11-09)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from dino_gpu_resize import preprocess
+        assert arr.shape[1:] == (256, 256, 3), arr.shape
+        loader = DataLoader(Slice(arr, lo, hi, torch.from_numpy), batch_size=a.batch, num_workers=min(a.workers, 4), pin_memory=True)
+        out = []
+        with torch.no_grad():
+            for b in loader:
+                out.append(model(preprocess(b.to(dev, non_blocking=True))).cpu().numpy())
+        feats = np.concatenate(out, axis=0)
+    else:
+        loader = DataLoader(Slice(arr, lo, hi, _dino_transform), batch_size=a.batch, num_workers=a.workers)
+        feats = extract_features_from_npz(loader, model, dev)
     t_feat = time.time() - t0
     obj = [None] * world
     dist.all_gather_object(obj, (lo, np.asarray(feats, dtype=np.float32)))
