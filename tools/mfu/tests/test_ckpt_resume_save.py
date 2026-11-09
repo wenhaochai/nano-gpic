@@ -9,10 +9,12 @@ Launch 1 trains 8 steps (ms every 2, last every 1). Then:
   same     a resume with the intervals unchanged, 2 micro-batches a step
   branch   a new run directory that holds only a copy of the parent's last.ckpt, 2 micro-batches a step
   moved    a run that the old code left with a live last-v1.ckpt beside a stale last.ckpt, continued by the new code
-In every new case: no save at the step the launch resumed from, every save at the end of an accumulation window, no
--vN file written, last.ckpt = the newest last*.ckpt = the full state of the last step, ms files model only.
+In every new case: no save at the step the launch resumed from, every save at the end of an accumulation window (the
+micro-batches of the whole run = steps x accumulation, across the resume too), no -vN file written, last.ckpt = the
+newest last*.ckpt = the full state of the last step, ms files model only. In every case, old code too: the hook's
+"[ckpt] step <s> (<n> micro-batches): <file>" lines are the saves, one each, in order.
 usage: python test_ckpt_resume_save.py <scratch dir>"""
-import glob, json, os, shutil, sys, tempfile
+import contextlib, glob, io, json, os, re, shutil, sys, tempfile
 import torch, lightning.pytorch as pl
 from lightning.pytorch.callbacks.model_checkpoint import ModelCheckpoint
 
@@ -31,8 +33,9 @@ SAVES = []
 _save, _start = CheckpointHook._save_checkpoint, CheckpointHook.on_train_start
 
 
-def _logged(self, trainer, filepath):   # (file, step, micro-batches done): the class keeps its name, so its state key too
-    SAVES.append((os.path.basename(filepath), trainer.global_step, trainer.fit_loop.epoch_loop.batch_progress.current.processed))
+def _logged(self, trainer, filepath):   # (file, step, micro-batches of this epoch, of the run): the class keeps its name, so its state key too
+    bp = trainer.fit_loop.epoch_loop.batch_progress
+    SAVES.append((os.path.basename(filepath), trainer.global_step, bp.current.processed, bp.total.processed))
     _save(self, trainer, filepath)
 
 
@@ -70,7 +73,12 @@ def launch(root, steps, ms, last, acc, old=False):
     del SAVES[:]
     t = pl.Trainer(max_steps=steps, callbacks=[CheckpointHook(**a[0]), CheckpointHook(**a[1])], default_root_dir=root, logger=False,
                    enable_progress_bar=False, enable_model_summary=False, accelerator="cpu", devices=1, accumulate_grad_batches=acc)
-    t.fit(M(), torch.utils.data.DataLoader(DS(), batch_size=2), ckpt_path=newest(root))
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        t.fit(M(), torch.utils.data.DataLoader(DS(), batch_size=2), ckpt_path=newest(root))
+    lines = [(m[3], int(m[1]), int(m[2])) for m in re.finditer(r"^\[ckpt\] step (\d+) \((\d+) micro-batches\): (\S+)$", out.getvalue(), re.M)]
+    assert lines == [(s[0], s[1], s[3]) for s in SAVES], (lines, SAVES)
+    assert old or all(s[3] == acc * s[1] for s in SAVES), SAVES
     return [s[:2] for s in SAVES], [s for s in SAVES if s[2] % acc]
 
 
@@ -104,6 +112,7 @@ try:
     root = first(top, "old", 2)
     saves, mid = launch(root, 16, 4, 2, 2, old=True)
     assert saves[:2] == [("ms-step=000008-v1.ckpt", 8), ("last-v1.ckpt", 8)] and len(mid) == 2 and mid[0][1] == mid[1][1] == 8, (saves, mid)
+    assert mid[0][3] == mid[1][3] == 17, mid   # the log line of the fault: "[ckpt] step 8 (17 micro-batches)"
     assert torch.load(f"{root}/last.ckpt", map_location="cpu", weights_only=False)["global_step"] == 8   # the stale file
     print(f"ok  old code, extension, 2 micro-batches a step: the fault ({saves[0][0]} and {saves[1][0]} at step 8, written after micro-batch {mid[0][2] % 2} of the 2 of step 9)")
 
