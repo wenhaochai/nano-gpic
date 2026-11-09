@@ -23,7 +23,9 @@ MAP=(prod:main ar:ar dist-step:dist-step energy-head:energy-head eval-par:eval-p
      ladder-noema:ladder-noema ladder-datamem:ladder-datamem eval-official:eval-official
      cooldown:cooldown ladder-full:ladder-full gmflow-b2:gmflow-b2 ladder-pns-fp8:ladder-pns-fp8
      ladder-sweep-fp8-cap:ladder-sweep-fp8-cap fp8-branch:fp8-branch sweep-noema-sched:sweep-noema-sched heldout-release:heldout-release
-     bucket-sub:bucket-sub resume-roundtrip:resume-roundtrip)   # 2026-11-08: the code of every run the page records
+     bucket-sub:bucket-sub resume-roundtrip:resume-roundtrip
+     eval-official-run9:eval-official-run9 heldout-loss-compiled:heldout-loss-compiled mfu-probe-small:mfu-probe-small
+     mfu-probe-prof:mfu-probe-prof eval-probe:eval-probe heldout-probe:heldout-probe)   # 2026-11-08: the code of every run the page records; 2026-11-09 (gpic-28): the deployed eval (run9), the compiled held-out tool, the optimization scan's probes
 git -C $SRC fetch -q origin
 RD=$(git -C $SRC log -1 --format=%cs origin/prod -- README.md)
 [ "$RD" = "$(date +%F)" ] || { echo "README.md on prod was last rewritten on $RD: rewrite it (the ladder, the goals, what works, figures) first"; exit 1; }
