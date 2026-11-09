@@ -821,3 +821,9 @@ SDPA's fp32 math backend, the same batches, t and noise): loss differs by 2.5e-6
   FD, branch noise 0.15%): the +9.9% of the check is not FP8 precision. Candidates: the FP8 arm's resume at 11900, or run-to-run
   variance of independent runs. A fresh optimizer at 10200 costs FD 847.5 against the uninterrupted 802.7, so a resume test (w2322:
   the optimizer state after restore against the checkpoint's) is running.
+- Resume and replicates (w2322-w2328): a resume restores the whole optimizer state (per-group sums of squares after restore equal
+  the checkpoint's to 10 digits). Full d16 runs at C0, FD / FID / held-out: bf16 802.7 / 55.77 / 0.06721; bf16 with another data
+  order and seed 806.2 / 53.18 / 0.06717; FP8 with those seeds, in one piece, 813.1 / 54.39 / 0.06721; the first FP8 run 882.6 /
+  63.04 / 0.06728. FP8 lands within about 1% FD and 0.06% held-out of bf16; the first FP8 run is an outlier whose only distinct
+  event is its resume in the cooldown (FP8 was on after it and the optimizer state exact); cause not established. FP8 makes a d16
+  step about 10% faster (d18 9%, d14 4.4%).
