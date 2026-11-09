@@ -130,17 +130,26 @@ PY
   echo "{\"predict_s\": $((t1-t0))}" | tee $OUT/phase_times.json
   exit 0
 fi
-python -m torch.distributed.run --standalone --nproc_per_node ${EVAL_DEVICES:-8} $WT/tools/fast_eval.py "$NPZ" \
-  $WC/data/gpic/reference_stats/test_stats.npz $OUT/metrics.json --workers 11 > $OUT/eval.log 2>&1
+# the official evaluation's Inception metrics (FD, PRDC, MMD) on the same samples, before they are deleted (owner 2026-11-07: record every
+# metric the official evaluation gives); a failure here leaves the DINOv2 result in place and says so. It runs beside the DINOv2
+# evaluation, on the last visible GPU with TF's memory growth on, so no GPU waits on the one-GPU Inception pass (genmodel 2026-11-08
+# night; owner: 「一定要处理空闲」, 「空闲gpu会有非常严重的后果」); the samples and both metric files are the same as before.
+IG=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}; IG=${IG##*,}
+( XDG_CACHE_HOME=$WC/cache/gpic_eval_xdg TF_FORCE_GPU_ALLOW_GROWTH=true CUDA_VISIBLE_DEVICES=$IG $WC/envs/gpic-eval-tf/bin/python $WT/tools/official_inception.py \
+    "$NPZ" $WC/data/gpic/reference_stats/test_stats.npz $OUT/metrics_inception.json > $OUT/inception.log 2>&1 \
+    || echo "inception metrics failed (see $OUT/inception.log)"
+  date +%s > $OUT/.inception_end ) &
+IPID=$!
+if ! python -m torch.distributed.run --standalone --nproc_per_node ${EVAL_DEVICES:-8} $WT/tools/fast_eval.py "$NPZ" \
+  $WC/data/gpic/reference_stats/test_stats.npz $OUT/metrics.json --workers 11 > $OUT/eval.log 2>&1; then
+  kill $IPID 2>/dev/null || true; wait $IPID 2>/dev/null || true; exit 1
+fi
 t2=$(date +%s)
 echo "{\"predict_s\": $((t1-t0)), \"eval_s\": $((t2-t1))}" | tee $OUT/phase_times.json
 cat $OUT/metrics.json
-# the official evaluation's Inception metrics (FD, PRDC, MMD) on the same samples, before they are deleted (owner 2026-11-07: record every
-# metric the official evaluation gives); a failure here leaves the DINOv2 result in place and says so
-XDG_CACHE_HOME=$WC/cache/gpic_eval_xdg CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES%%,*} $WC/envs/gpic-eval-tf/bin/python $WT/tools/official_inception.py \
-  "$NPZ" $WC/data/gpic/reference_stats/test_stats.npz $OUT/metrics_inception.json > $OUT/inception.log 2>&1 \
-  || echo "inception metrics failed (see $OUT/inception.log)"
-t3=$(date +%s); echo "{\"predict_s\": $((t1-t0)), \"eval_s\": $((t2-t1)), \"inception_s\": $((t3-t2))}" > $OUT/phase_times.json
+wait $IPID || true
+t3=$(cat $OUT/.inception_end 2>/dev/null || date +%s); rm -f $OUT/.inception_end
+echo "{\"predict_s\": $((t1-t0)), \"eval_s\": $((t2-t1)), \"inception_s\": $((t3-t1)), \"inception_beside_eval\": 1}" > $OUT/phase_times.json
 # held-out loss (EMA and raw) of the evaluated checkpoint, once per checkpoint (tools/heldout_loss.py skips what is done)
 if [ "${EVAL_HELDOUT:-0}" = 1 ]; then   # off by default: one checkpoint keeps 1 of 8 GPUs busy; batched held-out jobs (heldout_backfill.sh) run 8 checkpoints side by side
   ( HWT=$WC/project/gpic-wt/heldout_loss_run; export PYTHONPATH=$HWT/baselines/PixelGen WT=$HWT OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
