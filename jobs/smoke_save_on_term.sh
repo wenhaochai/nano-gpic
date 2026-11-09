@@ -11,7 +11,7 @@
 # code noema_cap_run 8e1b9ef + src/callbacks/save_on_term.py + data workers that ignore TERM. Per case, the sweep's training path
 # (train_sweep_noema_cap_nccl.sh's settings, W&B on) runs under `timeout --kill-after=300 <T>s` as fetch_pending runs a wq guest
 # (TERM to the whole process group at T, KILL 300 s later), then again without a limit: it must resume from the step the cut
-# saved and finish. Cases: d9 (DDP, 4096 steps, scheduled last.ckpt every 1024) and d16 (FSDP2, 1024 steps, every 256).
+# saved and finish. Cases: d9 (DDP, 4096 steps, scheduled last.ckpt every 512) and d16 (FSDP2, 1024 steps, every 128).
 # Checks: rc 124 and an exit within the grace, one save step for all ranks, the resume's step, the steps and losses after it.
 set -o pipefail
 WC=/scratch/gpfs/GROUP/USER
@@ -45,8 +45,8 @@ case_() {   # <tag> <cut after s> <d> <nb> <nt> <steps> <last every> <mb> <fsdp>
   echo "$tag launch 2: rc $?; $(grep -a -h 'resuming from' $OUT/$tag.2.log | head -1)"
   grep -a -h "checkpoint step" $OUT/$tag/exp_ladder_d$1/launches.txt | tail -2 | sed "s/^/$tag launches: /"
 }
-case_ d9 240 640 9 2 4096 1024 128 0
-case_ d16 330 1536 16 4 1024 256 128 1
+case_ d9 240 640 9 2 4096 512 128 0     # last every 512: not max_steps/4 (the ms hook's interval; two equal hooks stop Lightning)
+case_ d16 330 1536 16 4 1024 128 128 1
 source $WC/envs/pixgen/bin/activate
 python - $OUT <<'PY'
 import glob, json, math, os, sys
