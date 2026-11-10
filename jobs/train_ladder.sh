@@ -20,7 +20,15 @@
 # Env (smoke tests only): LADDER_WT (code worktree), LADDER_RUN_ROOT (run root), BENCH_OUT (adds the step timer),
 # LADDER_PARTIAL_OK (a launch stopped early by --trainer.max_steps counts as done). LADDER_LAST_EVERY: the steps between
 # two last.ckpt saves (default max_steps/32; jobs/train_full.sh).
+# Launch levers (gpic-28 2026-11-09, logs/mfu_infra_scan_1109b.yaml item 6): the same training, less time before the first
+# step (128 s a launch at width 1536, 2.8% of the project's GPU-h in 233 launches over 48 h). Each has its own switch, on by
+# default; 0 turns one off. jobs/smoke_launch.sh compares both settings.
+#  GPIC_LAUNCH_GATE_BG        A1: the GPU health gate runs beside main.py's start; fit waits for its verdict (main.py before_fit)
+#  GPIC_LAUNCH_VEC_ISA_MEMO   E: the compiler's CPU vector-set check is answered from a file (src/utils/patch_bugs.py)
+#  GPIC_LAUNCH_OMP            F: every rank starts with the thread count Lightning sets at fit (CPUs / ranks), not with all CPUs
+# GPIC_LAUNCH_FP=1 (tests): src/callbacks/launch_fingerprint.py prints each rank's state at the first step.
 set -o pipefail
+export GPIC_LAUNCH_T0=$(date +%s.%N)
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 SIZE=$1 D=$2 NB=$3 NT=$4 STEPS=$5; shift 5
 WT=${LADDER_WT:-$WC/project/gpic-wt/ladder_full_run}
@@ -31,8 +39,21 @@ MS=$((STEPS / 4)); LAST=${LADDER_LAST_EVERY:-$((STEPS / 32))}   # jobs/train_ful
 [ "$LAST" -gt 0 ] 2>/dev/null || { echo "bad LADDER_LAST_EVERY $LAST"; exit 2; }
 mkdir -p $RUN
 echo "$(date -u +%FT%TZ) $(git -C $WT rev-parse HEAD) size=$SIZE d=$D nb=$NB nt=$NT max_steps=$STEPS ms_every=$MS last_every=$LAST host=$(hostname) job=$JOBID" >> $RUN/launches.txt
-# GPU health gate: a throttled GPU slows the whole run; exit 98 = requeue elsewhere
-python $WT/tools/gpu_health.py > $RUN/gpu_health_$(date +%s).txt 2>&1 || { tail -3 $(ls -t $RUN/gpu_health_*.txt | head -1); echo "unhealthy GPU on $(hostname); exit 98"; exit 98; }
+# GPU health gate: a throttled GPU slows the whole run; exit 98 = requeue elsewhere.
+# Launch lever A1: the gate in the background, its exit status in a file; main.py starts at once (its first 30 s use no GPU),
+# waits for the status before its first CUDA call and exits 98 without a pass. The gate stays in this shell's process group,
+# so a cut (TERM to the group) ends it too. Only with a main.py that knows the file.
+GATE=$RUN/gpu_health_$(date +%s).txt
+GATE_BG=0
+[ "${GPIC_LAUNCH_GATE_BG:-1}" = 1 ] && grep -q GPIC_GATE_RC $WT/baselines/PixelGen/main.py && GATE_BG=1
+if [ $GATE_BG = 1 ]; then
+  export GPIC_GATE_RC=${TMPDIR:-/tmp}/gpu_gate_$$.rc; rm -f $GPIC_GATE_RC
+  ( python $WT/tools/gpu_health.py > $GATE 2>&1; echo $? > $GPIC_GATE_RC.tmp; mv $GPIC_GATE_RC.tmp $GPIC_GATE_RC ) &
+  export GPIC_GATE_PID=$!
+else
+  unset GPIC_GATE_RC GPIC_GATE_PID
+  python $WT/tools/gpu_health.py > $GATE 2>&1 || { tail -3 $GATE; echo "unhealthy GPU on $(hostname); exit 98"; exit 98; }
+fi
 CKPT_ARGS=()
 LASTCK=$(ls -t $RUN/last*.ckpt 2>/dev/null | head -1)
 if [ -n "$LASTCK" ]; then CKPT_ARGS=(--ckpt_path "$LASTCK"); echo "resuming from $LASTCK"; fi
@@ -68,6 +89,8 @@ done
 echo "$(date -u +%FT%TZ) shard seed $GPIC_SHARD_SEED, shard log kept up to $KEEP_T (checkpoint step $CK_STEP): $(cat $RUN/shards_started_rank*.txt 2>/dev/null | wc -l) lines" >> $RUN/launches.txt
 BENCH_CB=""
 if [ -n "${BENCH_OUT:-}" ]; then BENCH_CB=',{"class_path":"src.callbacks.bench.BenchTimer"}'; fi
+# tests only, the last callback: it prints the state the first step starts from and changes nothing
+if [ "${GPIC_LAUNCH_FP:-0}" = 1 ]; then BENCH_CB=$BENCH_CB',{"class_path":"src.callbacks.launch_fingerprint.LaunchFingerprint"}'; fi
 # the ms hook first: a kill between the two saves must not leave last.ckpt ahead of a missing ms file (review N1);
 # the last hook without a version counter: last.ckpt is always the live state, also in a branch or an extension
 # (src/callbacks/model_checkpoint.py); the ms hook keeps its counter, so no ms file is ever written over
@@ -112,13 +135,43 @@ echo "$(date -u +%FT%TZ) MFU levers: attn=$GPIC_MFU_ATTN fsdp=$GPIC_MFU_FSDP gpu
 # at once, its EXIT trap (env.sh) removed TMPDIR, and every rank's pin-memory thread failed on the DataLoader's sockets in it
 # before any save (smoke w2409); timeout also saw its child gone and freed the GPUs while main.py still ran.
 trap 'echo "$(date -u +%FT%TZ) train_ladder.sh: TERM; main.py saves and stops"' TERM
-python main.py fit --config configs_h100/lite_ladder.yaml --trainer.default_root_dir $ROOT \
+# Launch lever E: a True answer of the vector-set check is kept here, one empty file per compiler, flags, torch build and CPU
+if [ "${GPIC_LAUNCH_VEC_ISA_MEMO:-1}" = 1 ]; then export GPIC_VEC_ISA_MEMO=${GPIC_VEC_ISA_MEMO:-$WC/cache/inductor/vec_isa_memo}; else unset GPIC_VEC_ISA_MEMO; fi
+# Launch lever F: Lightning gives every rank CPUs / ranks threads when fit starts (_set_num_threads_if_needed), but until then
+# each rank builds the model with one thread per CPU, 7 x 96 threads on 96 CPUs while ranks 1-7 start (their model
+# construction took 17.8 s against 11.0 s for rank 0 alone, w2441). The same count from the start; a count set by the caller stays.
+OMP_ENV=()
+if [ "${GPIC_LAUNCH_OMP:-1}" = 1 ] && [ -z "${OMP_NUM_THREADS:-}" ]; then
+  NDEV=8 prev=""   # configs_h100/lite_ladder.yaml: devices '8'
+  for a in "$@"; do
+    [ "$prev" = --trainer.devices ] && NDEV=$a
+    case $a in --trainer.devices=*) NDEV=${a#*=} ;; esac
+    prev=$a
+  done
+  if [ "$NDEV" -gt 0 ] 2> /dev/null; then
+    NTHR=$(( $(nproc) / NDEV )); [ $NTHR -ge 1 ] || NTHR=1
+    OMP_ENV=(env OMP_NUM_THREADS=$NTHR)
+  fi
+fi
+echo "$(date -u +%FT%TZ) launch levers: gate_bg=$GATE_BG vec_isa_memo=${GPIC_VEC_ISA_MEMO:-off} omp=${OMP_ENV[1]:-off}" >> $RUN/launches.txt
+"${OMP_ENV[@]}" python main.py fit --config configs_h100/lite_ladder.yaml --trainer.default_root_dir $ROOT \
   --trainer.max_steps $STEPS --trainer.callbacks "$CB" \
   --model.denoiser.init_args.hidden_size $D --model.denoiser.init_args.num_groups $((D / 64)) \
   --model.denoiser.init_args.num_blocks $NB --model.denoiser.init_args.num_text_blocks $NT \
   --tags.exp ladder_$SIZE --trainer.logger.init_args.name ladder_$SIZE --trainer.logger.init_args.id ladder-$SIZE \
   "${MFU_ARGS[@]}" "$@" "${CKPT_ARGS[@]}"
 rc=$?
+if [ $GATE_BG = 1 ]; then
+  if [ ! -e $GPIC_GATE_RC ]; then   # main.py ended before the verdict: stop the gate and its per-GPU workers
+    GATE_PY=$(pgrep -P $GPIC_GATE_PID | paste -sd,)
+    GATE_WK=$([ -n "$GATE_PY" ] && pgrep -P $GATE_PY | paste -sd' ')
+    pkill -P $GPIC_GATE_PID 2> /dev/null
+    [ -n "$GATE_WK" ] && kill $GATE_WK 2> /dev/null
+  fi
+  wait $GPIC_GATE_PID 2> /dev/null
+  rm -f $GPIC_GATE_RC $GPIC_GATE_RC.tmp
+  if [ $rc -eq 98 ]; then tail -3 $GATE; echo "unhealthy GPU on $(hostname); exit 98"; exit 98; fi
+fi
 # Lightning turns a SIGTERM that reaches only the ranks into exit 0: done means the final ms checkpoint exists (review S1)
 if [ $rc -eq 0 ] && [ -z "${LADDER_PARTIAL_OK:-}" ] && ! ls $RUN/ms-step=$(printf %06d $STEPS)*.ckpt > /dev/null 2>&1; then
   echo "main.py exit 0 before max_steps $STEPS"; rc=99
