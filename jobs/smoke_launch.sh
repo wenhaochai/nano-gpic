@@ -15,8 +15,11 @@
 #          on with the memo filled, off. 384 steps each: the levers set each rank's thread count before fit, where
 #          Lightning sets it, and the gate runs beside the start, so the step time is part of the test.
 #  d1536   width 1536 (FSDP2): off, on, off. 128 steps each, and last.ckpt at step 128.
-#  d1536r  a resume at width 1536 from the first d1536 arm's last.ckpt, in that run directory (no new last.ckpt, so all
-#          three start from the same file): off, on, off, to step 256.
+#  d1536r  a resume at width 1536 from the first d1536 arm's last.ckpt: off, on, off, to step 256. Each arm has its own
+#          run directory with a hard link to that file and a copy of the seed and shard logs: a launch that reaches its
+#          last step writes last.ckpt (the writer renames a new file into place, so the parent's file stays). In w2486
+#          the three arms shared the parent's directory, the first one wrote last.ckpt at step 256 and the other two had
+#          nothing left to train: that smoke's resume group gave no result.
 # src/callbacks/launch_fingerprint.py prints the state every rank starts its first step from (weights, EMA slot,
 # optimizer, scheduler, random streams, first batches) and the times, also of the EMA slot's second copy in
 # configure_model (4.2 s at width 1536 in the w2441 profile; no lever yet); tools/mfu/check_launch.py compares them.
@@ -27,12 +30,14 @@
 # levers are on in every arm (they passed the plan above), the base arms differ from the test arm only in B and G1: at
 # each of the three settings base, test, base (9 launches, about 27 min). The first arm fills the memo. The base arms
 # time the copy that G1 leaves out (copy s in the report), so each lever's part of the gain can be read.
-# usage: smoke_launch.sh [worktree under gpic-wt, default launch2_cap_run] [levers | ranks, default levers]
+# Plan "resume": only the resume group of the plan "levers" (w2486 gave the two fresh groups): a parent launch to step
+# 128 with the levers on (it fills the memo; no arm), then off, on, off from its last.ckpt. 4 launches, about 13 min.
+# usage: smoke_launch.sh [worktree under gpic-wt, default launch2_cap_run] [levers | ranks | resume, default levers]
 set -o pipefail
 WC=/scratch/gpfs/GROUP/USER
 WT=$WC/project/gpic-wt/${1:-launch2_cap_run}
 PLAN=${2:-levers}
-case $PLAN in levers|ranks) ;; *) echo "plan must be levers or ranks"; exit 2 ;; esac
+case $PLAN in levers|ranks|resume) ;; *) echo "plan must be levers, ranks or resume"; exit 2 ;; esac
 [ -e "$WT/.git" ] || { echo "no worktree $WT"; exit 2; }
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }
 echo "code $(basename $WT) $(git -C $WT rev-parse --short HEAD) on $(hostname); plan $PLAN; OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset} nproc=$(nproc)"
@@ -62,6 +67,7 @@ run() {   # <arm> <run tag> <lever> <d> <nb> <nt> <mb> <fsdp> <max steps> <last 
     --trainer.max_steps $S
 }
 RANKS=0 ROLE="" GAIN=""   # set before a launch of the plan "ranks": lever B, base or test arm, the seconds the test arm must gain
+PARENT=""                 # 1: a launch that only makes a checkpoint (no line in the manifest)
 launch() {   # <arm> <group> <lever> <memo> <start step> <run tag> <launch number in the run directory> <d> <nb> <nt> <mb> <fsdp> <max steps> <last every>
   local arm=$1 group=$2 lever=$3 memo=$4 step=$5 tag=$6 n=$7; shift 7
   local t0=$(date +%s)
@@ -72,10 +78,17 @@ launch() {   # <arm> <group> <lever> <memo> <start step> <run tag> <launch numbe
   local rc=$? wall=$(( $(date +%s) - t0 ))
   echo "$arm: rc $rc in $wall s; $(grep -a -h 'resuming from' $OUT/$arm.log | head -1)"
   grep -a -h -o -E '\[gate\] [^[]*|unhealthy GPU.*' $OUT/$arm.log | head -3 | sed "s/^/$arm: /"
-  echo "arm name=$arm group=$group lever=$lever memo=$memo step=$step log=$OUT/$arm.log run=$OUT/$tag/exp_ladder_d$1 n=$n bench=$OUT/$arm.bench rc=$rc wall=$wall ranks=$RANKS${ROLE:+ role=$ROLE}${GAIN:+ gain=$GAIN} ema_copy=$([ $RANKS = 1 ] && echo skip || echo keep)" >> $MAN
+  [ -n "$PARENT" ] || echo "arm name=$arm group=$group lever=$lever memo=$memo step=$step log=$OUT/$arm.log run=$OUT/$tag/exp_ladder_d$1 n=$n bench=$OUT/$arm.bench rc=$rc wall=$wall ranks=$RANKS${ROLE:+ role=$ROLE}${GAIN:+ gain=$GAIN} ema_copy=$([ $RANKS = 1 ] && echo skip || echo keep)" >> $MAN
   [ $rc = 0 ] || FAIL="$FAIL $arm-rc$rc"
 }
 state() { find $1 -maxdepth 1 -name "last*.ckpt" -printf '%f %s %T@ %i\n' | sort; }   # name, size, mtime, inode
+fork_run() {   # <parent run tag> <size> <new run tag>...: run directories that resume from the parent's last.ckpt and leave it as it is
+  local p=$OUT/$1/exp_ladder_$2 size=$2 n t; shift 2
+  for t in "$@"; do
+    n=$OUT/$t/exp_ladder_$size
+    mkdir -p $n && ln $p/last.ckpt $n/last.ckpt && cp $p/shard_seed.txt $p/shards_started_rank*.txt $n/ || FAIL="$FAIL fork-$t"
+  done
+}
 
 if [ $PLAN = levers ]; then
 #      arm         group  lever memo step run tag     n    d  nb nt  mb fs steps last
@@ -90,9 +103,22 @@ launch d1536_off2  d1536  off   off    0  d1536_off2  1 1536 16  4 128  1  128  
 R=$OUT/d1536_off1/exp_ladder_d1536
 state $R > $OUT/parent.before; cat $OUT/parent.before
 [ "$(wc -l < $OUT/parent.before)" = 1 ] || FAIL="$FAIL no-parent-checkpoint"
-launch d1536r_off1 d1536r off   off  128  d1536_off1  2 1536 16  4 128  1  256 4096
-launch d1536r_hit  d1536r on    hit  128  d1536_off1  3 1536 16  4 128  1  256 4096
-launch d1536r_off2 d1536r off   off  128  d1536_off1  4 1536 16  4 128  1  256 4096
+fork_run d1536_off1 d1536 d1536r_off1 d1536r_hit d1536r_off2
+launch d1536r_off1 d1536r off   off  128  d1536r_off1 1 1536 16  4 128  1  256 4096
+launch d1536r_hit  d1536r on    hit  128  d1536r_hit  1 1536 16  4 128  1  256 4096
+launch d1536r_off2 d1536r off   off  128  d1536r_off2 1 1536 16  4 128  1  256 4096
+elif [ $PLAN = resume ]; then
+PARENT=1
+launch d1536_parent -     on    miss   0  d1536_parent 1 1536 16  4 128  1  128  128
+PARENT=""
+echo "memo: $(ls $OUT/vec_isa_memo 2> /dev/null | wc -l) files in $OUT/vec_isa_memo"
+R=$OUT/d1536_parent/exp_ladder_d1536
+state $R > $OUT/parent.before; cat $OUT/parent.before
+[ "$(wc -l < $OUT/parent.before)" = 1 ] || FAIL="$FAIL no-parent-checkpoint"
+fork_run d1536_parent d1536 d1536r_off1 d1536r_hit d1536r_off2
+launch d1536r_off1 d1536r off   off  128  d1536r_off1 1 1536 16  4 128  1  256 4096
+launch d1536r_hit  d1536r on    hit  128  d1536r_hit  1 1536 16  4 128  1  256 4096
+launch d1536r_off2 d1536r off   off  128  d1536r_off2 1 1536 16  4 128  1  256 4096
 else   # plan ranks: lever B against the launch with the first three levers
 b() { RANKS=$1 ROLE=$2 GAIN=$3; }
 #                    arm         group  lever memo step run tag     n    d  nb nt  mb fs steps last
@@ -106,9 +132,10 @@ b 0 base "";  launch d1536_base2 d1536  on    hit    0  d1536_base2 1 1536 16  4
 R=$OUT/d1536_base1/exp_ladder_d1536
 state $R > $OUT/parent.before; cat $OUT/parent.before
 [ "$(wc -l < $OUT/parent.before)" = 1 ] || FAIL="$FAIL no-parent-checkpoint"
-b 0 base "";  launch d1536r_base1 d1536r on   hit  128  d1536_base1 2 1536 16  4 128  1  256 4096
-b 1 test 5;   launch d1536r_b     d1536r on   hit  128  d1536_base1 3 1536 16  4 128  1  256 4096
-b 0 base "";  launch d1536r_base2 d1536r on   hit  128  d1536_base1 4 1536 16  4 128  1  256 4096
+fork_run d1536_base1 d1536 d1536r_base1 d1536r_b d1536r_base2
+b 0 base "";  launch d1536r_base1 d1536r on   hit  128  d1536r_base1 1 1536 16  4 128  1  256 4096
+b 1 test 5;   launch d1536r_b     d1536r on   hit  128  d1536r_b     1 1536 16  4 128  1  256 4096
+b 0 base "";  launch d1536r_base2 d1536r on   hit  128  d1536r_base2 1 1536 16  4 128  1  256 4096
 fi
 state $R > $OUT/parent.after
 cmp -s $OUT/parent.before $OUT/parent.after || { FAIL="$FAIL parent-checkpoint-changed"; cat $OUT/parent.after; }
