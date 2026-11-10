@@ -25,7 +25,9 @@ MAP=(prod:main ar:ar dist-step:dist-step energy-head:energy-head eval-par:eval-p
      ladder-sweep-fp8-cap:ladder-sweep-fp8-cap fp8-branch:fp8-branch sweep-noema-sched:sweep-noema-sched heldout-release:heldout-release
      bucket-sub:bucket-sub resume-roundtrip:resume-roundtrip
      eval-official-run9:eval-official-run9 heldout-loss-compiled:heldout-loss-compiled mfu-probe-small:mfu-probe-small
-     mfu-probe-prof:mfu-probe-prof eval-probe:eval-probe heldout-probe:heldout-probe)   # 2026-11-08: the code of every run the page records; 2026-11-09 (gpic-28): the deployed eval (run9), the compiled held-out tool, the optimization scan's probes
+     mfu-probe-prof:mfu-probe-prof eval-probe:eval-probe heldout-probe:heldout-probe
+     resume-isolate:resume-isolate resume-isolate-r4:resume-isolate-r4 resume-fix-cap:resume-fix-cap
+     ckpt-onelast-cap:ckpt-onelast-cap ckpt-onelast-sched:ckpt-onelast-sched)   # 2026-11-08: the code of every run the page records; 2026-11-09 (gpic-28): the deployed eval (run9), the compiled held-out tool, the optimization scan's probes; 2026-11-09 evening (genmodel): the FP8 resume checks (resume-isolate, resume-isolate-r4), the AR runs (resume-fix-cap) and the queued AR and XLR-1P runs (ckpt-onelast-cap, ckpt-onelast-sched)
 git -C $SRC fetch -q origin
 RD=$(git -C $SRC log -1 --format=%cs origin/prod -- README.md)
 [ "$RD" = "$(date +%F)" ] || { echo "README.md on prod was last rewritten on $RD: rewrite it (the ladder, the goals, what works, figures) first"; exit 1; }
