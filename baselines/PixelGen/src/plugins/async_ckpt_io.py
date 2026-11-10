@@ -73,6 +73,9 @@ def _writer(jobs, acks):
     # training process waits for the writes at exit, and a SIGKILL leftover is removed at the next launch (_clean_tmp)
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # save_checkpoint started this process with both signals blocked (see there): now that they are ignored, a TERM that
+    # came during the start-up is dropped here
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT})
     parent = os.getppid()
     while True:
         try:
@@ -201,7 +204,17 @@ class AsyncShmCheckpointIO(TorchCheckpointIO):
             ctx = mp.get_context("spawn")
             self._jobs, self._acks = ctx.Queue(), ctx.Queue()
             self._proc = ctx.Process(target=_writer, args=(self._jobs, self._acks), daemon=True)
-            self._proc.start()
+            # The writer ignores TERM (review S3), but only from the first line of _writer, and a spawned process needs
+            # seconds until then (a new interpreter that imports torch). A TERM in that time ended the writer with the
+            # first save's writes pending: the cut's own save then failed, rank 0 left with 97 and ranks 1-7 hung on
+            # their GPUs (smoke w2514, 2026-11-10: a cut 6 s after a launch's first save). The new process inherits the
+            # signal mask of the thread that starts it, so it starts with TERM and INT blocked and unblocks them after
+            # it ignores them; this thread's own mask is back at once, and a TERM that comes meanwhile is delivered then.
+            old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+            try:
+                self._proc.start()
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, old)
             if not getattr(self, "_atexit", False):
                 atexit.register(self._teardown_at_exit)
                 self._atexit = True

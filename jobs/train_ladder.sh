@@ -185,6 +185,9 @@ fi
 SKIP_EMA=0
 [ "${GPIC_LAUNCH_SKIP_EMA_COPY:-0}" = 1 ] && [ "${GPIC_MFU_NO_EMA:-0}" = 1 ] && grep -q GPIC_LAUNCH_SKIP_EMA_COPY $WT/baselines/PixelGen/src/lightning_model_gpic.py 2> /dev/null && SKIP_EMA=1
 echo "$(date -u +%FT%TZ) launch levers: gate_bg=$GATE_BG vec_isa_memo=${GPIC_VEC_ISA_MEMO:-off} omp=${OMP_ENV[1]:-off} ranks=$RANKS_BG skip_ema_copy=$SKIP_EMA" >> $RUN/launches.txt
+# Every process of this launch carries this name in its environment (ranks, data workers, the checkpoint writer): a rank
+# that fails must leave none of them behind (below)
+export GPIC_LAUNCH_ID=$$-$(date +%s%N)
 CMD=(python main.py fit --config configs_h100/lite_ladder.yaml --trainer.default_root_dir $ROOT
   --trainer.max_steps $STEPS --trainer.callbacks "$CB"
   --model.denoiser.init_args.hidden_size $D --model.denoiser.init_args.num_groups $((D / 64))
@@ -243,6 +246,31 @@ if [ $GATE_BG = 1 ]; then
   wait $GPIC_GATE_PID 2> /dev/null
   rm -f $GPIC_GATE_RC $GPIC_GATE_RC.tmp
   if [ $rc -eq 98 ]; then tail -3 $GATE; echo "unhealthy GPU on $(hostname); exit 98"; exit 98; fi
+fi
+# A launch that failed leaves no process. Lightning ends ranks 1-7 when rank 0 fails, but not when its own teardown fails
+# too: in w2514 rank 0 left with 97 (the checkpoint writer had died) and ranks 1-7 and their data workers, which ignore TERM,
+# stayed on the GPUs until the pilot's sweep; with lever B the ranks get KILL above, their data workers do not. So after a
+# status other than 0: what still carries this launch's name 5 s later gets KILL.
+launch_left() {
+  python - "$GPIC_LAUNCH_ID" $$ <<'PY'
+import os, sys
+key, skip = ("GPIC_LAUNCH_ID=" + sys.argv[1]).encode(), {int(sys.argv[2]), os.getpid(), os.getppid()}
+for p in os.listdir("/proc"):
+    if p.isdigit() and int(p) not in skip:
+        try:
+            if os.stat(f"/proc/{p}").st_uid == os.getuid() and key in open(f"/proc/{p}/environ", "rb").read().split(b"\0"):
+                print(p)
+        except OSError:   # a process that ended, or another user's
+            pass
+PY
+}
+if [ $rc -ne 0 ]; then
+  LEFT_P=$(launch_left)
+  if [ -n "$LEFT_P" ]; then sleep 5; LEFT_P=$(launch_left); fi
+  if [ -n "$LEFT_P" ]; then
+    echo "train_ladder.sh: the launch ended with $rc and $(echo $LEFT_P | wc -w) of its processes are still there; KILL"
+    kill -KILL $LEFT_P 2> /dev/null
+  fi
 fi
 # Lightning turns a SIGTERM that reaches only the ranks into exit 0: done means the final ms checkpoint exists (review S1)
 if [ $rc -eq 0 ] && [ -z "${LADDER_PARTIAL_OK:-}" ] && ! ls $RUN/ms-step=$(printf %06d $STEPS)*.ckpt > /dev/null 2>&1; then
