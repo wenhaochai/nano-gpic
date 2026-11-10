@@ -6,28 +6,32 @@ no slower afterwards.
 The manifest has one line per launch (arm):
   arm name=<arm> group=<group> lever=off|on memo=off|miss|hit step=<start step> log=<launch log> run=<run directory>
       n=<number of this launch in the run directory> bench=<BENCH_OUT> rc=<exit status> wall=<seconds>
-A group is one setting (width, fresh or resumed) with at least two off arms and one on arm. Read from each launch:
+      [ranks=0|1] [role=base|test] [gain=<seconds>]
+lever: the first three levers (gate beside the start, memo, thread count); ranks: lever B (the script starts every rank).
+A group is one setting (width, fresh or resumed) with at least two base arms and one test arm; without role, an arm
+with lever=off is a base arm and one with lever=on a test arm. Read from each launch:
 the "[launch-fp]" lines of src/callbacks/launch_fingerprint.py (8 ranks), the "[gate]" and "[warmup]" lines,
 the step timer's files, the gate's report and the "launch levers" line of launches.txt.
 
 Checks, FAIL on any:
   every arm      exit 0, one start line and two batch lines per rank, the start step, a healthy gate
   hard fields    step, weights and buffers of the denoiser and of the EMA slot, optimizer and scheduler state, vector
-                 sets: equal per rank between the off arms (else the launcher itself does not repeat and nothing can be
-                 shown) and between each on arm and the off arms
+                 sets: equal per rank between the base arms (else the launcher itself does not repeat and nothing can be
+                 shown) and between each on arm and the base arms
   soft fields    the four random streams, the first two batches, the first two losses, and the thread count and
                  OMP_NUM_THREADS at the first step (Lightning sets both when fit starts, the lever sets them before):
-                 where the off arms agree on every rank, each on arm must agree too; where they differ the field is
+                 where the base arms agree on every rank, each on arm must agree too; where they differ the field is
                  listed as not testable. A loss agrees within 0.1% (two launches from one state may sum on the GPU in
                  another order); a loss that is not equal to the last digit is a note
   levers         the launches.txt line; on arms print the gate's verdict line once; before fit (when the fingerprint's
                  module is imported) every rank of an on arm has the launcher's thread count, and no rank of an off
                  arm has OMP_NUM_THREADS; memo counts (off: none; miss: no error, something stored; hit: no error,
-                 nothing new stored)
+                 nothing new stored); with ranks=1 the 8 rank processes started within 3 s of each other, without it
+                 ranks 1-7 started later than that after rank 0
   gate           an on arm's gate ran beside main.py's start: its slowest GPU is within 7% of its median, and its
-                 median within 3% of the off arms' medians
-  speed          a hit arm reaches the first step at least 5 s before every off arm of its group, a miss arm not after
-                 the slowest off arm; an on arm's median step time (steps from the 17th) is at most 2% over the
+                 median within 3% of the base arms' medians
+  speed          a hit arm reaches the first step at least 5 s (or the manifest's gain) before every base arm of its
+                 group, a miss arm not after the slowest base arm; an on arm's median step time (steps from the 17th) is at most 2% over the
                  slowest off arm's
 The report also gives the seconds and the minor page faults of the EMA slot's second copy (no lever yet).
 usage: check_launch.py <manifest>   (exit 0 = PASS)"""
@@ -47,6 +51,11 @@ STEP_TOL = 1.02
 GATE_MIN = 0.93
 GATE_MED = 0.97
 LOSS_TOL = 1e-3    # relative; other random draws move a rank's loss by percents, another order of a GPU sum by 1e-6
+TOGETHER_S = 3.0   # lever B: the script starts the 8 ranks in one loop; without it rank 0 imports and builds first (6 s and more)
+
+
+def is_base(a):
+    return a.get("role", "base" if a["lever"] == "off" else "test") == "base"
 
 
 def read_arm(a):
@@ -187,6 +196,11 @@ def main(manifest):
         if any(lv.get(k) != v for k, v in want.items()) or (on and (lv.get("vec_isa_memo") in (None, "off") or
                                                                      not lv.get("omp", "").startswith("OMP_NUM_THREADS="))):
             fails.append(f"{nm}: launches.txt has the levers {lv}")
+        if lv.get("ranks", "0") != a.get("ranks", "0"):
+            fails.append(f"{nm}: launches.txt has ranks={lv.get('ranks', '0')}, the manifest {a.get('ranks', '0')}")
+        tp = [t(a, r, "proc") for r in a["start"]]
+        if len(tp) == len(RANKS) and (max(tp) - min(tp) <= TOGETHER_S) != (a.get("ranks", "0") == "1"):
+            fails.append(f"{nm}: the 8 rank processes started {max(tp) - min(tp):.1f} s apart with ranks={a.get('ranks', '0')}")
         if len(a["gate_wait"]) != (1 if on else 0):
             fails.append(f"{nm}: {len(a['gate_wait'])} gate verdict lines for lever {a['lever']}")
         n_thr = lv.get("omp", "").rpartition("=")[2]   # the launcher's count; without one the line above has failed
@@ -215,9 +229,9 @@ def main(manifest):
             fails.append(f"{nm}: the gate's slowest GPU is {min(a['gate_tf']):.0f} of a median {statistics.median(a['gate_tf']):.0f} TFLOP/s")
 
     for g, ga in groups.items():   # on against off
-        offs, ons = [a for a in ga if a["lever"] == "off"], [a for a in ga if a["lever"] == "on"]
+        offs, ons = [a for a in ga if is_base(a)], [a for a in ga if not is_base(a)]
         if len(offs) < 2 or not ons:
-            fails.append(f"{g}: needs two off arms and one on arm")
+            fails.append(f"{g}: needs two base arms and one test arm")
             continue
         offs, ons = [a for a in offs if whole(a)], [a for a in ons if whole(a)]   # the others have failed above
         if len(offs) < 2:
@@ -227,32 +241,32 @@ def main(manifest):
             differ = [r for r in RANKS if not all(same(f, v, vals[r][0]) for v in vals[r])]
             if differ:
                 if f in HARD:
-                    fails.append(f"{g}: the off arms differ in {f} ({ranks(differ)}): the launcher itself does not repeat")
+                    fails.append(f"{g}: the base arms differ in {f} ({ranks(differ)}): the launcher itself does not repeat")
                 else:
-                    notes.append(f"{g}: {f} differs between the off arms ({ranks(differ)}): not testable")
+                    notes.append(f"{g}: {f} differs between the base arms ({ranks(differ)}): not testable")
                 continue
             for a in ons:
                 bad = [r for r in RANKS if not all(same(f, field(a, f, r), v) for v in vals[r])]
                 if bad:
-                    fails.append(f"{a['name']}: {f} differs from the off arms ({ranks(bad)}): "
+                    fails.append(f"{a['name']}: {f} differs from the base arms ({ranks(bad)}): "
                                  f"{field(a, f, bad[0])} against {vals[bad[0]][0]}")
                     continue
                 near = [r for r in RANKS if any(field(a, f, r) != v for v in vals[r])]
                 if near:
-                    notes.append(f"{a['name']}: {f} agrees with the off arms within {LOSS_TOL:g} but not to the last digit ({ranks(near)}): "
+                    notes.append(f"{a['name']}: {f} agrees with the base arms within {LOSS_TOL:g} but not to the last digit ({ranks(near)}): "
                                  f"{field(a, f, near[0])} against {vals[near[0]][0]}")
         t_off, s_off = [first_step(a) for a in offs], [step_ms(a) for a in offs]
         g_off = [statistics.median(a["gate_tf"]) for a in offs if a["gate_tf"]]
         for a in ons:
             tf, sm = first_step(a), step_ms(a)
-            if a["memo"] == "hit" and not tf <= min(t_off) - GAIN_MIN_S:
-                fails.append(f"{a['name']}: first step after {tf:.1f} s, the off arms after {min(t_off):.1f}-{max(t_off):.1f} s")
+            if a["memo"] == "hit" and not tf <= min(t_off) - float(a.get("gain", GAIN_MIN_S)):
+                fails.append(f"{a['name']}: first step after {tf:.1f} s, the base arms after {min(t_off):.1f}-{max(t_off):.1f} s")
             if a["memo"] != "hit" and not tf <= max(t_off):
-                fails.append(f"{a['name']}: first step after {tf:.1f} s, later than the off arms ({max(t_off):.1f} s)")
+                fails.append(f"{a['name']}: first step after {tf:.1f} s, later than the base arms ({max(t_off):.1f} s)")
             if not sm <= STEP_TOL * max(s_off):
-                fails.append(f"{a['name']}: step {sm:.2f} ms, the off arms {min(s_off):.2f}-{max(s_off):.2f} ms")
+                fails.append(f"{a['name']}: step {sm:.2f} ms, the base arms {min(s_off):.2f}-{max(s_off):.2f} ms")
             if a["gate_tf"] and g_off and statistics.median(a["gate_tf"]) < GATE_MED * statistics.median(g_off):
-                fails.append(f"{a['name']}: gate median {statistics.median(a['gate_tf']):.0f} TFLOP/s, the off arms {statistics.median(g_off):.0f}")
+                fails.append(f"{a['name']}: gate median {statistics.median(a['gate_tf']):.0f} TFLOP/s, the base arms {statistics.median(g_off):.0f}")
 
     # the report: seconds from the start of train_ladder.sh, rank 0 unless said
     print(f"{'arm':<13}{'lever':<6}{'memo':<5}{'proc':>6}{'init':>7}{'setup':>7}{'fit':>7}{'train':>7}{'first':>7}{'last rank':>10}"
@@ -272,7 +286,7 @@ def main(manifest):
               f"{(statistics.mean(wait) if wait else float('nan')):>8.2f}{gt:>14}{copy(a, 'copy_s'):>10}{copy(a, 'copy_flt', 1e3):>12}"
               f"  {thr[0]}; {' | '.join(sorted(set(thr[1:])))}, {'|'.join(cpus)}")
     for g, ga in groups.items():
-        offs, ons = [a for a in ga if a["lever"] == "off"], [a for a in ga if a["lever"] == "on"]
+        offs, ons = [a for a in ga if is_base(a)], [a for a in ga if not is_base(a)]
         if not offs:
             continue
         base, sb = statistics.mean(first_step(a) for a in offs), statistics.mean(step_ms(a) for a in offs)

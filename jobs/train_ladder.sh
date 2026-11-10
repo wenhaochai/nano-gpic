@@ -26,6 +26,7 @@
 #  GPIC_LAUNCH_GATE_BG        A1: the GPU health gate runs beside main.py's start; fit waits for its verdict (main.py before_fit)
 #  GPIC_LAUNCH_VEC_ISA_MEMO   E: the compiler's CPU vector-set check is answered from a file (src/utils/patch_bugs.py)
 #  GPIC_LAUNCH_OMP            F: every rank starts with the thread count Lightning sets at fit (CPUs / ranks), not with all CPUs
+#  GPIC_LAUNCH_RANKS          B: this script starts all ranks at once; off by default (1 = on) until jobs/smoke_launch.sh has compared it
 # GPIC_LAUNCH_FP=1 (tests): src/callbacks/launch_fingerprint.py prints each rank's state at the first step.
 set -o pipefail
 export GPIC_LAUNCH_T0=$(date +%s.%N)
@@ -140,27 +141,93 @@ if [ "${GPIC_LAUNCH_VEC_ISA_MEMO:-1}" = 1 ]; then export GPIC_VEC_ISA_MEMO=${GPI
 # Launch lever F: Lightning gives every rank CPUs / ranks threads when fit starts (_set_num_threads_if_needed), but until then
 # each rank builds the model with one thread per CPU, 7 x 96 threads on 96 CPUs while ranks 1-7 start (their model
 # construction took 17.8 s against 11.0 s for rank 0 alone, w2441). The same count from the start; a count set by the caller stays.
+NDEV=8 prev=""   # the number of ranks: configs_h100/lite_ladder.yaml has devices '8'; the caller's --trainer.devices wins
+for a in "$@"; do
+  [ "$prev" = --trainer.devices ] && NDEV=$a
+  case $a in --trainer.devices=*) NDEV=${a#*=} ;; esac
+  prev=$a
+done
+[ "$NDEV" -gt 0 ] 2> /dev/null || NDEV=0   # not a count (auto, a list of GPUs): levers F and B stay off
 OMP_ENV=()
-if [ "${GPIC_LAUNCH_OMP:-1}" = 1 ] && [ -z "${OMP_NUM_THREADS:-}" ]; then
-  NDEV=8 prev=""   # configs_h100/lite_ladder.yaml: devices '8'
-  for a in "$@"; do
-    [ "$prev" = --trainer.devices ] && NDEV=$a
-    case $a in --trainer.devices=*) NDEV=${a#*=} ;; esac
-    prev=$a
-  done
-  if [ "$NDEV" -gt 0 ] 2> /dev/null; then
-    NTHR=$(( $(nproc) / NDEV )); [ $NTHR -ge 1 ] || NTHR=1
-    OMP_ENV=(env OMP_NUM_THREADS=$NTHR)
-  fi
+if [ "${GPIC_LAUNCH_OMP:-1}" = 1 ] && [ -z "${OMP_NUM_THREADS:-}" ] && [ $NDEV -gt 0 ]; then
+  NTHR=$(( $(nproc) / NDEV )); [ $NTHR -ge 1 ] || NTHR=1
+  OMP_ENV=(env OMP_NUM_THREADS=$NTHR)
 fi
-echo "$(date -u +%FT%TZ) launch levers: gate_bg=$GATE_BG vec_isa_memo=${GPIC_VEC_ISA_MEMO:-off} omp=${OMP_ENV[1]:-off}" >> $RUN/launches.txt
-"${OMP_ENV[@]}" python main.py fit --config configs_h100/lite_ladder.yaml --trainer.default_root_dir $ROOT \
-  --trainer.max_steps $STEPS --trainer.callbacks "$CB" \
-  --model.denoiser.init_args.hidden_size $D --model.denoiser.init_args.num_groups $((D / 64)) \
-  --model.denoiser.init_args.num_blocks $NB --model.denoiser.init_args.num_text_blocks $NT \
-  --tags.exp ladder_$SIZE --trainer.logger.init_args.name ladder_$SIZE --trainer.logger.init_args.id ladder-$SIZE \
-  "${MFU_ARGS[@]}" "$@" "${CKPT_ARGS[@]}"
-rc=$?
+# Launch lever B: Lightning's rank 0 imports, builds the model and only then, in fit, starts ranks 1-7 with its own command
+# line; they import and build again while rank 0 waits (27.8 s of the 128 s before the first step at width 1536, w2441).
+# Here this script starts every rank with that command line at once. LOCAL_RANK in the environment tells Lightning that
+# the ranks exist (LightningEnvironment.creates_processes_externally), and MASTER_ADDR, MASTER_PORT, NODE_RANK and WORLD_SIZE
+# are the variables its launcher gives the ranks it starts; rank 0 then runs as ranks 1-7 always did. Lightning's watcher
+# of the ranks (a rank that ends with an error: KILL for all) moves into this script, which also waits for every rank
+# (before: the script ended with rank 0, and the pilot found ranks 1-7 still at their exit in 7% of the launches).
+RANKS_BG=0
+if [ "${GPIC_LAUNCH_RANKS:-0}" = 1 ] && [ $NDEV -gt 1 ]; then
+  # a port that is free now, below the range the system hands out for outgoing connections (32768 and up), and chosen from this
+  # shell's id: rank 0 binds it some 20 s from now, and two launches on one node (4 GPUs each) must not pick the same one
+  RANK_PORT=$(python - $$ <<'PY'
+import socket, sys
+for k in range(200):
+    port = 10000 + (int(sys.argv[1]) * 7919 + k * 101) % 20000
+    with socket.socket() as s:
+        try:
+            s.bind(("", port))   # every interface, as the store of rank 0 binds it
+        except OSError:
+            continue
+    print(port)
+    break
+PY
+)
+  [ -n "$RANK_PORT" ] && RANKS_BG=1   # no free port among 200: Lightning starts the ranks as before
+fi
+echo "$(date -u +%FT%TZ) launch levers: gate_bg=$GATE_BG vec_isa_memo=${GPIC_VEC_ISA_MEMO:-off} omp=${OMP_ENV[1]:-off} ranks=$RANKS_BG" >> $RUN/launches.txt
+CMD=(python main.py fit --config configs_h100/lite_ladder.yaml --trainer.default_root_dir $ROOT
+  --trainer.max_steps $STEPS --trainer.callbacks "$CB"
+  --model.denoiser.init_args.hidden_size $D --model.denoiser.init_args.num_groups $((D / 64))
+  --model.denoiser.init_args.num_blocks $NB --model.denoiser.init_args.num_text_blocks $NT
+  --tags.exp ladder_$SIZE --trainer.logger.init_args.name ladder_$SIZE --trainer.logger.init_args.id ladder-$SIZE
+  "${MFU_ARGS[@]}" "$@" "${CKPT_ARGS[@]}")
+if [ $RANKS_BG = 0 ]; then
+  "${OMP_ENV[@]}" "${CMD[@]}"
+  rc=$?
+else
+  export MASTER_ADDR=127.0.0.1 MASTER_PORT=$RANK_PORT NODE_RANK=0 WORLD_SIZE=$NDEV
+  RPIDS=()
+  for r in $(seq 0 $((NDEV - 1))); do LOCAL_RANK=$r "${OMP_ENV[@]}" "${CMD[@]}" & RPIDS+=($!); done   # rank 0 first: the oldest process
+  LEFT=("${RPIDS[@]}"); rc=0; R0OK=0
+  # Part 1, until rank 0 ends with 0 or a rank fails: wait for the next rank that ends.
+  while [ ${#LEFT[@]} -gt 0 ]; do
+    dp=""; wait -n -p dp "${LEFT[@]}"; st=$?
+    if [ -z "$dp" ]; then   # the TERM trap ended the wait (the ranks save and stop), or a rank ended that wait -n no longer reports
+      for p in "${LEFT[@]}"; do kill -0 $p 2> /dev/null || { dp=$p; wait $p; st=$?; break; }; done
+      [ -n "$dp" ] || continue
+    fi
+    NEW=(); for p in "${LEFT[@]}"; do [ $p = $dp ] || NEW+=($p); done; LEFT=("${NEW[@]}")
+    if [ $st -ne 0 ]; then   # the first rank that fails gives the launch its status
+      rc=$st
+      # 98 is the gate's verdict (main.py before_fit): every rank reads it and ends by itself. After any other failure the
+      # other ranks would wait for this one in a collective: KILL, as Lightning's watcher did
+      if [ $st -ne 98 ] && [ ${#LEFT[@]} -gt 0 ]; then echo "train_ladder.sh: rank $(for i in "${!RPIDS[@]}"; do [ ${RPIDS[$i]} = $dp ] && echo $i; done) ended with $st; KILL for the other ${#LEFT[@]}"; kill -KILL "${LEFT[@]}" 2> /dev/null; fi
+      break
+    elif [ $dp = ${RPIDS[0]} ]; then R0OK=1; break
+    fi
+  done
+  # Part 2: the ranks that are left end by themselves, within GPIC_LAUNCH_RANKS_EXIT_S (120) seconds, or get KILL: no rank keeps
+  # the GPUs. After rank 0 ended with 0 (its saves are done) what a later rank does at its exit does not change the launch.
+  # A look every 0.2 s and no helper process: a helper that must be stopped can be left behind (a TERM between its fork and its
+  # first command is lost; tools/mfu/tests/test_launch_ranks.py found one in 1 of 8 launches).
+  LIMIT=$(( SECONDS + ${GPIC_LAUNCH_RANKS_EXIT_S:-120} ))
+  while [ ${#LEFT[@]} -gt 0 ]; do
+    NEW=()
+    for p in "${LEFT[@]}"; do
+      if kill -0 $p 2> /dev/null; then NEW+=($p)
+      else wait $p; st=$?; [ $st -eq 0 ] || [ $R0OK = 0 ] || echo "train_ladder.sh: a rank ended with $st after rank 0 ended with 0"; fi
+    done
+    LEFT=("${NEW[@]}")
+    [ ${#LEFT[@]} -gt 0 ] || break
+    if [ $SECONDS -ge $LIMIT ]; then echo "train_ladder.sh: ${#LEFT[@]} ranks did not end in ${GPIC_LAUNCH_RANKS_EXIT_S:-120} s; KILL"; kill -KILL "${LEFT[@]}" 2> /dev/null; LIMIT=$(( SECONDS + 3600 )); fi
+    sleep 0.2
+  done
+fi
 if [ $GATE_BG = 1 ]; then
   if [ ! -e $GPIC_GATE_RC ]; then   # main.py ended before the verdict: stop the gate and its per-GPU workers
     GATE_PY=$(pgrep -P $GPIC_GATE_PID | paste -sd,)
