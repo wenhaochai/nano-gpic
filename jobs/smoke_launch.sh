@@ -22,20 +22,26 @@
 # configure_model (4.2 s at width 1536 in the w2441 profile; no lever yet); tools/mfu/check_launch.py compares them.
 # Result: SMOKE_LAUNCH PASS | FAIL <reasons>; the checkpoints are deleted on PASS and kept on FAIL. About 30 min
 # (130 s a width-640 arm, 200 s a width-1536 arm); an arm that would pass the job's hour is not started (FAIL <arm>-no-time).
-# usage: smoke_launch.sh [worktree under gpic-wt, default launch_cap_run]
+# Plan "ranks" (lever B, GPIC_LAUNCH_RANKS=1: the launcher starts every rank at once; the plan above is "levers"): the
+# first three levers are on in every arm (they passed the plan above), the base arms differ from the test arm only in
+# lever B: at each of the three settings base, B, base (9 launches, about 27 min). The first arm fills the memo.
+# usage: smoke_launch.sh [worktree under gpic-wt, default launch2_cap_run] [levers | ranks, default levers]
 set -o pipefail
 WC=/scratch/gpfs/GROUP/USER
-WT=$WC/project/gpic-wt/${1:-launch_cap_run}
+WT=$WC/project/gpic-wt/${1:-launch2_cap_run}
+PLAN=${2:-levers}
+case $PLAN in levers|ranks) ;; *) echo "plan must be levers or ranks"; exit 2 ;; esac
 [ -e "$WT/.git" ] || { echo "no worktree $WT"; exit 2; }
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }
-echo "code $(basename $WT) $(git -C $WT rev-parse --short HEAD) on $(hostname); OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset} nproc=$(nproc)"
+echo "code $(basename $WT) $(git -C $WT rev-parse --short HEAD) on $(hostname); plan $PLAN; OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset} nproc=$(nproc)"
 T_JOB=$(date +%s)
 STAMP=$(date +%m%d_%H%M)
 OUT=$WC/runs/gpic-speed/mfu_probe/launch_$STAMP; mkdir -p $OUT
 MAN=$OUT/manifest.txt; : > $MAN
 FAIL=""
-run() {   # <arm> <run tag> <lever> <d> <nb> <nt> <mb> <fsdp> <max steps> <last every>: one launch of the sweep path
+run() {   # <arm> <run tag> <lever> <d> <nb> <nt> <mb> <fsdp> <max steps> <last every> <ranks>: one launch of the sweep path
   local arm=$1 tag=$2 lever=$3 d=$4 nb=$5 nt=$6 MB=$7 FS=$8 S=$9 LAST=${10} root=$OUT/$2 size=d$4 SCH=4096
+  if [ "${11:-0}" = 1 ]; then export GPIC_LAUNCH_RANKS=1; else unset GPIC_LAUNCH_RANKS; fi
   mkdir -p $root/exp_ladder_$size; [ -s $root/exp_ladder_$size/shard_seed.txt ] || echo 20261106 > $root/exp_ladder_$size/shard_seed.txt
   if [ $lever = off ]; then export GPIC_LAUNCH_GATE_BG=0 GPIC_LAUNCH_VEC_ISA_MEMO=0 GPIC_LAUNCH_OMP=0
   else unset GPIC_LAUNCH_GATE_BG GPIC_LAUNCH_VEC_ISA_MEMO GPIC_LAUNCH_OMP; export GPIC_VEC_ISA_MEMO=$OUT/vec_isa_memo; fi
@@ -53,21 +59,23 @@ run() {   # <arm> <run tag> <lever> <d> <nb> <nt> <mb> <fsdp> <max steps> <last 
     --trainer.logger.init_args.name smoke_launch_$arm --trainer.logger.init_args.id smoke-launch-$arm-$STAMP \
     --trainer.max_steps $S
 }
+RANKS=0 ROLE="" GAIN=""   # set before a launch of the plan "ranks": lever B, base or test arm, the seconds the test arm must gain
 launch() {   # <arm> <group> <lever> <memo> <start step> <run tag> <launch number in the run directory> <d> <nb> <nt> <mb> <fsdp> <max steps> <last every>
   local arm=$1 group=$2 lever=$3 memo=$4 step=$5 tag=$6 n=$7; shift 7
   local t0=$(date +%s)
   local lim=$(( 3240 - (t0 - T_JOB) )); [ $lim -le 900 ] || lim=900   # every arm and the check end inside the job's hour
   if [ $lim -lt 300 ]; then echo "== $arm: not started, $(( t0 - T_JOB )) s of the job's hour are gone"; FAIL="$FAIL $arm-no-time"; return; fi
   echo "== $arm (levers $lever, memo $memo): from step $step to $6 ($(date +%T), limit $lim s)"
-  ( export -f run; export OUT WC WT STAMP; timeout --kill-after=120 ${lim}s bash -c "run $arm $tag $lever $*" ) > $OUT/$arm.log 2>&1
+  ( export -f run; export OUT WC WT STAMP; timeout --kill-after=120 ${lim}s bash -c "run $arm $tag $lever $* $RANKS" ) > $OUT/$arm.log 2>&1
   local rc=$? wall=$(( $(date +%s) - t0 ))
   echo "$arm: rc $rc in $wall s; $(grep -a -h 'resuming from' $OUT/$arm.log | head -1)"
   grep -a -h -o -E '\[gate\] [^[]*|unhealthy GPU.*' $OUT/$arm.log | head -3 | sed "s/^/$arm: /"
-  echo "arm name=$arm group=$group lever=$lever memo=$memo step=$step log=$OUT/$arm.log run=$OUT/$tag/exp_ladder_d$1 n=$n bench=$OUT/$arm.bench rc=$rc wall=$wall" >> $MAN
+  echo "arm name=$arm group=$group lever=$lever memo=$memo step=$step log=$OUT/$arm.log run=$OUT/$tag/exp_ladder_d$1 n=$n bench=$OUT/$arm.bench rc=$rc wall=$wall ranks=$RANKS${ROLE:+ role=$ROLE}${GAIN:+ gain=$GAIN}" >> $MAN
   [ $rc = 0 ] || FAIL="$FAIL $arm-rc$rc"
 }
 state() { find $1 -maxdepth 1 -name "last*.ckpt" -printf '%f %s %T@ %i\n' | sort; }   # name, size, mtime, inode
 
+if [ $PLAN = levers ]; then
 #      arm         group  lever memo step run tag     n    d  nb nt  mb fs steps last
 launch d640_off1   d640   off   off    0  d640_off1   1  640  9  2 128  0  384 4096
 launch d640_miss   d640   on    miss   0  d640_miss   1  640  9  2 128  0  384 4096
@@ -83,6 +91,23 @@ state $R > $OUT/parent.before; cat $OUT/parent.before
 launch d1536r_off1 d1536r off   off  128  d1536_off1  2 1536 16  4 128  1  256 4096
 launch d1536r_hit  d1536r on    hit  128  d1536_off1  3 1536 16  4 128  1  256 4096
 launch d1536r_off2 d1536r off   off  128  d1536_off1  4 1536 16  4 128  1  256 4096
+else   # plan ranks: lever B against the launch with the first three levers
+b() { RANKS=$1 ROLE=$2 GAIN=$3; }
+#                    arm         group  lever memo step run tag     n    d  nb nt  mb fs steps last
+b 0 base "";  launch d640_base1  d640   on    miss   0  d640_base1  1  640  9  2 128  0  384 4096
+b 1 test 3;   launch d640_b      d640   on    hit    0  d640_b      1  640  9  2 128  0  384 4096
+b 0 base "";  launch d640_base2  d640   on    hit    0  d640_base2  1  640  9  2 128  0  384 4096
+echo "memo: $(ls $OUT/vec_isa_memo 2> /dev/null | wc -l) files in $OUT/vec_isa_memo"
+b 0 base "";  launch d1536_base1 d1536  on    hit    0  d1536_base1 1 1536 16  4 128  1  128  128
+b 1 test 5;   launch d1536_b     d1536  on    hit    0  d1536_b     1 1536 16  4 128  1  128  128
+b 0 base "";  launch d1536_base2 d1536  on    hit    0  d1536_base2 1 1536 16  4 128  1  128  128
+R=$OUT/d1536_base1/exp_ladder_d1536
+state $R > $OUT/parent.before; cat $OUT/parent.before
+[ "$(wc -l < $OUT/parent.before)" = 1 ] || FAIL="$FAIL no-parent-checkpoint"
+b 0 base "";  launch d1536r_base1 d1536r on   hit  128  d1536_base1 2 1536 16  4 128  1  256 4096
+b 1 test 5;   launch d1536r_b     d1536r on   hit  128  d1536_base1 3 1536 16  4 128  1  256 4096
+b 0 base "";  launch d1536r_base2 d1536r on   hit  128  d1536_base1 4 1536 16  4 128  1  256 4096
+fi
 state $R > $OUT/parent.after
 cmp -s $OUT/parent.before $OUT/parent.after || { FAIL="$FAIL parent-checkpoint-changed"; cat $OUT/parent.after; }
 
