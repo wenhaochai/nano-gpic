@@ -25,7 +25,8 @@ Images are batched in order of caption length, so a batch pads little; the order
 Subcommands (run from anywhere; the repo's baselines/PixelGen and tools/ go on sys.path):
   prep  --n-val N --n-train N        reads, crops and encodes the data once -> OUT_DIR/data_v1_val<N>_train<N>_00787.pt
   list  --out results.jsonl [--ckpt ...]   prints the task list (JSON lines): every ms checkpoint of the ladders that
-                                     is older than --min-age seconds and lacks a line for some weights in the output
+                                     lacks a line for some weights in the output. A checkpoint younger than --min-age
+                                     seconds that is still being written is left out (--skipped FILE gets its path)
   work  --out results.jsonl --data <prep file> (--tasks file --counter file | --ckpt ...) [--gpu i]
                                      computes the tasks; with --tasks, workers share the list through a lockf counter
                                      (each takes the next task); appends one JSON line per (checkpoint, weights)
@@ -49,6 +50,7 @@ import tarfile
 import threading
 import time
 import traceback
+import zipfile
 
 import numpy as np
 import torch
@@ -505,14 +507,27 @@ def est_minutes(d, n_images, batch=BATCH, load_min=0.5):
     return 2 * NUM_T * n_images / batch * s / H100_OVER_A40 / 60 + load_min
 
 
+def complete(path):
+    """The file ends with a zip end record. torch.save writes that record last, so a checkpoint that a writer still fills
+    in place fails this at any age, and one that a writer put in place with a rename (src/plugins/async_ckpt_io.py: every
+    run since 2026-11-07) passes from the moment it exists."""
+    try:
+        return zipfile.is_zipfile(path)
+    except OSError:
+        return False
+
+
 def cmd_list(a):
     tag = os.path.basename(a.data)[:-len(".pt")]   # the data file's name keys the done entries, as in work
     done = done_keys(a.out)
     now = time.time()
-    tasks, young = [], 0
+    tasks, young = [], []
     for c in (a.ckpt if a.ckpt is not None else default_ckpts()):
-        if now - os.path.getmtime(c) < a.min_age:   # may still be written (Lightning writes in place)
-            young += 1
+        # A young file may still be written. Its age alone left out finished checkpoints: a held-out job that started
+        # right after its last training lost that run's final checkpoint and ended with 0 (w2372, w2395, w2423,
+        # 2026-11-09), so the file itself says whether it is whole. An old file that is cut is listed, and fails loudly.
+        if now - os.path.getmtime(c) < a.min_age and not complete(c):
+            young.append(os.path.abspath(c))
             continue
         spec = spec_of(c)
         if todo_weights(spec, done, a, tag):
@@ -522,8 +537,11 @@ def cmd_list(a):
     for s in tasks:
         print(json.dumps(s))
     tot = sum(s["est_min"] for s in tasks)
-    print(f"[list] {len(tasks)} tasks, {young} checkpoints younger than {a.min_age} s skipped; estimate {tot:.0f} GPU-min "
-          f"on H100 ({tot / 8:.0f} min on 8 GPUs)", file=sys.stderr, flush=True)
+    if a.skipped:
+        with open(a.skipped, "w") as f:
+            f.write("".join(c + "\n" for c in young))
+    print(f"[list] {len(tasks)} tasks, {len(young)} checkpoints younger than {a.min_age:g} s and still being written skipped; "
+          f"estimate {tot:.0f} GPU-min on H100 ({tot / 8:.0f} min on 8 GPUs)", file=sys.stderr, flush=True)
 
 
 def claim(counter):
@@ -706,6 +724,7 @@ def main(argv=None):
             p.add_argument("--ckpt", nargs="*", default=None)
         if name == "list":
             p.add_argument("--min-age", type=float, default=600)
+            p.add_argument("--skipped", default=None, help="a file that gets the paths of the checkpoints left out as still being written")
         if name == "work":
             p.add_argument("--tasks", default=None)
             p.add_argument("--counter", default=None)

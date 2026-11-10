@@ -12,7 +12,8 @@ H4 input: to_input equals val_transform's ToTensor + Normalize bit for bit, and 
    batch rule (T = longest rounded up to 8, at most 320; zeros and False after each caption)
 H5 tasks: an end-to-end CPU run on fake ms checkpoints (strict load of the EMA and the raw weights from a run config)
    writes one line per (checkpoint, weights) with the asked fields; the task list skips done entries, lists a
-   checkpoint with one weights missing, and a second run adds no line; the lockf counter hands out each index once
+   checkpoint with one weights missing, and a second run adds no line; the lockf counter hands out each index once;
+   a young checkpoint is listed when it is whole and left out (and named in --skipped) while a writer fills it
 H6 one pass: a checkpoint whose EMA slot holds the raw weights' bytes (as independent tensors, or on one storage) gives two
    records from one pass, marked one_pass, with the values of two passes (GPIC_HELDOUT_ONE_PASS=0); one bit of difference,
    a missing key or a single missing record gives the two-pass path
@@ -250,12 +251,34 @@ def H5():
         torch.save(data, dpath)
         out = os.path.join(tmp, "res.jsonl")
         common = ["--n-val", str(n_val), "--n-train", str(n_train), "--data", dpath]
-        # the list: both checkpoints, longest first is a tie; a checkpoint younger than --min-age is left out
+        # the list: both checkpoints, longest first is a tie
+        skp = os.path.join(tmp, "skipped.txt")
+        listed = lambda txt: sorted(json.loads(l)["step"] for l in txt.splitlines() if l.startswith("{"))
         rc, txt = run_main(["list", "--out", out, "--min-age", "600", "--ckpt", *ck] + common)
-        assert len([l for l in txt.splitlines() if l.startswith("{")]) == 2, txt
+        assert listed(txt) == [100, 200], txt
+        # a young checkpoint that is whole is listed (run5: its age alone left out a run's final checkpoint)
         os.utime(ck[1], None)
-        rc, txt = run_main(["list", "--out", out, "--min-age", "600", "--ckpt", *ck] + common)
-        assert len([l for l in txt.splitlines() if l.startswith("{")]) == 1, txt
+        rc, txt = run_main(["list", "--out", out, "--min-age", "600", "--skipped", skp, "--ckpt", *ck] + common)
+        assert listed(txt) == [100, 200] and open(skp).read() == "", (txt, open(skp).read())
+        # a young checkpoint that a writer still fills in place (any cut: no end record yet) is left out and named;
+        # --min-age 0 lists it (the final count of jobs/heldout_loss_lib.sh); old, it is listed (and its task fails loudly)
+        whole = open(ck[1], "rb").read()
+        for cut in (0, 1, len(whole) // 2, len(whole) - 1):
+            with open(ck[1], "wb") as f:
+                f.write(whole[:cut])
+            assert not H.complete(ck[1]), cut
+            rc, txt = run_main(["list", "--out", out, "--min-age", "600", "--skipped", skp, "--ckpt", *ck] + common)
+            assert listed(txt) == [100] and open(skp).read() == os.path.abspath(ck[1]) + "\n", (cut, txt, open(skp).read())
+            rc, txt = run_main(["list", "--out", out, "--min-age", "600", "--ckpt", *ck] + common)   # no --skipped: no file needed
+            assert listed(txt) == [100], (cut, txt)
+        rc, txt = run_main(["list", "--out", out, "--min-age", "0", "--skipped", skp, "--ckpt", *ck] + common)
+        assert listed(txt) == [100, 200] and open(skp).read() == "", txt
+        os.utime(ck[1], (1, 1))
+        rc, txt = run_main(["list", "--out", out, "--min-age", "600", "--skipped", skp, "--ckpt", *ck] + common)
+        assert listed(txt) == [100, 200] and open(skp).read() == "", txt
+        with open(ck[1], "wb") as f:
+            f.write(whole)
+        assert H.complete(ck[1]) and not H.complete(os.path.join(tmp, "no_such_file.ckpt"))
         os.utime(ck[1], (1, 1))
         # the run: one checkpoint by --ckpt, on CPU
         rc, txt = run_main(["work", "--out", out, "--device", "cpu", "--batch", "3", "--threads", "1",
