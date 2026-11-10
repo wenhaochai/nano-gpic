@@ -87,13 +87,16 @@ if mode[0] == "hang":
 '''
 assert "GPIC_GATE_RC" not in STUB_MAIN   # the launcher looks for this name in main.py: the marker line below adds it
 MEMO = "/scratch/gpfs/GROUP/USER/cache/inductor/vec_isa_memo"   # the launcher's default
-FW = f"{OUT}/worktree"
-os.makedirs(f"{FW}/baselines/PixelGen")
-os.makedirs(f"{FW}/tools")
-with open(f"{FW}/tools/gpu_health.py", "w") as f:
-    f.write(STUB_GATE)
-with open(f"{FW}/baselines/PixelGen/main.py", "w") as f:
-    f.write(STUB_MAIN + "# this main.py knows GPIC_GATE_RC\n")
+FW, FW_OLD = f"{OUT}/worktree", f"{OUT}/worktree_old"   # FW_OLD: a model file that does not know lever G1's switch
+for fw in (FW, FW_OLD):
+    os.makedirs(f"{fw}/baselines/PixelGen/src")
+    os.makedirs(f"{fw}/tools")
+    with open(f"{fw}/tools/gpu_health.py", "w") as f:
+        f.write(STUB_GATE)
+    with open(f"{fw}/baselines/PixelGen/main.py", "w") as f:
+        f.write(STUB_MAIN + "# this main.py knows GPIC_GATE_RC\n")
+    with open(f"{fw}/baselines/PixelGen/src/lightning_model_gpic.py", "w") as f:
+        f.write("# stub\n" + ("# knows GPIC_LAUNCH_SKIP_EMA_COPY\n" if fw == FW else ""))
 count = [0]
 
 
@@ -106,7 +109,7 @@ def session(sid, wait=3.0):   # processes of the launcher's session, after up to
         time.sleep(0.2)
 
 
-def launch(name, ranks="*=fit:1", gate="pass:0.3", env=None, args=(), cut=None, partial_ok=True):
+def launch(name, ranks="*=fit:1", gate="pass:0.3", env=None, args=(), cut=None, partial_ok=True, wt=None):
     count[0] += 1
     d, tok = f"{OUT}/{name}", f"rktok{os.getpid()}n{count[0]}"
     os.makedirs(f"{d}/tmp")
@@ -117,7 +120,7 @@ def launch(name, ranks="*=fit:1", gate="pass:0.3", env=None, args=(), cut=None, 
     e = {k: v for k, v in os.environ.items()
          if not k.startswith(("GPIC_", "LADDER_", "SLURM_", "STUB_", "OMP_", "PROBE_", "MASTER_"))
          and k not in ("FETCHED_JOB_ID", "BENCH_OUT", "LOCAL_RANK", "NODE_RANK", "WORLD_SIZE")}
-    e.update(PATH=f"{d}/bin:{os.environ['PATH']}", TMPDIR=f"{d}/tmp", LADDER_WT=FW, LADDER_RUN_ROOT=f"{d}/root",
+    e.update(PATH=f"{d}/bin:{os.environ['PATH']}", TMPDIR=f"{d}/tmp", LADDER_WT=wt or FW, LADDER_RUN_ROOT=f"{d}/root",
              STUB_GATE=gate, STUB_RANKS=ranks, STUB_OUT=f"{d}/main.json", STUB_GATE_LOG=f"{d}/gate.log", STUB_REAL_MAIN=REAL_MAIN,
              GPIC_LAUNCH_RANKS="1")
     if partial_ok:
@@ -216,11 +219,15 @@ def expect(r, rc, n=8, levers=None, text=(), no_text=(), wall=None, omp="12", fi
     return pr + (["output: " + r["out"][-900:].replace("\n", " | ")] if pr else [])
 
 
-ON = f"gate_bg=1 vec_isa_memo={MEMO} omp=OMP_NUM_THREADS=12 ranks=1"
+ON = f"gate_bg=1 vec_isa_memo={MEMO} omp=OMP_NUM_THREADS=12 ranks=1 skip_ema_copy=0"
 r = launch("all_ok")
 check("8 ranks, all end with 0", expect(r, 0, levers=ON, text=[r"main\.py exit 0", r"\[gate\] healthy"], no_text=[r"KILL", r"unhealthy"], fit=8, wall=(1, 25)))
 r = launch("off", env={"GPIC_LAUNCH_RANKS": "0"})
 check("the switch off: one process, none of the rank variables", expect(r, 0, n=None, levers=ON.replace("ranks=1", "ranks=0"), text=[r"main\.py exit 0"]))
+for name, env, wt, want in (("g1_on", {"GPIC_LAUNCH_SKIP_EMA_COPY": "1", "GPIC_MFU_NO_EMA": "1"}, FW, "1"), ("g1_with_ema", {"GPIC_LAUNCH_SKIP_EMA_COPY": "1"}, FW, "0"),
+                            ("g1_not_asked", {"GPIC_MFU_NO_EMA": "1"}, FW, "0"), ("g1_old_model", {"GPIC_LAUNCH_SKIP_EMA_COPY": "1", "GPIC_MFU_NO_EMA": "1"}, FW_OLD, "0")):
+    r = launch(name, env=env, wt=wt)
+    check(f"lever G1, {name}: launches.txt says skip_ema_copy={want}", expect(r, 0, levers=ON.replace("skip_ema_copy=0", f"skip_ema_copy={want}"), fit=8))
 r = launch("default", env={"GPIC_LAUNCH_RANKS": ""})
 check("the switch not set: off", expect(r, 0, n=None, levers=ON.replace("ranks=1", "ranks=0"), text=[r"main\.py exit 0"]))
 r = launch("gate_beside", gate="pass:4")
@@ -262,9 +269,9 @@ check("--trainer.devices 4: 4 ranks, 24 threads", expect(r, 0, n=4, levers=ON.re
 r = launch("devices_1", args=("--trainer.devices=1",))
 check("--trainer.devices=1: one process as before", expect(r, 0, n=None, levers=ON.replace("=12 ranks=1", "=96 ranks=0")))
 r = launch("devices_auto", args=("--trainer.devices", "auto"))
-check("--trainer.devices auto: one process as before", expect(r, 0, n=None, levers=f"gate_bg=1 vec_isa_memo={MEMO} omp=off ranks=0"))
+check("--trainer.devices auto: one process as before", expect(r, 0, n=None, levers=f"gate_bg=1 vec_isa_memo={MEMO} omp=off ranks=0 skip_ema_copy=0"))
 r = launch("caller_omp", env={"OMP_NUM_THREADS": "5"})
-check("a thread count set by the caller stays in every rank", expect(r, 0, levers=f"gate_bg=1 vec_isa_memo={MEMO} omp=off ranks=1", omp="5", fit=8))
+check("a thread count set by the caller stays in every rank", expect(r, 0, levers=f"gate_bg=1 vec_isa_memo={MEMO} omp=off ranks=1 skip_ema_copy=0", omp="5", fit=8))
 pr = []   # rank 0 and the others end in the same moment: the helper that limits the others' exit must not outlive the script
 for i in range(12):   # (a first version left its sleep behind in 1 of 8 launches)
     r = launch(f"together{i}", ranks="*=fit:0.2", gate="pass:0.1")

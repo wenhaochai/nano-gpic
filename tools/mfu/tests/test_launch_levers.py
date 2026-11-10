@@ -386,8 +386,8 @@ def part_c():
         pr = []
         if r["rc"] != rc:
             pr.append(f"exit status {r['rc']}, expected {rc}")
-        if levers is not None and r["levers"] != levers + " ranks=0":   # lever B (tests/test_launch_ranks.py) is off by default
-            pr.append(f"launches.txt: levers {r['levers']!r}, expected {levers + ' ranks=0'!r}")
+        if levers is not None and r["levers"] != levers + " ranks=0 skip_ema_copy=0":   # levers B and G1 (tests/test_launch_ranks.py) are off by default
+            pr.append(f"launches.txt: levers {r['levers']!r}, expected {levers + ' ranks=0 skip_ema_copy=0'!r}")
         pr += [f"no /{t}/ in the output" for t in text if not re.search(t, r["out"])]
         pr += [f"/{t}/ in the output" for t in no_text if re.search(t, r["out"])]
         if (env is not None or order) and r["main"] is None:

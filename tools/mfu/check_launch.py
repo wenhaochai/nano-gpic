@@ -6,8 +6,9 @@ no slower afterwards.
 The manifest has one line per launch (arm):
   arm name=<arm> group=<group> lever=off|on memo=off|miss|hit step=<start step> log=<launch log> run=<run directory>
       n=<number of this launch in the run directory> bench=<BENCH_OUT> rc=<exit status> wall=<seconds>
-      [ranks=0|1] [role=base|test] [gain=<seconds>]
-lever: the first three levers (gate beside the start, memo, thread count); ranks: lever B (the script starts every rank).
+      [ranks=0|1] [role=base|test] [gain=<seconds>] [ema_copy=keep|skip]
+lever: the first three levers (gate beside the start, memo, thread count); ranks: lever B (the script starts every rank);
+ema_copy: lever G1 (skip: configure_model leaves out the second copy of the EMA slot).
 A group is one setting (width, fresh or resumed) with at least two base arms and one test arm; without role, an arm
 with lever=off is a base arm and one with lever=on a test arm. Read from each launch:
 the "[launch-fp]" lines of src/callbacks/launch_fingerprint.py (8 ranks), the "[gate]" and "[warmup]" lines,
@@ -27,7 +28,8 @@ Checks, FAIL on any:
                  module is imported) every rank of an on arm has the launcher's thread count, and no rank of an off
                  arm has OMP_NUM_THREADS; memo counts (off: none; miss: no error, something stored; hit: no error,
                  nothing new stored); with ranks=1 the 8 rank processes started within 3 s of each other, without it
-                 ranks 1-7 started later than that after rank 0
+                 ranks 1-7 started later than that after rank 0; with ema_copy=skip no rank made the EMA slot's
+                 second copy, without it every rank did
   gate           an on arm's gate ran beside main.py's start: its slowest GPU is within 7% of its median, and its
                  median within 3% of the base arms' medians
   speed          a hit arm reaches the first step at least 5 s (or the manifest's gain) before every base arm of its
@@ -201,6 +203,12 @@ def main(manifest):
         tp = [t(a, r, "proc") for r in a["start"]]
         if len(tp) == len(RANKS) and (max(tp) - min(tp) <= TOGETHER_S) != (a.get("ranks", "0") == "1"):
             fails.append(f"{nm}: the 8 rank processes started {max(tp) - min(tp):.1f} s apart with ranks={a.get('ranks', '0')}")
+        skip = a.get("ema_copy", "keep") == "skip"
+        if lv.get("skip_ema_copy", "0") != ("1" if skip else "0"):
+            fails.append(f"{nm}: launches.txt has skip_ema_copy={lv.get('skip_ema_copy', '0')}, the manifest ema_copy={a.get('ema_copy', 'keep')}")
+        bad = [r for r, s in a["start"].items() if (s.get("copy_s") == "none") != skip]
+        if bad:
+            fails.append(f"{nm}: the EMA slot's second copy on {ranks(bad)}: copy_s={a['start'][bad[0]].get('copy_s')} with ema_copy={a.get('ema_copy', 'keep')}")
         if len(a["gate_wait"]) != (1 if on else 0):
             fails.append(f"{nm}: {len(a['gate_wait'])} gate verdict lines for lever {a['lever']}")
         n_thr = lv.get("omp", "").rpartition("=")[2]   # the launcher's count; without one the line above has failed

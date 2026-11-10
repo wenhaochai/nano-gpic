@@ -27,6 +27,8 @@
 #  GPIC_LAUNCH_VEC_ISA_MEMO   E: the compiler's CPU vector-set check is answered from a file (src/utils/patch_bugs.py)
 #  GPIC_LAUNCH_OMP            F: every rank starts with the thread count Lightning sets at fit (CPUs / ranks), not with all CPUs
 #  GPIC_LAUNCH_RANKS          B: this script starts all ranks at once; off by default (1 = on) until jobs/smoke_launch.sh has compared it
+#  GPIC_LAUNCH_SKIP_EMA_COPY  G1: with GPIC_MFU_NO_EMA=1, configure_model leaves out the second copy of the weights into the EMA
+#                             slot (src/lightning_model_gpic.py); off by default (1 = on) until the same smoke
 # GPIC_LAUNCH_FP=1 (tests): src/callbacks/launch_fingerprint.py prints each rank's state at the first step.
 set -o pipefail
 export GPIC_LAUNCH_T0=$(date +%s.%N)
@@ -179,7 +181,10 @@ PY
 )
   [ -n "$RANK_PORT" ] && RANKS_BG=1   # no free port among 200: Lightning starts the ranks as before
 fi
-echo "$(date -u +%FT%TZ) launch levers: gate_bg=$GATE_BG vec_isa_memo=${GPIC_VEC_ISA_MEMO:-off} omp=${OMP_ENV[1]:-off} ranks=$RANKS_BG" >> $RUN/launches.txt
+# Launch lever G1: in force only with no EMA and a model file that knows the switch
+SKIP_EMA=0
+[ "${GPIC_LAUNCH_SKIP_EMA_COPY:-0}" = 1 ] && [ "${GPIC_MFU_NO_EMA:-0}" = 1 ] && grep -q GPIC_LAUNCH_SKIP_EMA_COPY $WT/baselines/PixelGen/src/lightning_model_gpic.py 2> /dev/null && SKIP_EMA=1
+echo "$(date -u +%FT%TZ) launch levers: gate_bg=$GATE_BG vec_isa_memo=${GPIC_VEC_ISA_MEMO:-off} omp=${OMP_ENV[1]:-off} ranks=$RANKS_BG skip_ema_copy=$SKIP_EMA" >> $RUN/launches.txt
 CMD=(python main.py fit --config configs_h100/lite_ladder.yaml --trainer.default_root_dir $ROOT
   --trainer.max_steps $STEPS --trainer.callbacks "$CB"
   --model.denoiser.init_args.hidden_size $D --model.denoiser.init_args.num_groups $((D / 64))

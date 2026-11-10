@@ -22,9 +22,11 @@
 # configure_model (4.2 s at width 1536 in the w2441 profile; no lever yet); tools/mfu/check_launch.py compares them.
 # Result: SMOKE_LAUNCH PASS | FAIL <reasons>; the checkpoints are deleted on PASS and kept on FAIL. About 30 min
 # (130 s a width-640 arm, 200 s a width-1536 arm); an arm that would pass the job's hour is not started (FAIL <arm>-no-time).
-# Plan "ranks" (lever B, GPIC_LAUNCH_RANKS=1: the launcher starts every rank at once; the plan above is "levers"): the
-# first three levers are on in every arm (they passed the plan above), the base arms differ from the test arm only in
-# lever B: at each of the three settings base, B, base (9 launches, about 27 min). The first arm fills the memo.
+# Plan "ranks" (lever B, GPIC_LAUNCH_RANKS=1: the launcher starts every rank at once, and lever G1,
+# GPIC_LAUNCH_SKIP_EMA_COPY=1: no second copy of the weights into the EMA slot; the plan above is "levers"): the first three
+# levers are on in every arm (they passed the plan above), the base arms differ from the test arm only in B and G1: at
+# each of the three settings base, test, base (9 launches, about 27 min). The first arm fills the memo. The base arms
+# time the copy that G1 leaves out (copy s in the report), so each lever's part of the gain can be read.
 # usage: smoke_launch.sh [worktree under gpic-wt, default launch2_cap_run] [levers | ranks, default levers]
 set -o pipefail
 WC=/scratch/gpfs/GROUP/USER
@@ -41,7 +43,7 @@ MAN=$OUT/manifest.txt; : > $MAN
 FAIL=""
 run() {   # <arm> <run tag> <lever> <d> <nb> <nt> <mb> <fsdp> <max steps> <last every> <ranks>: one launch of the sweep path
   local arm=$1 tag=$2 lever=$3 d=$4 nb=$5 nt=$6 MB=$7 FS=$8 S=$9 LAST=${10} root=$OUT/$2 size=d$4 SCH=4096
-  if [ "${11:-0}" = 1 ]; then export GPIC_LAUNCH_RANKS=1; else unset GPIC_LAUNCH_RANKS; fi
+  if [ "${11:-0}" = 1 ]; then export GPIC_LAUNCH_RANKS=1 GPIC_LAUNCH_SKIP_EMA_COPY=1; else unset GPIC_LAUNCH_RANKS GPIC_LAUNCH_SKIP_EMA_COPY; fi
   mkdir -p $root/exp_ladder_$size; [ -s $root/exp_ladder_$size/shard_seed.txt ] || echo 20261106 > $root/exp_ladder_$size/shard_seed.txt
   if [ $lever = off ]; then export GPIC_LAUNCH_GATE_BG=0 GPIC_LAUNCH_VEC_ISA_MEMO=0 GPIC_LAUNCH_OMP=0
   else unset GPIC_LAUNCH_GATE_BG GPIC_LAUNCH_VEC_ISA_MEMO GPIC_LAUNCH_OMP; export GPIC_VEC_ISA_MEMO=$OUT/vec_isa_memo; fi
@@ -70,7 +72,7 @@ launch() {   # <arm> <group> <lever> <memo> <start step> <run tag> <launch numbe
   local rc=$? wall=$(( $(date +%s) - t0 ))
   echo "$arm: rc $rc in $wall s; $(grep -a -h 'resuming from' $OUT/$arm.log | head -1)"
   grep -a -h -o -E '\[gate\] [^[]*|unhealthy GPU.*' $OUT/$arm.log | head -3 | sed "s/^/$arm: /"
-  echo "arm name=$arm group=$group lever=$lever memo=$memo step=$step log=$OUT/$arm.log run=$OUT/$tag/exp_ladder_d$1 n=$n bench=$OUT/$arm.bench rc=$rc wall=$wall ranks=$RANKS${ROLE:+ role=$ROLE}${GAIN:+ gain=$GAIN}" >> $MAN
+  echo "arm name=$arm group=$group lever=$lever memo=$memo step=$step log=$OUT/$arm.log run=$OUT/$tag/exp_ladder_d$1 n=$n bench=$OUT/$arm.bench rc=$rc wall=$wall ranks=$RANKS${ROLE:+ role=$ROLE}${GAIN:+ gain=$GAIN} ema_copy=$([ $RANKS = 1 ] && echo skip || echo keep)" >> $MAN
   [ $rc = 0 ] || FAIL="$FAIL $arm-rc$rc"
 }
 state() { find $1 -maxdepth 1 -name "last*.ckpt" -printf '%f %s %T@ %i\n' | sort; }   # name, size, mtime, inode

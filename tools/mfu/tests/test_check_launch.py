@@ -18,7 +18,7 @@ HARD = {"den": "d0", "den_buf": "b0", "ema": "e0", "ema_buf": "eb0", "opt": "o0"
 SOFT = {"rng_cpu": "c", "rng_cuda": "g", "rng_np": "n", "rng_py": "p"}
 
 
-def arm(name, group, lever, memo, step=0, run=None, n=1, first=100.0, step_ms=70.0, rk=None, role=None, gain=None):
+def arm(name, group, lever, memo, step=0, run=None, n=1, first=100.0, step_ms=70.0, rk=None, role=None, gain=None, ema=None):
     """One launch as a dict that write() turns into the files the checker reads; every field can be changed after."""
     on = lever == "on"
     ranks = {}
@@ -30,15 +30,15 @@ def arm(name, group, lever, memo, step=0, run=None, n=1, first=100.0, step_ms=70
         f["memo"] = {"off": "h0/m0/s0/e0", "miss": "h0/m4/s4/e0", "hit": "h4/m0/s0/e0"}[memo]
         f["threads"], f["omp"], f["cpus"] = "12/96", "12", "48"   # at the first step: Lightning's count in every arm
         f["thr0"], f["omp0"] = ("12", "12") if on else ("96", "unset")   # before fit: the lever's count, or every CPU's
-        f.update({"t_proc": f"{(0.5 if on else 15.0) + (20.0 if r and rk != '1' else 0.01 * r):.2f}", "t_init": "9.0", "t_setup": "30.0", "t_fit": "31.0", "t_train": f"{first - 12:.2f}", "copy_s": "4.20", "copy_flt": "1000", "fp_s": "0.4"})
+        f.update({"t_proc": f"{(0.5 if on else 15.0) + (20.0 if r and rk != '1' else 0.01 * r):.2f}", "t_init": "9.0", "t_setup": "30.0", "t_fit": "31.0", "t_train": f"{first - 12:.2f}", "copy_s": "none" if ema == "skip" else "4.20", "copy_flt": "none" if ema == "skip" else "1000", "fp_s": "0.4"})
         ranks[r] = {"start": f, "batch": [(step + i, f"h{i}r{r}/7", first - 1 + 0.3 * r + i) for i in range(2)],
                     "rows": [{"step": step + i, "step_ms": 300.0 if i < 16 else step_ms, "data_wait_s": 0.001, "loss": 1.0 - 1e-3 * i + r}
                              for i in range(64)]}
     return {"name": name, "group": group, "lever": lever, "memo": memo, "step": step, "run": run or name, "n": n, "rc": 0,
             "main_rc": 0, "ranks": ranks, "gate": [380, 381, 379, 382, 380, 381, 380, 379], "gate_ok": True,
-            "gate_line": on, "extra": "".join(f" {k}={v}" for k, v in (("ranks", rk), ("role", role), ("gain", gain)) if v is not None),
+            "gate_line": on, "extra": "".join(f" {k}={v}" for k, v in (("ranks", rk), ("role", role), ("gain", gain), ("ema_copy", ema)) if v is not None),
             "levers": ("gate_bg=1 vec_isa_memo=/x/memo omp=OMP_NUM_THREADS=12" if on else "gate_bg=0 vec_isa_memo=off omp=off")
-                      + ("" if rk is None else f" ranks={rk}")}
+                      + ("" if rk is None else f" ranks={rk}") + ("" if ema is None else f" skip_ema_copy={int(ema == 'skip')}")}
 
 
 def write(root, arms):
@@ -286,11 +286,12 @@ def _(a): del a["fresh_off2"]
 def _(a): a["d640_off1"]["ranks"][3]["rows"] = None
 
 
-def with_b(a, first=70.0, gain=None, base2=82.0):
-    """The second smoke's layout as one more group: the first three levers on in every arm, lever B in the test arm."""
-    a["b_base1"] = arm("b_base1", "b640", "on", "miss", first=95.0, rk="0", role="base")
-    a["b_test"] = arm("b_test", "b640", "on", "hit", first=first, rk="1", role="test", gain=gain)
-    a["b_base2"] = arm("b_base2", "b640", "on", "hit", first=base2, rk="0", role="base")
+def with_b(a, first=70.0, gain=None, base2=82.0, ema=None):
+    """The second smoke's layout as one more group: the first three levers on in every arm, lever B (and, with ema="skip",
+    lever G1) in the test arm."""
+    a["b_base1"] = arm("b_base1", "b640", "on", "miss", first=95.0, rk="0", role="base", ema=ema and "keep")
+    a["b_test"] = arm("b_test", "b640", "on", "hit", first=first, rk="1", role="test", gain=gain, ema=ema)
+    a["b_base2"] = arm("b_base2", "b640", "on", "hit", first=base2, rk="0", role="base", ema=ema and "keep")
 
 
 @case("lever B: base arms with the three levers on, a test arm with every rank started at once", True, "CHECK_LAUNCH PASS: 13 arms in 4 groups, 0 failures, 0 notes")
@@ -335,6 +336,26 @@ def _(a): with_b(a); each(a["b_test"], lambda d: [x.update(step_ms=72.1) for x i
 
 @case("lever B: a group with one base arm", False, "b640: needs two base arms and one test arm")
 def _(a): with_b(a); del a["b_base1"]
+
+
+@case("lever G1: the test arm leaves out the EMA slot's second copy", True, "CHECK_LAUNCH PASS: 13 arms in 4 groups, 0 failures, 0 notes")
+def _(a): with_b(a, ema="skip")
+
+
+@case("lever G1: asked for, but rank 2 made the copy", False, "b_test: the EMA slot's second copy on rank 2: copy_s=4.20 with ema_copy=skip")
+def _(a): with_b(a, ema="skip"); a["b_test"]["ranks"][2]["start"]["copy_s"] = "4.20"
+
+
+@case("lever G1: a base arm made no copy", False, "b_base2: the EMA slot's second copy on all ranks: copy_s=none with ema_copy=keep")
+def _(a): with_b(a, ema="skip"); each(a["b_base2"], lambda d: d["start"].update(copy_s="none"))
+
+
+@case("lever G1: launches.txt does not say it", False, "b_test: launches.txt has skip_ema_copy=0, the manifest ema_copy=skip")
+def _(a): with_b(a, ema="skip"); a["b_test"]["levers"] = a["b_test"]["levers"].replace("skip_ema_copy=1", "skip_ema_copy=0")
+
+
+@case("lever G1: the test arm's EMA slot differs", False, "b_test: ema differs from the base arms (all ranks)")
+def _(a): with_b(a, ema="skip"); each(a["b_test"], lambda d: d["start"].update(ema="other"))
 
 
 def main(scratch):
