@@ -19,11 +19,14 @@ Checks, FAIL on any:
   hard fields    step, weights and buffers of the denoiser and of the EMA slot, optimizer and scheduler state, vector
                  sets: equal per rank between the base arms (else the launcher itself does not repeat and nothing can be
                  shown) and between each on arm and the base arms
-  soft fields    the four random streams, the first two batches, the first two losses, and the thread count and
-                 OMP_NUM_THREADS at the first step (Lightning sets both when fit starts, the lever sets them before):
-                 where the base arms agree on every rank, each on arm must agree too; where they differ the field is
-                 listed as not testable. A loss agrees within 0.1% (two launches from one state may sum on the GPU in
-                 another order); a loss that is not equal to the last digit is a note
+  soft fields    the four random streams, the first two batches and the first two losses: where the base arms agree
+                 on every rank, each on arm must agree too; where they differ the field is listed as not testable.
+                 A loss agrees within 0.1% (two launches from one state may sum on the GPU in another order); a loss
+                 that is not equal to the last digit is a note
+  threads        with the thread lever every rank has the launcher's count and OMP_NUM_THREADS before fit and at the
+                 first step. Without it Lightning sets both at fit, but only in a rank whose strategy has a launcher:
+                 under FSDP2 (ModelParallelStrategy) ranks 1-7 have none and train with one thread per CPU (w2486), so
+                 the lever also changes their thread count in training there: a note, with the counts
   levers         the launches.txt line; on arms print the gate's verdict line once; before fit (when the fingerprint's
                  module is imported) every rank of an on arm has the launcher's thread count, and no rank of an off
                  arm has OMP_NUM_THREADS; memo counts (off: none; miss: no error, something stored; hit: no error,
@@ -45,7 +48,7 @@ import statistics
 import sys
 
 HARD = ("step", "den", "den_buf", "ema", "ema_buf", "opt", "sched", "isa")
-SOFT = ("rng_cpu", "rng_cuda", "rng_np", "rng_py", "batch0", "batch1", "loss0", "loss1", "thr", "omp")
+SOFT = ("rng_cpu", "rng_cuda", "rng_np", "rng_py", "batch0", "batch1", "loss0", "loss1")
 RANKS = range(8)
 SKIP = 16          # steps left out of the step time: compile leftovers and the allocator's first growth
 GAIN_MIN_S = 5.0   # a hit arm must reach the first step this much sooner than every off arm
@@ -217,6 +220,11 @@ def main(manifest):
             if bad:
                 fails.append(f"{nm}: not the launcher's {n_thr} threads before fit on {ranks(bad)}: "
                              f"thr0={a['start'][bad[0]].get('thr0')} omp0={a['start'][bad[0]].get('omp0')}")
+        if on and n_thr.isdigit():
+            bad = [r for r, s in a["start"].items() if field(a, "thr", r) != n_thr or s.get("omp") != n_thr]
+            if bad:
+                fails.append(f"{nm}: not the launcher's {n_thr} threads at the first step on {ranks(bad)}: "
+                             f"threads={a['start'][bad[0]].get('threads')} omp={a['start'][bad[0]].get('omp')}")
         if not on:
             bad = [r for r, s in a["start"].items() if s.get("omp0") != "unset"]
             if bad:
@@ -263,6 +271,16 @@ def main(manifest):
                 if near:
                     notes.append(f"{a['name']}: {f} agrees with the base arms within {LOSS_TOL:g} but not to the last digit ({ranks(near)}): "
                                  f"{field(a, f, near[0])} against {vals[near[0]][0]}")
+        n_on = {x["levers"].get("omp", "").rpartition("=")[2] for x in ga if x["lever"] == "on"}
+        if len(n_on) == 1 and next(iter(n_on)).isdigit():   # what the thread lever changes in training (see "threads" above)
+            n_thr = next(iter(n_on))
+            for a in ga:
+                bad = [r for r, s in a["start"].items() if a["lever"] == "off" and (field(a, "thr", r) != n_thr or s.get("omp") != n_thr)]
+                if bad:
+                    s = a["start"][bad[0]]
+                    notes.append(f"{g}: without the thread lever {ranks(bad)} train with {field(a, 'thr', bad[0])} threads and OMP_NUM_THREADS "
+                                 f"{s.get('omp')} ({a['name']}); with it every rank has {n_thr}")
+                    break
         t_off, s_off = [first_step(a) for a in offs], [step_ms(a) for a in offs]
         g_off = [statistics.median(a["gate_tf"]) for a in offs if a["gate_tf"]]
         for a in ons:

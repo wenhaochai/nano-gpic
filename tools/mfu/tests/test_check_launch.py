@@ -169,7 +169,7 @@ def _(a): each(a["r_hit"], lambda d: d["start"].update(thr0="96"))
 
 
 @case("on arm: the launcher gave another count than the ranks had", False,
-      "fresh_hit: not the launcher's 6 threads before fit on all ranks: thr0=12 omp0=12")
+      "fresh_hit: not the launcher's 6 threads before fit on all ranks: thr0=12 omp0=12", nfail=2, nnote=1)   # and at the first step; and the note on the off arms' 12
 def _(a): a["fresh_hit"]["levers"] = a["fresh_hit"]["levers"].replace("OMP_NUM_THREADS=12", "OMP_NUM_THREADS=6")
 
 
@@ -177,17 +177,24 @@ def _(a): a["fresh_hit"]["levers"] = a["fresh_hit"]["levers"].replace("OMP_NUM_T
 def _(a): each(a["d640_off1"], lambda d: d["start"].update(thr0="12", omp0="12"))
 
 
-@case("on arm: another thread count at the first step", False, "d640_hit: thr differs from the base arms (rank 2): 6 against 12")
+@case("on arm: another thread count at the first step", False, "d640_hit: not the launcher's 12 threads at the first step on rank 2: threads=6/96 omp=12")
 def _(a): a["d640_hit"]["ranks"][2]["start"].update(threads="6/96")
 
 
-@case("on arm: another OMP_NUM_THREADS at the first step", False, "d640_miss: omp differs from the base arms (all ranks): 6 against 12")
+@case("on arm: another OMP_NUM_THREADS at the first step", False, "d640_miss: not the launcher's 12 threads at the first step on all ranks: threads=12/96 omp=6")
 def _(a): each(a["d640_miss"], lambda d: d["start"].update(omp="6"))
 
 
-@case("off arms differ in the thread count at the first step: a note", True,
-      "note: d640: thr differs between the base arms (rank 3): not testable")
+@case("one off arm has another thread count at the first step on rank 3: a note", True,
+      "note: d640: without the thread lever rank 3 train with 96 threads and OMP_NUM_THREADS 12 (d640_off1); with it every rank has 12")
 def _(a): a["d640_off1"]["ranks"][3]["start"].update(threads="96/96")
+
+
+@case("FSDP2 as in w2486: without the lever ranks 1-7 train with every CPU's thread: a note", True,
+      "note: fresh: without the thread lever rank 1,2,3,4,5,6,7 train with 96 threads and OMP_NUM_THREADS unset (fresh_off2); with it every rank has 12")
+def _(a):
+    for name in ("parent", "fresh_off2"):
+        each(a[name], lambda d: d["start"].update(threads="96/96", omp="unset"), range(1, 8))
 
 
 @case("on arm: another inter-op count is no fault", True, "CHECK_LAUNCH PASS: 10 arms in 3 groups, 0 failures, 0 notes")
