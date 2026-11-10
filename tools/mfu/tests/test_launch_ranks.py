@@ -45,6 +45,7 @@ STUB_MAIN = '''# stub of baselines/PixelGen/main.py (tools/mfu/tests/test_launch
 #   die:<status>:<s> exit <status> after <s> seconds, before fit
 #   term0:<s>:<x>    as fit:<s>, but a TERM is caught: exit 0 after <x> more seconds (a rank that saves and stops)
 #   hang:<s>         as fit:<s>, then it ignores TERM and never ends (a rank that hangs at its exit)
+#   orphan:<status>:<s>  starts a process that ignores TERM and never ends (a data worker), then exits <status> after <s> seconds
 import ast, json, os, signal, sys, textwrap, time
 def real_before_fit(path):   # the method's own source, from the real main.py
     src = open(path).read()
@@ -68,6 +69,10 @@ got = []
 if mode[0] == "term0":
     signal.signal(signal.SIGTERM, lambda *a: got.append(1))
 dump()
+if mode[0] == "orphan":
+    import subprocess
+    subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)"])
+    mode[0] = "die"
 if mode[0] == "die":
     time.sleep(float(mode[2]))
     sys.exit(int(mode[1]))
@@ -221,7 +226,7 @@ def expect(r, rc, n=8, levers=None, text=(), no_text=(), wall=None, omp="12", fi
 
 ON = f"gate_bg=1 vec_isa_memo={MEMO} omp=OMP_NUM_THREADS=12 ranks=1 skip_ema_copy=0"
 r = launch("all_ok")
-check("8 ranks, all end with 0", expect(r, 0, levers=ON, text=[r"main\.py exit 0", r"\[gate\] healthy"], no_text=[r"KILL", r"unhealthy"], fit=8, wall=(1, 25)))
+check("8 ranks, all end with 0", expect(r, 0, levers=ON, text=[r"main\.py exit 0", r"\[gate\] healthy"], no_text=[r"KILL", r"unhealthy", r"still there"], fit=8, wall=(1, 25)))
 r = launch("off", env={"GPIC_LAUNCH_RANKS": "0"})
 check("the switch off: one process, none of the rank variables", expect(r, 0, n=None, levers=ON.replace("ranks=1", "ranks=0"), text=[r"main\.py exit 0"]))
 for name, env, wt, want in (("g1_on", {"GPIC_LAUNCH_SKIP_EMA_COPY": "1", "GPIC_MFU_NO_EMA": "1"}, FW, "1"), ("g1_with_ema", {"GPIC_LAUNCH_SKIP_EMA_COPY": "1"}, FW, "0"),
@@ -246,6 +251,12 @@ r = launch("rank_dies", ranks="3=die:5:1.5,*=fit:60")
 check("rank 3 ends with 5: KILL for the others, status 5", expect(r, 5, levers=ON, text=[r"rank 3 ended with 5; KILL for the other 7", r"main\.py exit 5"], wall=(1, 25)))
 r = launch("rank0_dies", ranks="0=die:7:1.5,*=fit:60")
 check("rank 0 ends with 7: KILL for the others, status 7", expect(r, 7, levers=ON, text=[r"rank 0 ended with 7; KILL for the other 7", r"main\.py exit 7"], wall=(1, 25)))
+r = launch("fail_leaves", ranks="x=orphan:3:1", env={"GPIC_LAUNCH_RANKS": "0"})
+check("Lightning's start, main.py ends with 3 and leaves a process that ignores TERM: KILL for it, status 3",
+      expect(r, 3, n=None, levers=ON.replace("ranks=1", "ranks=0"), text=[r"the launch ended with 3 and 1 of its processes are still there; KILL", r"main\.py exit 3"], wall=(1, 40)))
+r = launch("rank_fail_leaves", ranks="0=orphan:3:1,*=fit:60")
+check("rank 0 ends with 3 and leaves such a process: KILL for the ranks and for it, status 3",
+      expect(r, 3, levers=ON, text=[r"rank 0 ended with 3; KILL for the other 7", r"the launch ended with 3 and 1 of its processes are still there; KILL", r"main\.py exit 3"], wall=(1, 40)))
 r = launch("two_die", ranks="2=die:4:1,6=die:9:1.6,*=fit:60")
 check("two ranks fail: the first one's status", expect(r, 4, levers=ON, text=[r"rank 2 ended with 4", r"main\.py exit 4"], wall=(1, 25)))
 r = launch("rank0_first", ranks="0=fit:1,*=fit:5")
