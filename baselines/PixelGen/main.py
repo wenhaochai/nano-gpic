@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 import time
 from typing import Any, Union
@@ -75,6 +76,54 @@ class ReWriteRootDirCli(LightningCLI):
             os.environ["TORCH_HOME"] = torch_hub_dir
             torch.hub.set_dir(torch_hub_dir)
         super().instantiate_classes()
+
+    def before_fit(self) -> None:
+        # Launch lever A1 (gpic-28 2026-11-09). jobs/train_ladder.sh starts the GPU health gate (tools/gpu_health.py) and
+        # this process together: the imports and the model's construction use no GPU (0 MiB on every GPU for 40 s after
+        # the gate in the w2441 profile), so the gate's 15 s no longer come before them. This is the last point before
+        # the first CUDA call, and fit waits here for the gate's verdict. GPIC_GATE_RC: the file that gets the gate's
+        # exit status; GPIC_GATE_PID: the shell that writes it. A failed gate, a gate that ended without a verdict or
+        # no verdict in GPIC_GATE_WAIT_S ends the launch with 98, the blocking gate's code; nothing has started yet
+        # (no rank, no data worker, no wandb run). The ranks that Lightning starts later find the file in place.
+        rc_file = os.environ.get("GPIC_GATE_RC")
+        if not rc_file:
+            return
+
+        def read():
+            try:
+                with open(rc_file) as f:
+                    return int(f.read().strip())
+            except FileNotFoundError:
+                return None
+            except ValueError:
+                return -1
+
+        def gate_gone():   # the gate's shell has ended (a zombie until its parent's wait) or is not there
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+            except FileNotFoundError:
+                return True
+            except Exception:
+                return False
+
+        t0, pid = time.time(), int(os.environ.get("GPIC_GATE_PID") or 0)
+        limit = float(os.environ.get("GPIC_GATE_WAIT_S") or 300)
+        rc = read()
+        while rc is None and time.time() - t0 < limit:
+            if pid and gate_gone():   # its verdict is in the file now, or it never comes
+                rc = read()
+                break
+            time.sleep(0.05)
+            rc = read()
+        first = int(os.environ.get("LOCAL_RANK") or 0) == 0
+        if rc == 0:
+            if first:
+                print(f"[gate] healthy; fit waited {time.time() - t0:.1f} s for the verdict", flush=True)
+            return
+        if first:
+            print(f"[gate] {'no verdict' if rc is None else f'exit status {rc}'} after {time.time() - t0:.1f} s: no fit", flush=True)
+        sys.exit(98)
 
 if __name__ == "__main__":
 
