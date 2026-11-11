@@ -30,7 +30,26 @@
 #  GPIC_LAUNCH_SKIP_EMA_COPY  G1: with GPIC_MFU_NO_EMA=1, configure_model leaves out the second copy of the weights into the EMA
 #                             slot (src/lightning_model_gpic.py); off by default (1 = on) until the same smoke
 # GPIC_LAUNCH_FP=1 (tests): src/callbacks/launch_fingerprint.py prints each rank's state at the first step.
+# Launch guard (2026-11-10, w2503: wandb.init failed with an HTTP 500 before the first step and the launch hung for 10 min).
+# Needs a worktree with src/callbacks/first_step.py (rank 0 writes GPIC_FIRST_STEP_FILE, one file per launch, at the end of
+# its first training batch); without it both stay off.
+#  GPIC_LAUNCH_RETRIES (2)            a launch that ends with a status other than 0 and 98, with no cut (TERM to this script)
+#                                     and no first step, is started again (this script again, by exec: a new gate, the
+#                                     newest checkpoint, the shard log cut again) after GPIC_LAUNCH_RETRY_WAIT_S (60) s, at
+#                                     most this many times; 0 = off. A cut during the wait: exit 99. After the first step
+#                                     nothing changes.
+#  GPIC_LAUNCH_START_TIMEOUT_S (1500) a launch that has neither ended nor reached its first step this many seconds after its
+#                                     start gets TERM, KILL GPIC_LAUNCH_WATCHDOG_KILL_S (30) s later, and counts as a failure
+#                                     before the first step; with no retry left the script ends with 125 (wq: failed, not
+#                                     requeued: a launch that hangs 3 times in a row needs a look); 0 = off. Off after a cut.
+# Each retry and each watchdog firing is one line in launches.txt. baselines/PixelGen/main.py (GPIC_FAIL_FAST) ends a rank
+# whose fit raised within seconds; this script ends the other ranks.
 set -o pipefail
+# a retry starts this script again with the arguments, directory and environment this run got (the environment of this
+# process at its exec, not what the script exported since)
+SELF=$(readlink -f "$0") ARGS0=("$@") CWD0=$PWD
+mapfile -d '' ENV0 < /proc/$$/environ
+ATTEMPT=${GPIC_LAUNCH_ATTEMPT:-0}
 export GPIC_LAUNCH_T0=$(date +%s.%N)
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
 SIZE=$1 D=$2 NB=$3 NT=$4 STEPS=$5; shift 5
@@ -91,7 +110,11 @@ for f in $RUN/shards_started_rank*.txt; do
 done
 echo "$(date -u +%FT%TZ) shard seed $GPIC_SHARD_SEED, shard log kept up to $KEEP_T (checkpoint step $CK_STEP): $(cat $RUN/shards_started_rank*.txt 2>/dev/null | wc -l) lines" >> $RUN/launches.txt
 BENCH_CB=""
-if [ -n "${BENCH_OUT:-}" ]; then BENCH_CB=',{"class_path":"src.callbacks.bench.BenchTimer"}'; fi
+# launch guard (top): the first-step marker, when this worktree has it
+FIRST_STEP=0
+grep -q "class FirstStepMarker" $WT/baselines/PixelGen/src/callbacks/first_step.py 2> /dev/null && FIRST_STEP=1
+[ $FIRST_STEP = 1 ] && BENCH_CB=',{"class_path":"src.callbacks.first_step.FirstStepMarker"}'
+if [ -n "${BENCH_OUT:-}" ]; then BENCH_CB=$BENCH_CB',{"class_path":"src.callbacks.bench.BenchTimer"}'; fi
 # tests only, the last callback: it prints the state the first step starts from and changes nothing
 if [ "${GPIC_LAUNCH_FP:-0}" = 1 ]; then BENCH_CB=$BENCH_CB',{"class_path":"src.callbacks.launch_fingerprint.LaunchFingerprint"}'; fi
 # the ms hook first: a kill between the two saves must not leave last.ckpt ahead of a missing ms file (review N1);
@@ -137,7 +160,8 @@ echo "$(date -u +%FT%TZ) MFU levers: attn=$GPIC_MFU_ATTN fsdp=$GPIC_MFU_FSDP gpu
 # saves at the next step all ranks agree on and stops (src/callbacks/save_on_term.py). Without the trap the TERM ended this shell
 # at once, its EXIT trap (env.sh) removed TMPDIR, and every rank's pin-memory thread failed on the DataLoader's sockets in it
 # before any save (smoke w2409); timeout also saw its child gone and freed the GPUs while main.py still ran.
-trap 'echo "$(date -u +%FT%TZ) train_ladder.sh: TERM; main.py saves and stops"' TERM
+CUT=0   # set by the TERM: no retry and no watchdog after a cut
+trap 'CUT=1; echo "$(date -u +%FT%TZ) train_ladder.sh: TERM; main.py saves and stops"' TERM
 # Launch lever E: a True answer of the vector-set check is kept here, one empty file per compiler, flags, torch build and CPU
 if [ "${GPIC_LAUNCH_VEC_ISA_MEMO:-1}" = 1 ]; then export GPIC_VEC_ISA_MEMO=${GPIC_VEC_ISA_MEMO:-$WC/cache/inductor/vec_isa_memo}; else unset GPIC_VEC_ISA_MEMO; fi
 # Launch lever F: Lightning gives every rank CPUs / ranks threads when fit starts (_set_num_threads_if_needed), but until then
@@ -188,6 +212,49 @@ echo "$(date -u +%FT%TZ) launch levers: gate_bg=$GATE_BG vec_isa_memo=${GPIC_VEC
 # Every process of this launch carries this name in its environment (ranks, data workers, the checkpoint writer): a rank
 # that fails must leave none of them behind (below)
 export GPIC_LAUNCH_ID=$$-$(date +%s%N)
+launch_left() {
+  python - "$GPIC_LAUNCH_ID" $$ <<'PY'
+import os, sys
+key, skip = ("GPIC_LAUNCH_ID=" + sys.argv[1]).encode(), {int(sys.argv[2]), os.getpid(), os.getppid()}
+for p in os.listdir("/proc"):
+    if p.isdigit() and int(p) not in skip:
+        try:
+            if os.stat(f"/proc/{p}").st_uid == os.getuid() and key in open(f"/proc/{p}/environ", "rb").read().split(b"\0"):
+                print(p)
+        except OSError:   # a process that ended, or another user's
+            pass
+PY
+}
+# Launch guard (top of this file): the marker of this launch's first step, the retry count and the start watchdog
+RETRIES=${GPIC_LAUNCH_RETRIES:-2} START_TO=${GPIC_LAUNCH_START_TIMEOUT_S:-1500}
+[[ $RETRIES =~ ^[0-9]+$ ]] || RETRIES=0
+[[ $START_TO =~ ^[0-9]+$ ]] || START_TO=0
+[ $FIRST_STEP = 1 ] || { RETRIES=0 START_TO=0; }
+if [ $FIRST_STEP = 1 ]; then export GPIC_FIRST_STEP_FILE=${TMPDIR:-/tmp}/first_step_$GPIC_LAUNCH_ID; rm -f $GPIC_FIRST_STEP_FILE; else unset GPIC_FIRST_STEP_FILE; fi
+echo "$(date -u +%FT%TZ) launch guard: attempt=$ATTEMPT retries=$RETRIES retry_wait=${GPIC_LAUNCH_RETRY_WAIT_S:-60} start_timeout=$START_TO" >> $RUN/launches.txt
+WD_FIRED=0
+# true when the watchdog must end this launch now: on, no cut, no first step yet, the time is up
+watchdog_due() {
+  [ $START_TO -gt 0 ] && [ $CUT = 0 ] && [ $WD_FIRED = 0 ] && [ ! -e "$GPIC_FIRST_STEP_FILE" ] && [ $((SECONDS - LAUNCH_S)) -ge $START_TO ]
+}
+# the watchdog's action: TERM to the given processes, then KILL for every process of this launch after
+# GPIC_LAUNCH_WATCHDOG_KILL_S (30) s, or at once when they have all ended
+watchdog_fire() {
+  WD_FIRED=1
+  local msg="launch watchdog: no first step and no exit $((SECONDS - LAUNCH_S)) s after the start (limit $START_TO s); TERM, KILL after ${GPIC_LAUNCH_WATCHDOG_KILL_S:-30} s"
+  echo "$(date -u +%FT%TZ) train_ladder.sh: $msg"
+  echo "$(date -u +%FT%TZ) $msg" >> $RUN/launches.txt
+  kill -TERM "$@" 2> /dev/null
+  local lim=$((SECONDS + ${GPIC_LAUNCH_WATCHDOG_KILL_S:-30})) p alive
+  while [ $SECONDS -lt $lim ]; do
+    alive=0; for p in "$@"; do kill -0 $p 2> /dev/null && alive=1; done
+    [ $alive = 1 ] || break
+    sleep 0.5
+  done
+  local lp=$(launch_left)
+  [ -n "$lp" ] && kill -KILL $lp 2> /dev/null
+}
+LAUNCH_S=$SECONDS
 CMD=(python main.py fit --config configs_h100/lite_ladder.yaml --trainer.default_root_dir $ROOT
   --trainer.max_steps $STEPS --trainer.callbacks "$CB"
   --model.denoiser.init_args.hidden_size $D --model.denoiser.init_args.num_groups $((D / 64))
@@ -195,16 +262,37 @@ CMD=(python main.py fit --config configs_h100/lite_ladder.yaml --trainer.default
   --tags.exp ladder_$SIZE --trainer.logger.init_args.name ladder_$SIZE --trainer.logger.init_args.id ladder-$SIZE
   "${MFU_ARGS[@]}" "$@" "${CKPT_ARGS[@]}")
 if [ $RANKS_BG = 0 ]; then
-  "${OMP_ENV[@]}" "${CMD[@]}"
-  rc=$?
+  if [ $START_TO = 0 ]; then
+    "${OMP_ENV[@]}" "${CMD[@]}"
+    rc=$?
+  else   # in the background, so the watchdog can look every 0.5 s; the TERM trap runs at once, main.py gets the cut's TERM itself
+    # (after the first step or a cut it only waits)
+    "${OMP_ENV[@]}" "${CMD[@]}" & MPID=$!
+    while kill -0 $MPID 2> /dev/null && [ $CUT = 0 ] && [ ! -e "$GPIC_FIRST_STEP_FILE" ]; do
+      if watchdog_due; then watchdog_fire $MPID; break; fi
+      sleep 0.5
+    done
+    while kill -0 $MPID 2> /dev/null; do wait $MPID; done   # a TERM ends a wait early: wait again
+    wait $MPID; rc=$?   # bash keeps the status of an ended child: this is main.py's own
+    [ $WD_FIRED = 1 ] && rc=125
+  fi
 else
   export MASTER_ADDR=127.0.0.1 MASTER_PORT=$RANK_PORT NODE_RANK=0 WORLD_SIZE=$NDEV
   RPIDS=()
   for r in $(seq 0 $((NDEV - 1))); do LOCAL_RANK=$r "${OMP_ENV[@]}" "${CMD[@]}" & RPIDS+=($!); done   # rank 0 first: the oldest process
-  LEFT=("${RPIDS[@]}"); rc=0; R0OK=0
-  # Part 1, until rank 0 ends with 0 or a rank fails: wait for the next rank that ends.
+  LEFT=("${RPIDS[@]}"); rc=0; R0OK=0; TICK=""
+  # Part 1, until rank 0 ends with 0 or a rank fails: wait for the next rank that ends. While the start watchdog is armed, a
+  # 5-s sleep beside the ranks wakes the wait, and the watchdog looks.
   while [ ${#LEFT[@]} -gt 0 ]; do
-    dp=""; wait -n -p dp "${LEFT[@]}"; st=$?
+    if [ -n "$TICK" ] && ! kill -0 $TICK 2> /dev/null; then wait $TICK 2> /dev/null; TICK=""; fi
+    if watchdog_due; then
+      watchdog_fire "${LEFT[@]}"
+      for p in "${LEFT[@]}"; do wait $p 2> /dev/null; done
+      LEFT=(); rc=125; break
+    fi
+    if [ -z "$TICK" ] && [ $START_TO -gt 0 ] && [ $CUT = 0 ] && [ ! -e "$GPIC_FIRST_STEP_FILE" ]; then sleep 5 & TICK=$!; fi
+    dp=""; wait -n -p dp "${LEFT[@]}" $TICK; st=$?
+    if [ -n "$TICK" ] && [ "$dp" = "$TICK" ]; then TICK=""; continue; fi
     if [ -z "$dp" ]; then   # the TERM trap ended the wait (the ranks save and stop), or a rank ended that wait -n no longer reports
       for p in "${LEFT[@]}"; do kill -0 $p 2> /dev/null || { dp=$p; wait $p; st=$?; break; }; done
       [ -n "$dp" ] || continue
@@ -219,6 +307,7 @@ else
     elif [ $dp = ${RPIDS[0]} ]; then R0OK=1; break
     fi
   done
+  [ -n "$TICK" ] && { kill $TICK 2> /dev/null; wait $TICK 2> /dev/null; TICK=""; }
   # Part 2: the ranks that are left end by themselves, within GPIC_LAUNCH_RANKS_EXIT_S (120) seconds, or get KILL: no rank keeps
   # the GPUs. After rank 0 ended with 0 (its saves are done) what a later rank does at its exit does not change the launch.
   # A look every 0.2 s and no helper process: a helper that must be stopped can be left behind (a TERM between its fork and its
@@ -251,19 +340,6 @@ fi
 # too: in w2514 rank 0 left with 97 (the checkpoint writer had died) and ranks 1-7 and their data workers, which ignore TERM,
 # stayed on the GPUs until the pilot's sweep; with lever B the ranks get KILL above, their data workers do not. So after a
 # status other than 0: what still carries this launch's name 5 s later gets KILL.
-launch_left() {
-  python - "$GPIC_LAUNCH_ID" $$ <<'PY'
-import os, sys
-key, skip = ("GPIC_LAUNCH_ID=" + sys.argv[1]).encode(), {int(sys.argv[2]), os.getpid(), os.getppid()}
-for p in os.listdir("/proc"):
-    if p.isdigit() and int(p) not in skip:
-        try:
-            if os.stat(f"/proc/{p}").st_uid == os.getuid() and key in open(f"/proc/{p}/environ", "rb").read().split(b"\0"):
-                print(p)
-        except OSError:   # a process that ended, or another user's
-            pass
-PY
-}
 if [ $rc -ne 0 ]; then
   LEFT_P=$(launch_left)
   if [ -n "$LEFT_P" ]; then sleep 5; LEFT_P=$(launch_left); fi
@@ -271,6 +347,33 @@ if [ $rc -ne 0 ]; then
     echo "train_ladder.sh: the launch ended with $rc and $(echo $LEFT_P | wc -w) of its processes are still there; KILL"
     kill -KILL $LEFT_P 2> /dev/null
   fi
+fi
+# Launch guard: a failure before the first step of this launch (no marker file), not a cut, not the gate's 98: wait, then this
+# script again with the same arguments (exec: the same process, so wq and the pilot see one job), up to RETRIES times
+STARTED=0; [ -n "${GPIC_FIRST_STEP_FILE:-}" ] && [ -e "$GPIC_FIRST_STEP_FILE" ] && STARTED=1
+rm -f "${GPIC_FIRST_STEP_FILE:-}" "${GPIC_FIRST_STEP_FILE:-}.tmp"
+if [ $rc -ne 0 ] && [ $rc -ne 98 ] && [ $CUT = 0 ] && [ $STARTED = 0 ] && [ $FIRST_STEP = 1 ] && [ $RETRIES -gt 0 ]; then
+  WHY=$([ $WD_FIRED = 1 ] && echo "watchdog: no first step in $START_TO s" || echo "failed before the first step")
+  if [ $ATTEMPT -lt $RETRIES ]; then
+    N=$((ATTEMPT + 1)) WAIT_S=${GPIC_LAUNCH_RETRY_WAIT_S:-60}
+    echo "$(date -u +%FT%TZ) launch retry $N: status $rc, reason $WHY; next launch in $WAIT_S s" >> $RUN/launches.txt
+    echo "$(date -u +%FT%TZ) train_ladder.sh: launch retry $N of $RETRIES: status $rc ($WHY); next launch in $WAIT_S s"
+    sleep $WAIT_S & SP=$!
+    wait $SP   # a TERM (the pilot's cut) ends the wait at once
+    kill $SP 2> /dev/null; wait $SP 2> /dev/null
+    if [ $CUT = 1 ]; then
+      echo "$(date -u +%FT%TZ) launch retry $N: cut during the wait; exit 99" >> $RUN/launches.txt
+      echo "main.py exit 99 (a cut during the wait before launch retry $N)"; exit 99
+    fi
+    # the same process (wq and the pilot see one job) with the first environment; env.sh sets TMPDIR's EXIT trap again
+    cd "$CWD0"
+    exec env -i "${ENV0[@]}" GPIC_LAUNCH_ATTEMPT=$N bash "$SELF" "${ARGS0[@]}"
+  fi
+  echo "$(date -u +%FT%TZ) launch retry: none left ($RETRIES used); status $rc, reason $WHY" >> $RUN/launches.txt
+elif [ $rc -ne 0 ] && [ $rc -ne 98 ] && [ $rc -ne 99 ] && [ $rc -ne 124 ] && [ $rc -ne 143 ] && [ $CUT = 1 ] && [ $STARTED = 0 ] && [ $FIRST_STEP = 1 ] && [ $ATTEMPT -lt $RETRIES ]; then
+  # a cut that came while a launch failed before its first step: nothing to save, and a retry was still left: requeue
+  echo "$(date -u +%FT%TZ) launch retry: cut after a failure (status $rc) before the first step; exit 99" >> $RUN/launches.txt
+  rc=99
 fi
 # Lightning turns a SIGTERM that reaches only the ranks into exit 0: done means the final ms checkpoint exists (review S1)
 if [ $rc -eq 0 ] && [ -z "${LADDER_PARTIAL_OK:-}" ] && ! ls $RUN/ms-step=$(printf %06d $STEPS)*.ckpt > /dev/null 2>&1; then

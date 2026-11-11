@@ -125,12 +125,62 @@ class ReWriteRootDirCli(LightningCLI):
             print(f"[gate] {'no verdict' if rc is None else f'exit status {rc}'} after {time.time() - t0:.1f} s: no fit", flush=True)
         sys.exit(98)
 
+def leave_after_failure(exc, code=1):
+    """GPIC_FAIL_FAST (on by default, 0 = off; 2026-11-10, w2503). An exception that escapes fit used to end the process
+    through the interpreter's exit hooks, and one of them waits for the other ranks: Lightning registers
+    _destroy_dist_connection (lightning/fabric/utilities/distributed.py:287) for NCCL, and torch's destroy_process_group
+    -> ProcessGroupNCCL::shutdown finalizes the communicator and waits for it. In w2503 rank 0 failed in wandb.init
+    (trainer/call.py:102, before the "pre_setup" barrier at call.py:105) while ranks 1-7 sat in that barrier; rank 0 printed
+    its traceback, wandb's own exit hook ended at 18:43:03, and then rank 0 stayed alive with GPU 0 idle until it was
+    cancelled at 18:51:51 (its NCCL watchdog was still running at 18:51:30, so shutdown had not got past its first stage).
+    Here: the traceback, then the other exit hooks (wandb's teardown, the checkpoint writer's wait, the data workers) in a
+    thread for at most GPIC_FAIL_EXIT_HOOKS_S (120) seconds, without the NCCL destroy, then os._exit with the status. The
+    other ranks wait in a collective for this one: jobs/train_ladder.sh ends them (by GPIC_LAUNCH_ID)."""
+    import atexit
+    import threading
+    import traceback
+    try:
+        sys.excepthook(type(exc), exc, exc.__traceback__)   # torch's hook prefixes the rank once the group exists
+    except Exception:
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.flush()
+        except Exception:
+            pass
+    try:
+        from lightning.fabric.utilities.distributed import _destroy_dist_connection
+        atexit.unregister(_destroy_dist_connection)
+    except Exception:
+        pass
+    limit = float(os.environ.get("GPIC_FAIL_EXIT_HOOKS_S") or 120)
+    t0 = time.time()
+    hooks = threading.Thread(target=atexit._run_exitfuncs, name="exit-hooks", daemon=True)
+    hooks.start()
+    hooks.join(limit)
+    note = f"; exit hooks still running after {limit:.0f} s" if hooks.is_alive() else ""
+    print(f"[main] fit failed ({type(exc).__name__}); leaving with status {code} {time.time() - t0:.1f} s after the "
+          f"traceback{note}", file=sys.stderr, flush=True)
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    os._exit(code)
+
+
 if __name__ == "__main__":
 
-    cli = ReWriteRootDirCli(LightningModel, DataModule,
-                            auto_configure_optimizers=False,
-                            save_config_callback=ReWriteRootSaveConfigCallback,
-                            save_config_kwargs={"overwrite": True})
+    try:
+        cli = ReWriteRootDirCli(LightningModel, DataModule,
+                                auto_configure_optimizers=False,
+                                save_config_callback=ReWriteRootSaveConfigCallback,
+                                save_config_kwargs={"overwrite": True})
+    except SystemExit:   # a status chosen on purpose (the gate's 98, an argument error, Lightning's own exits): as before
+        raise
+    except BaseException as e:
+        if os.environ.get("GPIC_FAIL_FAST", "1") != "1":
+            raise
+        leave_after_failure(e)
     train_dataset = getattr(cli.datamodule, "train_dataset", None)
     if hasattr(train_dataset, "stop_workers"):
         train_dataset.stop_workers()
