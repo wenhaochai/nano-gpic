@@ -134,7 +134,7 @@ def leave_after_failure(exc, code=1):
     its traceback, wandb's own exit hook ended at 18:43:03, and then rank 0 stayed alive with GPU 0 idle until it was
     cancelled at 18:51:51 (its NCCL watchdog was still running at 18:51:30, so shutdown had not got past its first stage).
     Here: the traceback, then the other exit hooks (wandb's teardown, the checkpoint writer's wait, the data workers) in a
-    thread for at most GPIC_FAIL_EXIT_HOOKS_S (120) seconds, without the NCCL destroy, then os._exit with the status. The
+    thread for at most GPIC_FAIL_EXIT_HOOKS_S (30) seconds (wandb's took 1.4 s in w2503), without the NCCL destroy, then os._exit with the status. The
     other ranks wait in a collective for this one: jobs/train_ladder.sh ends them (by GPIC_LAUNCH_ID)."""
     import atexit
     import threading
@@ -153,7 +153,7 @@ def leave_after_failure(exc, code=1):
         atexit.unregister(_destroy_dist_connection)
     except Exception:
         pass
-    limit = float(os.environ.get("GPIC_FAIL_EXIT_HOOKS_S") or 120)
+    limit = float(os.environ.get("GPIC_FAIL_EXIT_HOOKS_S") or 30)
     t0 = time.time()
     hooks = threading.Thread(target=atexit._run_exitfuncs, name="exit-hooks", daemon=True)
     hooks.start()
