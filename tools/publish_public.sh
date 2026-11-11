@@ -28,7 +28,7 @@ MAP=(prod:main ar:ar dist-step:dist-step energy-head:energy-head eval-par:eval-p
      mfu-probe-prof:mfu-probe-prof eval-probe:eval-probe heldout-probe:heldout-probe
      resume-isolate:resume-isolate resume-isolate-r4:resume-isolate-r4 resume-fix-cap:resume-fix-cap
      ckpt-onelast-cap:ckpt-onelast-cap ckpt-onelast-sched:ckpt-onelast-sched resume-isolate-e12:resume-isolate-e12 resume-mech:resume-mech
-     launch-cutfix-cap:launch-cutfix-cap heldout-loss-run5:heldout-loss-run5 eval-official-run10:eval-official-run10
+     launch-cutfix-cap:launch-cutfix-cap launch-retry-cap:launch-retry-cap heldout-loss-run5:heldout-loss-run5 eval-official-run10:eval-official-run10
      eval-official-run11:eval-official-run11 save-on-term-cap:save-on-term-cap save-on-term-sched:save-on-term-sched
      resume-fix-sched:resume-fix-sched ckpt-dedup-cap:ckpt-dedup-cap ckpt-dedup-sched:ckpt-dedup-sched)   # 2026-11-08: the code of every run the page records; 2026-11-09 (gpic-28): the deployed eval (run9), the compiled held-out tool, the optimization scan's probes; 2026-11-09 evening (genmodel): the FP8 resume checks (resume-isolate, resume-isolate-r4, resume-isolate-e12, resume-mech), the AR runs (resume-fix-cap) and the queued AR and XLR-1P runs (ckpt-onelast-cap, ckpt-onelast-sched); 2026-11-10 (genmodel): the code of today's finished runs (launch-cutfix-cap, be47945) and the fixes under it (save on TERM, the resume reseed for the schedule runs, one copy of the raw weights), the held-out run5 and evaluation run10 and run11 tools
 git -C $SRC fetch -q origin
