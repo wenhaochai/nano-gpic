@@ -60,6 +60,15 @@ class CompileWarmup(Callback):
             trainer.strategy.barrier()
             if trainer.is_global_zero:
                 print(f"[warmup] T={T}: {time.time() - t0:.1f} s", flush=True)
+                # progress for the launch watchdog of jobs/train_ladder.sh (2026-11-12, w2557: a 105-block cold compile, 3 buckets of
+                # 10-14 min, passed its 1500 s limit while healthy): each finished bucket restarts its clock
+                _p = os.environ.get("GPIC_FIRST_STEP_FILE")
+                if _p:
+                    try:
+                        with open(_p + ".progress", "w") as f:
+                            f.write(f"{T} {time.time():.0f}\n")
+                    except OSError:
+                        pass
         if trainer.is_global_zero:
             print("[warmup] done", flush=True)
         if trainer.global_step > 0:

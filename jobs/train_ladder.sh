@@ -230,12 +230,17 @@ RETRIES=${GPIC_LAUNCH_RETRIES:-2} START_TO=${GPIC_LAUNCH_START_TIMEOUT_S:-1500}
 [[ $RETRIES =~ ^[0-9]+$ ]] || RETRIES=0
 [[ $START_TO =~ ^[0-9]+$ ]] || START_TO=0
 [ $FIRST_STEP = 1 ] || { RETRIES=0 START_TO=0; }
-if [ $FIRST_STEP = 1 ]; then export GPIC_FIRST_STEP_FILE=${TMPDIR:-/tmp}/first_step_$GPIC_LAUNCH_ID; rm -f $GPIC_FIRST_STEP_FILE; else unset GPIC_FIRST_STEP_FILE; fi
+if [ $FIRST_STEP = 1 ]; then export GPIC_FIRST_STEP_FILE=${TMPDIR:-/tmp}/first_step_$GPIC_LAUNCH_ID; rm -f $GPIC_FIRST_STEP_FILE $GPIC_FIRST_STEP_FILE.progress; else unset GPIC_FIRST_STEP_FILE; fi
 echo "$(date -u +%FT%TZ) launch guard: attempt=$ATTEMPT retries=$RETRIES retry_wait=${GPIC_LAUNCH_RETRY_WAIT_S:-60} start_timeout=$START_TO" >> $RUN/launches.txt
 WD_FIRED=0
-# true when the watchdog must end this launch now: on, no cut, no first step yet, the time is up
+# true when the watchdog must end this launch now: on, no cut, no first step yet, the time is up. The clock starts at the launch and
+# restarts at each compile-warmup bucket that finishes (compile_warmup.py writes $GPIC_FIRST_STEP_FILE.progress; 2026-11-12, w2557:
+# a 105-block cold compile, 3 buckets of 10-14 min, passed 1500 s while healthy), so the limit is the longest silence, not the start
 watchdog_due() {
-  [ $START_TO -gt 0 ] && [ $CUT = 0 ] && [ $WD_FIRED = 0 ] && [ ! -e "$GPIC_FIRST_STEP_FILE" ] && [ $((SECONDS - LAUNCH_S)) -ge $START_TO ]
+  [ $START_TO -gt 0 ] && [ $CUT = 0 ] && [ $WD_FIRED = 0 ] && [ ! -e "$GPIC_FIRST_STEP_FILE" ] || return 1
+  local t0=$LAUNCH_EPOCH m
+  m=$(stat -c %Y "$GPIC_FIRST_STEP_FILE.progress" 2> /dev/null) && [ "$m" -gt $t0 ] && t0=$m
+  [ $(($(date +%s) - t0)) -ge $START_TO ]
 }
 # the watchdog's action: TERM to the given processes, then KILL for every process of this launch after
 # GPIC_LAUNCH_WATCHDOG_KILL_S (30) s, or at once when they have all ended
@@ -254,7 +259,7 @@ watchdog_fire() {
   local lp=$(launch_left)
   [ -n "$lp" ] && kill -KILL $lp 2> /dev/null
 }
-LAUNCH_S=$SECONDS
+LAUNCH_S=$SECONDS LAUNCH_EPOCH=$(date +%s)
 CMD=(python main.py fit --config configs_h100/lite_ladder.yaml --trainer.default_root_dir $ROOT
   --trainer.max_steps $STEPS --trainer.callbacks "$CB"
   --model.denoiser.init_args.hidden_size $D --model.denoiser.init_args.num_groups $((D / 64))
