@@ -1227,7 +1227,8 @@ def T27():
     root = os.path.join(tmp, "root")
     def evs(args, wtn="gmflow_run3", cwd=None):
         a = list(map(str, args)); a[6:6] = ["--wt", wtn]
-        r = subprocess.run(["bash", stub2, *a], env=env0, capture_output=True, text=True, cwd=cwd)
+        # EVAL_PIPELINE=0: the sequential loop (eval-official-run11's chain sources the worktree's jobs/eval_chain_lib.sh, which the stub lacks)
+        r = subprocess.run(["bash", stub2, *a], env=dict(env0, EVAL_PIPELINE="0"), capture_output=True, text=True, cwd=cwd)
         logs = {os.path.basename(f): open(f).read().strip() for f in sorted(glob.glob(os.path.join(root, "eval_*.log")))}
         return r.returncode, r.stdout, logs
     rc, out, logs = evs([0, "d640", 640, 9, 2, root, "66816:euler:8", "66816:gm_ode:8:4"])
