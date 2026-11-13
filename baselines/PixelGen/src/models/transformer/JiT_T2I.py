@@ -354,6 +354,49 @@ class FinalLayer(nn.Module):
         return x
 
 
+@torch.compiler.disable
+def _dtm_fixed_noise(m, rows, cols, device):
+    """The DTM head's m fixed noises [rows, cols] for its mean: a generator seeded 20261113 on the device, outside torch.compile (a graph break), so
+    the mean is a deterministic function of the tokens whatever the global RNG and whether or not the model is compiled."""
+    g = torch.Generator(device=device)
+    g.manual_seed(20261113)
+    return [torch.randn(rows, cols, device=device, dtype=torch.float32, generator=g) for _ in range(m)]
+
+
+class TokenFlowHead(nn.Module):
+    """dtm-ladder (docs/dtm_ladder.md; Transition Matching's DTM, Shaul et al. 2025, arXiv 2506.23589): a small flow on one patch's P = C p^2 values given
+    the backbone's token z, x_hat = head(q, tau, z), q = tau patch + (1 - tau) eta, eta ~ N(0, I). The same module as branch ar's AR_JiT.TokenFlowHead
+    (width 1024, 3 ResBlocks, x-prediction; its loss in training_dtm.py is the official v-space L2 with t_eps)."""
+
+    def __init__(self, patch_dim, cond_dim, width=1024, depth=3):
+        super().__init__()
+        self.proj_in = nn.Linear(patch_dim, width)
+        self.proj_cond = nn.Linear(cond_dim, width)
+        self.t_embedder = TimestepEmbedder(width)
+        self.blocks = nn.ModuleList([ResBlock(width) for _ in range(depth)])
+        self.norm = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+        self.out = nn.Linear(width, patch_dim)
+        for mod in self.modules():
+            if isinstance(mod, nn.Linear):
+                nn.init.xavier_uniform_(mod.weight)
+                nn.init.constant_(mod.bias, 0)
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        for blk in self.blocks:   # each block starts as the identity
+            nn.init.constant_(blk.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(blk.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.out.weight, 0)
+        nn.init.constant_(self.out.bias, 0)
+
+    def forward(self, q, tau, z):
+        """q [M, P], tau [M], z [M, D] -> x_hat [M, P]."""
+        c = self.t_embedder(tau) + self.proj_cond(z)
+        h = self.proj_in(q)
+        for blk in self.blocks:
+            h = blk(h, c)
+        return self.out(self.norm(h))
+
+
 class EnergyHead(nn.Module):
     """Test E (docs/energy_head.md): replaces FinalLayer. The backbone's tokens h are projected once per input; then each of the m samples gets its own noise, a global vector
     through the conditioning and a vector per token, and two small residual MLP blocks per token give a whole-image sample of p(x | x_t, y)."""
@@ -447,6 +490,11 @@ class JiT_T2I(nn.Module):
             gm_k=0,
             gm_spread="image",
             gm_scope="pixel",
+            dtm_width=0,
+            dtm_depth=3,
+            dtm_steps=32,
+            dtm_mean_draws=4,
+            dtm_t_eps=0.05,
     ):
         """xi_dim > 0 makes the model an implicit sampler of p(x | x_t, y) (docs/distribution_step.md): before block xi_block the batch
         forks into m copies, and each copy gets its own noise. xi_dim = 0 is the official point model, unchanged.
@@ -461,13 +509,22 @@ class JiT_T2I(nn.Module):
         K components of a pixel. "image" is the model before this option, unchanged.
         gm_scope (gm_k > 0 only, docs/gmflow.md section 15, owner 2026-11-06): "pixel" = K weights per pixel, the model before this option, unchanged; "image" = one
         mixture per image: the K per-pixel logits are averaged over the image before the softmax, so each image has one set of K weights (no new parameter), and
-        the K means are K whole candidate images. Needs gm_spread "image"."""
+        the K means are K whole candidate images. Needs gm_spread "image".
+        dtm_width > 0 is the flow head of Transition Matching's DTM (docs/dtm_ladder.md): FinalLayer's linear is dropped and a TokenFlowHead of this width and
+        dtm_depth blocks draws each patch from p(patch | x_t, y) given the backbone's normalized token. forward() then returns, by dtm_mode: None or "mean"
+        the head's mean, its x prediction at tau = 0 averaged over dtm_mean_draws fixed head noises (so the point model's samplers, the evaluations and
+        the held-out tool run on it unchanged); "draw" one draw per patch, the head's flow in dtm_steps Euler steps on its x prediction. With dtm_q
+        [B, N, P] and dtm_tau [B, N] (training) it returns the head's x_hat [B, N, P] for that head state. dtm_width = 0 is the official point model,
+        unchanged: the backbone's parameters and every RNG draw are the point model's (the head is built after initialize_weights with the CPU RNG restored)."""
         super().__init__()
         assert not (head_width and xi_dim), "the energy head and the implicit fork are two different models"
         assert not (gm_k and (head_width or xi_dim or code_dim)), "the GMFlow head is a model of its own"
+        assert not (dtm_width and (gm_k or head_width or xi_dim or code_dim)), "the DTM flow head is a model of its own"
+        assert dtm_depth >= 1 and dtm_steps >= 1 and dtm_mean_draws >= 1 and 0 < dtm_t_eps < 1, (dtm_depth, dtm_steps, dtm_mean_draws, dtm_t_eps)
         assert gm_spread in ("image", "pixel") and (gm_spread == "image" or gm_k), (gm_spread, gm_k)
         assert gm_scope in ("pixel", "image") and (gm_scope == "pixel" or (gm_k and gm_spread == "image")), (gm_scope, gm_k, gm_spread)
         self.gm_k = gm_k
+        self.dtm_width, self.dtm_steps, self.dtm_mean_draws, self.dtm_t_eps = dtm_width, dtm_steps, dtm_mean_draws, dtm_t_eps
         self.gm_spread = gm_spread
         self.gm_scope = gm_scope
         self.head_width = head_width
@@ -524,6 +581,10 @@ class JiT_T2I(nn.Module):
                 self.gm_spread_head = nn.Linear(hidden_size, patch_size ** 2)
             nn.init.constant_(self.gm_spread_head.weight, 0)
             nn.init.constant_(self.gm_spread_head.bias, 0)
+        if dtm_width:   # after initialize_weights and with the CPU RNG restored, as gm_spread_head: the backbone and every later draw are the point model's
+            self.final_layer.linear = nn.Identity()   # the head takes norm_final's output; no unused parameter (DDP)
+            with torch.random.fork_rng(devices=[]):
+                self.dtm_head = TokenFlowHead(in_channels * patch_size ** 2, hidden_size, dtm_width, dtm_depth)
         self.precompute_pos = dict()
         self.weight_path = weight_path
         self.load_ema = load_ema
@@ -650,7 +711,29 @@ class JiT_T2I(nn.Module):
         means, logits = x.split([K * C, K], dim=1)
         return means.reshape(B, K, C, H, W), logits.reshape(B, K, 1, H, W)
 
-    def forward(self, x, t, y, return_layer=None, y_mask=None, y_pack=None, m=1, z=None, gm_mode="mean"):
+    def _dtm(self, z, q, tau, mode):
+        """The DTM head on the backbone's normalized tokens z [B, N, D]: x_hat tokens [B, N, P] (see __init__ for q, tau and mode)."""
+        B, N, D = z.shape
+        P = self.in_channels * self.patch_size ** 2
+        zf = z.reshape(B * N, D)
+        if q is not None:
+            return self.dtm_head(q.reshape(B * N, P).to(z.dtype), tau.reshape(B * N), zf).view(B, N, P)
+        if mode == "draw":   # the head's flow, Euler on its x prediction, from fresh noise (the caller seeds the RNG)
+            grid = torch.linspace(0, 1, self.dtm_steps + 1, device=z.device, dtype=torch.float32)
+            hq = torch.randn(B * N, P, device=z.device, dtype=torch.float32)
+            for j in range(self.dtm_steps):
+                hat = self.dtm_head(hq.to(z.dtype), grid[j].expand(B * N), zf).float()
+                hq = hat if j == self.dtm_steps - 1 else hq + (grid[j + 1] - grid[j]) * (hat - hq) / (1 - grid[j]).clamp_min(self.dtm_t_eps)
+            return hq.view(B, N, P)
+        assert mode in (None, "mean"), mode
+        etas = _dtm_fixed_noise(self.dtm_mean_draws, B * N, P, z.device)   # fixed head noises: the mean is a deterministic function of z
+        acc = None
+        for eta in etas:
+            hat = self.dtm_head(eta.to(z.dtype), torch.zeros(B * N, device=z.device, dtype=torch.float32), zf).float()
+            acc = hat if acc is None else acc + hat
+        return (acc / self.dtm_mean_draws).view(B, N, P)
+
+    def forward(self, x, t, y, return_layer=None, y_mask=None, y_pack=None, m=1, z=None, gm_mode="mean", dtm_q=None, dtm_tau=None, dtm_mode=None):
         """y_mask (ladder option B): [B, T] bool, True = a real caption token, T <= txt_max_length; None = the
         official unmasked path (y padded to txt_max_length). y_pack (lever E): packed captions, y [S, txt_embed_dim]. m: samples per input of the implicit sampler; the
         output is [B * m, C, H, W], each input's samples next to each other. z: plan A's code, [B, code_dim].
@@ -664,7 +747,7 @@ class JiT_T2I(nn.Module):
             x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
         if y_pack is not None:
-            if self.gm_k or self.xi_dim or self.code_dim or self.head_width:   # gmflow-ladder: lever E is off in the ladder (GPIC_MFU_PACK=0)
+            if self.gm_k or self.xi_dim or self.code_dim or self.head_width or self.dtm_width:   # gmflow-ladder: lever E is off in the ladder (GPIC_MFU_PACK=0)
                 raise NotImplementedError("packed captions (lever E, GPIC_MFU_PACK=1) run only the point model; set GPIC_MFU_PACK=0 for gm_k, xi_dim, code_dim or head_width")
             t = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
             y = self.y_embedder(y) + self.y_pos_embedding[0].index_select(0, y_pack["pos"]).to(y.dtype)
@@ -715,6 +798,11 @@ class JiT_T2I(nn.Module):
             spread = self.unpatchify(self.gm_spread_head(h.detach()), H, W).float().unsqueeze(1)   # (B, 1, 1, H, W): shared by the K components and the C channels
         else:
             x = self.final_layer(x, condition, m) if self.head_width else self.final_layer(x)
+        if self.dtm_width:   # x = norm_final(tokens): FinalLayer's linear is the identity here
+            assert return_layer is None
+            out = self._dtm(x, dtm_q, dtm_tau, dtm_mode)
+            return out if dtm_q is not None else self.unpatchify(out.to(x.dtype), H, W)
+        assert dtm_q is None and dtm_mode is None, "dtm_q and dtm_mode need dtm_width > 0"
         if self.gm_k:
             assert return_layer is None and gm_mode in ("mean", "full"), gm_mode
             means, logits = self.gm_unpatchify(x, H, W)

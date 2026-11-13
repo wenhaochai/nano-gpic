@@ -1,0 +1,25 @@
+# The DTM flow head on the final ladder (docs/dtm_ladder.md; dtm-ladder, owner popup 2026-11-13 00:5x). Overlay after configs_h100/muon_ladder.yaml
+# (jobs/train_dtm_ladder.sh): the backbone, optimizer and recipe stay the ladder's; the final linear becomes TokenFlowHead (width 1024, 3 blocks)
+# and the loss is the head's (training_dtm.DTMTrainer: the point model's t and x_t, then per patch a head time tau ~ logit-normal(-0.8, 1.6)).
+model:
+  denoiser:
+    init_args:
+      dtm_width: 1024
+      dtm_depth: 3
+      dtm_steps: 32
+      dtm_mean_draws: 4
+      dtm_t_eps: 0.05
+  diffusion_trainer:
+    class_path: src.diffusion.flow_matching.training_dtm.DTMTrainer
+    init_args:
+      scheduler:
+        class_path: src.diffusion.flow_matching.scheduling.LinearScheduler
+      loss_weight_fn: src.diffusion.flow_matching.training_JiT.constant
+      lognorm_t: true
+      timeshift: 1.0
+      P_mean: -0.8
+      P_std: 0.8
+      t_eps: 0.05
+      null_condition_p: 0.0   # owner 2026-11-04: no CFG, so no caption dropout
+      head_P_mean: -0.8
+      head_P_std: 1.6

@@ -51,6 +51,8 @@ E, IMG, TMAX = 32, 64, 32
 SMALL = dict(input_size=IMG, in_channels=3, num_groups=4, hidden_size=64, num_blocks=3, num_text_blocks=1, patch_size=16, txt_embed_dim=E,
              txt_max_length=TMAX, bottleneck_dim=16)
 K, STEPS, B = int(cfg["k"]), int(cfg["steps"]), int(cfg.get("batch", 4))
+DTM = int(cfg.get("dtm", 0))   # dtm-ladder: the DTM flow head of this width (tiny: 1 block), with DTMTrainer; 0 = no head (the point model or the mixture)
+assert not (DTM and K), "the DTM head and the mixture are two models"
 TOTAL = int(cfg.get("total_steps", STEPS))   # the schedule's max_steps (a run cut into launches keeps it)
 
 
@@ -90,12 +92,15 @@ def collate(items):
 
 def build():
     pl.seed_everything(int(cfg.get("seed", 0)), workers=True)
-    den = JiT_T2I(**SMALL, **({"gm_k": K} if K else {}))
+    den = JiT_T2I(**SMALL, **({"gm_k": K} if K else {}), **({"dtm_width": DTM, "dtm_depth": 1, "dtm_steps": 4, "dtm_mean_draws": 2} if DTM else {}))
     targs = dict(scheduler=LinearScheduler(), loss_weight_fn=constant, lognorm_t=True, timeshift=1.0, P_mean=-0.8, P_std=0.8, t_eps=0.05,
                  null_condition_p=0.0)
     if K:
         from src.diffusion.flow_matching.training_gmflow import GMFlowTrainer
         tr = GMFlowTrainer(**targs, lam=0.5, weight_scale=2.0)
+    elif DTM:
+        from src.diffusion.flow_matching.training_dtm import DTMTrainer
+        tr = DTMTrainer(**targs, head_P_mean=-0.8, head_P_std=1.6)
     else:
         tr = JiTTrainer(**targs)
     smp = EulerSamplerJiT(scheduler=LinearScheduler(), w_scheduler=LinearScheduler(), guidance_fn=simple_guidance_fn, num_steps=4, guidance=1.0)

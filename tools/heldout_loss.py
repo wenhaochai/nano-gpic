@@ -45,6 +45,10 @@ held-out negative log-likelihood per dimension, in nats, in v space (v = (x - x_
   the model's mean (one variance per level, fitted on this data), the point model's counterpart; recorded for both models.
 The NLL lines carry nll = true and go to their own done keys (a line without it is a loss-only line, as before).
 
+dtm-ladder (2026-11-13, docs/dtm_ladder.md): a run of the DTM flow head (DTMTrainer, dtm_width > 0) is scored by the head's mean, the model's
+default output (its x prediction at head time 0, averaged over dtm_mean_draws fixed head noises), the same quantity as the point model's loss.
+--nll is not defined for it (a flow head has no closed-form density). Records carry dtm_width.
+
 --levels uniform (2026-11-13; owner's question: does another timestep distribution change the scaling law?): the 16 levels are
 t = (k + 0.5) / 16, uniform on (0, 1), in place of the quantiles of the training distribution; everything else is unchanged
 (the same images, the same noise per image and level index, the same loss). The plain mean is then the expected loss under a
@@ -431,6 +435,8 @@ def run_config(run_dir):
             assert trn["class_path"] == "src.diffusion.flow_matching.training_gmflow.GMFlowTrainer", (c, trn["class_path"])
             assert kw.get("gm_spread", "image") == "image" and kw.get("gm_scope", "pixel") == "pixel", \
                 f"{c}: gm_spread {kw.get('gm_spread')}, gm_scope {kw.get('gm_scope')}: only the per-pixel mixture with one s_u per image is scored"
+        elif kw.get("dtm_width"):   # dtm-ladder: the DTM flow head, scored by its mean (the model's default output; docs/dtm_ladder.md)
+            assert trn["class_path"] == "src.diffusion.flow_matching.training_dtm.DTMTrainer", (c, trn["class_path"])
         else:
             assert trn["class_path"] == "src.diffusion.flow_matching.training_JiT.JiTTrainer", (c, trn["class_path"])
         for k in ("xi_dim", "code_dim", "head_width"):
@@ -670,6 +676,7 @@ def run_task(spec, weights, data, a, device):
     log(f"loaded {','.join(nets)}{' (the EMA slot holds the same bytes: one pass)' if one_pass else ''} in {load_s:.0f} s")
     autocast = torch.device(device).type == "cuda"
     nll = bool(getattr(a, "nll", False))
+    assert not (nll and kw.get("dtm_width")), "--nll is not defined for the DTM flow head"
     mix = nll and bool(kw.get("gm_k"))   # the point model's NLL is the Gaussian one, from its per-level loss
     res = {s: evaluate(nets, tr, data[s], ts, SEED, a.batch, device, autocast, a.threads, log=lambda m, s=s: log(f"{s} {m}"), nll=mix)
            for s in a.splits}
@@ -679,7 +686,7 @@ def run_task(spec, weights, data, a, device):
     for w in weights:
         r = dict(spec)
         r.pop("est_min", None)
-        r.update(weights=w, n_val=a.n_val, n_train=a.n_train, num_t=NUM_T, seed=SEED, data=data["tag"], nll=nll, gm_k=int(kw.get("gm_k") or 0),
+        r.update(weights=w, n_val=a.n_val, n_train=a.n_train, num_t=NUM_T, seed=SEED, data=data["tag"], nll=nll, gm_k=int(kw.get("gm_k") or 0), dtm_width=int(kw.get("dtm_width") or 0),
                  levels=getattr(a, "levels", "train"),
                  train_shard=os.path.basename(data["train_shard"]), t=ts.tolist(),
                  d=kw["hidden_size"], nb=kw["num_blocks"], nt=kw["num_text_blocks"])

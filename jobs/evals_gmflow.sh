@@ -11,7 +11,8 @@
 # official noise (--noise below), EMA, no CFG. Finished tasks are skipped, so a rerun does only the rest.
 # K = 0 evaluates a point model. --link <run dir> links that run's ms checkpoints into <root>/exp_ladder_<size>, so nothing is written in its directory (the ladder's
 # own evaluations, official noise and Euler at 50 steps, have no other call counts, so the ladder's checkpoints are evaluated again here).
-# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--scope image] [--par] <step:sampler:calls[:substeps]> ...
+# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--scope image] [--dtm <width>] [--par] <step:sampler:calls[:substeps]> ...
+# --dtm <width>: a DTM flow-head run (docs/dtm_ladder.md; eval_gmflow.sh EVAL_DTM), with K = 0 and the samplers dtm_draw or euler_mean.
 # --scope image: one mixture per image (docs/gmflow.md section 15; eval_gmflow.sh EVAL_SCOPE, checked against the root's scope.txt); default pixel.
 # --par: one evaluation per GPU, 8 side by side (EVAL_DEVICES=1), for short evaluations whose sampling is a small part of the time.
 # --noise: official (the default since 2026-11-06, owner: the official evaluation setup except CFG = 1; one noise for all prompts, directories end in _official) or
@@ -22,7 +23,7 @@
 # Code: the frozen worktree gpic-wt/gmflow_run2, or gpic-wt/<worktree> with --wt; every evaluation checks that it still holds the commit of the start.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-[ $# -ge 7 ] || { echo "usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--scope image] [--par] <tasks...>"; exit 2; }
+[ $# -ge 7 ] || { echo "usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--scope image] [--dtm <width>] [--par] <tasks...>"; exit 2; }
 K=$1 SIZE=$2 WD=$3 NB=$4 NT=$5 ROOT=$6; shift 6
 LINK=""
 if [ "$1" = "--link" ]; then LINK=$2; shift 2; [ -d "$LINK" ] || { echo "no run directory $LINK"; exit 2; }; fi
@@ -37,6 +38,8 @@ if [ "$1" = "--noise" ]; then NOISE=$2; shift 2; case $NOISE in official|prompt)
 NTAG=""; [ $NOISE = prompt ] || NTAG=official
 SCOPE=pixel
 if [ "$1" = "--scope" ]; then SCOPE=$2; shift 2; case $SCOPE in pixel|image) ;; *) echo "--scope must be pixel or image"; exit 2 ;; esac; fi
+DTMW=0
+if [ "$1" = "--dtm" ]; then DTMW=$2; shift 2; [[ $DTMW =~ ^[1-9][0-9]*$ ]] || { echo "--dtm takes the head's width"; exit 2; }; fi
 PAR=0
 if [ "$1" = "--par" ]; then PAR=1; shift; fi
 [ $# -ge 1 ] || { echo "no tasks"; exit 2; }
@@ -60,7 +63,7 @@ for t in "$@"; do
   fi
 done
 [ -f $ROOT/commit.txt ] || echo $SHA > $ROOT/commit.txt
-export GMFLOW_WT=$WT LADDER_RUN_ROOT=$ROOT EVAL_SIZE=$SIZE EVAL_D=$WD EVAL_NB=$NB EVAL_NT=$NT EVAL_SPREAD=$SPREAD EVAL_NOISE=$NOISE EVAL_SCOPE=$SCOPE
+export GMFLOW_WT=$WT LADDER_RUN_ROOT=$ROOT EVAL_SIZE=$SIZE EVAL_D=$WD EVAL_NB=$NB EVAL_NT=$NT EVAL_SPREAD=$SPREAD EVAL_NOISE=$NOISE EVAL_SCOPE=$SCOPE EVAL_DTM=$DTMW
 run_task() {   # <task>: one evaluation, skipped if it has its metrics.json; returns its exit status
   local t=$1 STEP rest S C N D LOG
   STEP=${t%%:*} rest=${t#*:}; S=${rest%%:*} C=${rest#*:}

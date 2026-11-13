@@ -535,8 +535,65 @@ def H8():
           f"the uniform list is empty, the default list still has the checkpoint")
 
 
+@test
+def H9():
+    """dtm-ladder: a DTM run (DTMTrainer, dtm_width) is scored by the head's mean, end to end on CPU; --nll is refused for it"""
+    import yaml
+    with tempfile.TemporaryDirectory() as tmp:
+        run = os.path.join(tmp, "exp_ladder_d64")
+        os.makedirs(run)
+        dkw = dict(dtm_width=48, dtm_depth=1, dtm_steps=3, dtm_mean_draws=2)
+        init = dict(SMALL, weight_path=None, load_ema=False, **dkw)
+        cfg = {"model": {"denoiser": {"class_path": "src.models.transformer.JiT_T2I.JiT_T2I", "init_args": init},
+                         "diffusion_trainer": {"class_path": "src.diffusion.flow_matching.training_dtm.DTMTrainer", "init_args": {
+                             "scheduler": {"class_path": "src.diffusion.flow_matching.scheduling.LinearScheduler"},
+                             "loss_weight_fn": "src.diffusion.flow_matching.training_JiT.constant", "lognorm_t": True,
+                             "timeshift": 1.0, "P_mean": -0.8, "P_std": 0.8, "t_eps": 0.05, "null_condition_p": 0.0,
+                             "head_P_mean": -0.8, "head_P_std": 1.6}}}}
+        with open(os.path.join(run, "config-TrainerFn.FITTING-0000000000.yaml"), "w") as f:
+            yaml.safe_dump(cfg, f)
+        torch.manual_seed(3)
+        net = JiT_T2I(**SMALL, **dkw).eval()
+        with torch.no_grad():
+            for prm in net.parameters():
+                if prm.requires_grad:
+                    prm.add_(0.05 * torch.randn_like(prm))
+        sd = {"denoiser." + k: v for k, v in net.state_dict().items()}
+        sd.update({"ema_denoiser." + k: v for k, v in net.state_dict().items()})
+        ck = os.path.join(run, "ms-step=000100.ckpt")
+        torch.save({"global_step": 100, "state_dict": sd}, ck)
+        os.utime(ck, (1, 1))
+        n_val, n_train = 4, 3
+        data = dict(version=1, n_val=n_val, n_train=n_train, train_shard="/x/gpic_train_00787.tar",
+                    val=H.pack_split(None, fake_split(n_val, 5)["img"], [torch.randn(L, 32) for L in (3, 5, 2, 7)], {}),
+                    train=H.pack_split(None, fake_split(n_train, 6)["img"], [torch.randn(L, 32) for L in (4, 1, 6)], {}))
+        for sp in ("val", "train"):
+            data[sp]["text_max_length"] = SMALL["txt_max_length"]
+        dpath = os.path.join(tmp, "data.pt")
+        torch.save(data, dpath)
+        out = os.path.join(tmp, "res.jsonl")
+        common = ["--n-val", str(n_val), "--n-train", str(n_train), "--data", dpath]
+        rc, txt = run_main(["work", "--out", out, "--device", "cpu", "--batch", "3", "--threads", "1", "--ckpt", ck] + common)
+        assert rc == 0, txt
+        recs = [json.loads(l) for l in open(out)]
+        assert [r["weights"] for r in recs] == ["ema", "raw"] and all(r["dtm_width"] == 48 and r["one_pass"] for r in recs), recs   # one pass, two records (H6)
+        assert recs[0]["loss_val_t"] == recs[1]["loss_val_t"]
+        d2 = H.load_data(dpath, "cpu")
+        ts = H.levels(-0.8, 0.8, 1.0)
+        ref = H.evaluate({"raw": net}, H.make_trainer(LOSS), d2["val"], ts, batch=3, threads=1)["raw"]["level_mean"]
+        rel = (torch.tensor(recs[1]["loss_val_t"], dtype=torch.float64) - ref).abs().max().item() / ref.mean().item()
+        assert rel < 2e-5, rel
+        try:   # the worker catches a task's error, logs it and returns nonzero; no record is written
+            rc2, txt2 = run_main(["work", "--out", out + "2", "--device", "cpu", "--batch", "3", "--threads", "1", "--nll", "--ckpt", ck] + common)
+            refused = rc2 != 0 and not (os.path.exists(out + "2") and open(out + "2").read().strip())
+        except AssertionError:
+            refused = True
+        assert refused, "--nll ran on a DTM run"
+    print(f"  DTM run: one pass, two equal records, dtm_width 48, loss of the head's mean {recs[1]['loss_val']:.5f}; max rel diff to evaluate() {rel:.1e}")
+
+
 def main():
-    tests = [H1, H2, H3, H4, H5, H6, H7, H8]
+    tests = [H1, H2, H3, H4, H5, H6, H7, H8, H9]
     want = set(sys.argv[1:])
     for t in tests:
         if not want or t.__name__ in want:
