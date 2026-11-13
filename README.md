@@ -10,7 +10,7 @@ The goal:
 
 This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026; its README is [GPIC_README.md](GPIC_README.md)). Every run, number and figure is on the experiment page, [wenhaochai.com/exps/gpic-speed.html](https://wenhaochai.com/exps/gpic-speed.html). Training logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed). The speed records, their rules and the speed work are in [docs/speedrun.md](docs/speedrun.md).
 
-*Updated 2026-11-11.*
+*Updated 2026-11-13.*
 
 ## 1. The ladder
 
@@ -100,7 +100,7 @@ Nine steps, in order. Each gives a decision and its evidence.
 
 **4. The shape.** Decision: open. The optimum is not bracketed on the deep side; the ladder's shapes stay in use meanwhile. Evidence (sweep AR, depth against width at a fixed number of parameters): at about 110M parameters (1.5e18 FLOPs), 512 × (15+2) is best, with a held-out loss of 0.06891 against the ladder's 640 × (9+2) at 0.06897. At about 250M (7.9e18 FLOPs) and about 670M (5.4e19 FLOPs), the loss falls toward deeper, narrower shapes through the deepest tested: 640 × (23+2) 0.06679 against the ladder's 896 × (11+2) 0.06695, and 896 × (32+3) 0.06464 against 1280 × (14+3) 0.06492. At equal FLOPs the deepest shapes take 15% and 23% more H100-hours (wall time, launches included).
 
-**5. The batch against the steps.** Decision so far: batch 1024 at every size, as in the first Muon ladder, with the steps of one ladder within a factor of ten. The batch checks at larger compute are not yet results.
+**5. The batch against the steps.** Decision so far: batch 1024 at every size, as in the first Muon ladder, with the steps of one ladder within a factor of ten. At equal compute a larger batch is worse: doubling it raises the held-out loss by up to 0.60% (d9 and d14 from 512 to 4096 images, d16 at 5.7e19 FLOPs from 1024 to 2048). At d12 and 2.9e19 FLOPs, 512 and 1024 differ by 0.005% and 2048 is 0.10% higher.
 
 **6. Iso-FLOP curves.** Decision: the tokens per parameter of the best size, about 48 image tokens per block parameter so far. Evidence: with each size at its best rate, the best size is 120M, 171M and 248M block parameters at 3.6e18, 7.1e18 and 1.4e19 FLOPs (47 to 49 image tokens per parameter at all three budgets), and grows as compute to the power 0.53. At a fixed rate it had been 58, 36 and 30 tokens per parameter. The curves are being redone with the rate rule and the 50% cooldown, one rate per size, from 3.6e18 to 2.3e20 FLOPs, with two sizes added between the ladder's: d13, 1152 × (13+3), and d15, 1408 × (15+3). In the runs finished so far, the lowest held-out loss is at d12 at 1.4e19 FLOPs (0.06628; d13 is 0.14% and d14 0.35% above it), at d13 and d14 together at 2.9e19 (both 0.06558), at d14 at 5.7e19 (0.06487) and at d16 at 1.1e20 (0.06416, with d14 0.11% above). The rows at 3.6e18, 7.1e18 and 2.3e20 FLOPs are not finished.
 
