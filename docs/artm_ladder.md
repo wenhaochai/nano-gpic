@@ -24,6 +24,8 @@ With art_T unused the point model is unchanged; ARTMJiT's backbone starts at the
 
 ## FLOP matching
 
+**Superseded (owner, 2026-11-13 07:4x: 「不需要对齐算力 对齐所有训练细节就行」).** The runs train with the point runs' training details: steps 21248 / 40192 / 89600 at d10 / d12 / d14, the same Muon and AdamW rates, Muon decay 0.0173 / 0.01829 / 0.01641, batch 1024, 50% cooldown, GPIC Full; the queued jobs' arguments were changed before any started (tmp/ladder_prof/dist_phase2/align_steps_1113.py). The FLOP-matched rows below are kept for the record.
+
 ARTM's forward FLOPs per training image: 512 image tokens through the blocks, attention on the keys the mask allows, the caption as the point model's,
 the head on 256 patches (`tools/artm_ladder/steps.py`, the ladder's own per-part formula). Steps = point steps x point FLOPs / ARTM FLOPs.
 
