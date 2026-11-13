@@ -32,6 +32,8 @@ time sampling (lognormal, mean -0.8, std 0.8), no caption dropout, bf16, gradien
 
 ## 3. FLOP matching
 
+**Superseded (owner, 2026-11-13 07:4x: 「不需要对齐算力 对齐所有训练细节就行」).** The runs train with the point runs' training details: steps 21248 / 40192 / 89600 at d10 / d12 / d14, the same rates, Muon decay 0.0173 / 0.01829 / 0.01641, batch 1024, 50% cooldown, GPIC Full; the queued jobs' arguments were changed before any started (tmp/ladder_prof/dist_phase2/align_steps_1113.py). The FLOP-matched rows below are kept for the record.
+
 r = the head's added forward FLOPs / the point model's forward FLOPs per image. Steps = point steps / (1 + r), rounded down to a multiple of
 32. Muon decay = 5 / (Muon LR x steps). `tools/gmflow_ladder/steps.py` prints the rows.
 
