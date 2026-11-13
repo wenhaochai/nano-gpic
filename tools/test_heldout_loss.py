@@ -478,8 +478,65 @@ def H7():
         assert d < 2e-5 and di < 2e-5, (d, di)
 
 
+@test
+def H8():
+    """--levels uniform: t = (k + 0.5) / 16, and its records have their own done keys"""
+    import types
+    ts = H.levels(-0.8, 0.8, 1.0, kind="uniform")
+    want = (torch.arange(16, dtype=torch.float64) + 0.5) / 16
+    assert ts.dtype == torch.float32 and torch.equal(ts, want.float()), ts
+    assert torch.equal(H.levels(-0.8, 0.8, 1.0), H.levels(-0.8, 0.8, 1.0, kind="train"))
+    assert not torch.equal(ts, H.levels(-0.8, 0.8, 1.0))
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "o.jsonl")
+        base = dict(ckpt="/x/ms-step=000010.ckpt", n_val=4, n_train=4, num_t=H.NUM_T, seed=H.SEED, data="tag")
+        with open(out, "w") as f:
+            for w in ("ema", "raw"):
+                f.write(json.dumps(dict(base, weights=w, levels="uniform")) + "\n")
+            f.write(json.dumps(dict(base, weights="raw")) + "\n")   # a record of before the option: levels of the training distribution
+        done = H.done_keys(out)
+        spec = {"ckpt": base["ckpt"]}
+        a = lambda **k: types.SimpleNamespace(n_val=4, n_train=4, **k)
+        assert H.todo_weights(spec, done, a(levels="uniform"), "tag") == []
+        assert H.todo_weights(spec, done, a(levels="train"), "tag") == ["ema"]
+        assert H.todo_weights(spec, done, a(), "tag") == ["ema"]            # no --levels attribute: train
+        assert H.todo_weights(spec, done, a(levels="uniform", nll=True), "tag") == ["ema", "raw"]
+    print(f"  uniform levels {ts[0]:.5f} .. {ts[-1]:.5f}; done keys separate train, uniform and nll records")
+    # end to end on CPU, as the job runs it: work --levels uniform, then the lists
+    with tempfile.TemporaryDirectory() as tmp:
+        ck = write_run(tmp, "d64", [100], [(11, 11)])
+        data = dict(version=1, n_val=4, n_train=3, train_shard="/x/gpic_train_00787.tar",
+                    val=H.pack_split(None, fake_split(4, 5)["img"], [torch.randn(L, 32) for L in (3, 5, 2, 7)], {}),
+                    train=H.pack_split(None, fake_split(3, 6)["img"], [torch.randn(L, 32) for L in (4, 1, 6)], {}))
+        for sp in ("val", "train"):
+            data[sp]["text_max_length"] = SMALL["txt_max_length"]
+        dpath = os.path.join(tmp, "data.pt")
+        torch.save(data, dpath)
+        out = os.path.join(tmp, "res.jsonl")
+        common = ["--n-val", "4", "--n-train", "3", "--data", dpath]
+        listed = lambda txt: sorted(json.loads(l)["step"] for l in txt.splitlines() if l.startswith("{"))
+        rc, txt = run_main(["work", "--out", out, "--device", "cpu", "--batch", "3", "--threads", "1", "--levels", "uniform",
+                            "--ckpt", ck[0]] + common)
+        assert rc == 0, txt
+        recs = [json.loads(l) for l in open(out)]
+        assert len(recs) == 2 and all(r["levels"] == "uniform" for r in recs), recs
+        for r in recs:
+            assert np.allclose(r["t"], want.numpy()) and len(r["loss_val_t"]) == 16 and len(r["loss_train_t"]) == 16, sorted(r)
+            assert abs(sum(r["loss_val_t"]) / 16 - r["loss_val"]) < 1e-9
+        d2 = H.load_data(dpath, "cpu")
+        ref = H.evaluate({"raw": tiny_net(11)}, H.make_trainer(LOSS), d2["val"], ts, batch=3, threads=1)["raw"]["level_mean"]
+        rel = (torch.tensor(recs[1]["loss_val_t"], dtype=torch.float64) - ref).abs().max().item() / ref.mean().item()
+        assert rel < 2e-5, rel
+        rc, txt = run_main(["list", "--out", out, "--min-age", "0", "--levels", "uniform", "--ckpt", *ck] + common)
+        assert listed(txt) == [], txt
+        rc, txt = run_main(["list", "--out", out, "--min-age", "0", "--ckpt", *ck] + common)
+        assert listed(txt) == [100], txt
+    print(f"  end to end: 2 records with levels = uniform and the 16 uniform t; max rel diff to evaluate() {rel:.1e}; "
+          f"the uniform list is empty, the default list still has the checkpoint")
+
+
 def main():
-    tests = [H1, H2, H3, H4, H5, H6, H7]
+    tests = [H1, H2, H3, H4, H5, H6, H7, H8]
     want = set(sys.argv[1:])
     for t in tests:
         if not want or t.__name__ in want:

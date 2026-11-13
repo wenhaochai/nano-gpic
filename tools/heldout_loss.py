@@ -44,6 +44,13 @@ held-out negative log-likelihood per dimension, in nats, in v space (v = (x - x_
   gauss_nll_<split>_t[k] = 0.5 log(2 pi e MSE_k), MSE_k = loss_<split>_t[k]: the NLL of the best fixed-variance Gaussian around
   the model's mean (one variance per level, fitted on this data), the point model's counterpart; recorded for both models.
 The NLL lines carry nll = true and go to their own done keys (a line without it is a loss-only line, as before).
+
+--levels uniform (2026-11-13; owner's question: does another timestep distribution change the scaling law?): the 16 levels are
+t = (k + 0.5) / 16, uniform on (0, 1), in place of the quantiles of the training distribution; everything else is unchanged
+(the same images, the same noise per image and level index, the same loss). The plain mean is then the expected loss under a
+uniform t, and a re-weighting of the 16 per-level means gives any other distribution on (0.03, 0.97). The runs trained with the
+logit-normal distribution (3% of its mass above t = 0.67, 0.01% above 0.9), so the levels near 0 and 1 score the model where it
+saw little or no training. Records carry levels = "uniform" and their own done keys; keep them in their own output file.
 """
 import argparse
 import fcntl
@@ -259,8 +266,12 @@ def load_data(path, device):
 
 
 # --------------------------------------------------------------------------------------------------------------- loss
-def levels(P_mean, P_std, timeshift, num_t=NUM_T):
-    """FixedValLoss's levels: the quantiles (k + 0.5) / num_t of the training t (float64, then float32, then the shift)."""
+def levels(P_mean, P_std, timeshift, num_t=NUM_T, kind="train"):
+    """FixedValLoss's levels: the quantiles (k + 0.5) / num_t of the training t (float64, then float32, then the shift).
+    kind "uniform" (--levels uniform): t = (k + 0.5) / num_t itself, the quantiles of a uniform t on (0, 1), with no shift."""
+    if kind == "uniform":
+        return ((torch.arange(num_t, dtype=torch.float64) + 0.5) / num_t).float()
+    assert kind == "train", kind
     from src.diffusion.flow_matching.training_JiT import time_shift_fn
     q = (torch.arange(num_t, dtype=torch.float64) + 0.5) / num_t
     base_t = torch.sigmoid(P_mean + P_std * torch.special.ndtri(q)).float()
@@ -527,12 +538,14 @@ def done_keys(out):
                     except json.JSONDecodeError:   # a writer killed inside its write; that entry is redone
                         print(f"[heldout] {out}: skips an unreadable line: {line[:80]!r}", file=sys.stderr, flush=True)
                         continue
-                    keys.add((r["ckpt"], r["weights"], r["n_val"], r["n_train"], r["num_t"], r["seed"], r["data"], bool(r.get("nll"))))
+                    keys.add((r["ckpt"], r["weights"], r["n_val"], r["n_train"], r["num_t"], r["seed"], r["data"], bool(r.get("nll")),
+                              r.get("levels", "train")))
     return keys
 
 
 def todo_weights(spec, done, a, tag):
-    return [w for w, _ in WEIGHTS if (spec["ckpt"], w, a.n_val, a.n_train, NUM_T, SEED, tag, bool(getattr(a, "nll", False))) not in done]
+    return [w for w, _ in WEIGHTS if (spec["ckpt"], w, a.n_val, a.n_train, NUM_T, SEED, tag, bool(getattr(a, "nll", False)),
+                                      getattr(a, "levels", "train")) not in done]
 
 
 # Seconds per eager forward of 128 images at T = 56 (bf16 autocast, both nets alike), measured on a vis2 A40 with `bench`
@@ -652,7 +665,7 @@ def run_task(spec, weights, data, a, device):
     if compiled:
         nets = {w: torch.compile(n) for w, n in nets.items()}
     tr = make_trainer(loss)
-    ts = levels(loss["P_mean"], loss["P_std"], loss["timeshift"])
+    ts = levels(loss["P_mean"], loss["P_std"], loss["timeshift"], kind=getattr(a, "levels", "train"))
     load_s = time.time() - t0
     log(f"loaded {','.join(nets)}{' (the EMA slot holds the same bytes: one pass)' if one_pass else ''} in {load_s:.0f} s")
     autocast = torch.device(device).type == "cuda"
@@ -667,6 +680,7 @@ def run_task(spec, weights, data, a, device):
         r = dict(spec)
         r.pop("est_min", None)
         r.update(weights=w, n_val=a.n_val, n_train=a.n_train, num_t=NUM_T, seed=SEED, data=data["tag"], nll=nll, gm_k=int(kw.get("gm_k") or 0),
+                 levels=getattr(a, "levels", "train"),
                  train_shard=os.path.basename(data["train_shard"]), t=ts.tolist(),
                  d=kw["hidden_size"], nb=kw["num_blocks"], nt=kw["num_text_blocks"])
         for s in a.splits:
@@ -790,6 +804,9 @@ def main(argv=None):
             p.add_argument("--splits", default="val,train", help="comma-separated, of " + ",".join(SPLITS))
         if name in ("list", "work"):
             p.add_argument("--nll", action="store_true", help="gmflow-ladder: also the NLL per dimension per level (module docstring)")
+            p.add_argument("--levels", default="train", choices=("train", "uniform"),
+                           help="train: the quantiles of the training t distribution (the default, every record before 2026-11-13); "
+                                "uniform: t = (k + 0.5) / 16 (module docstring); its own done keys")
         if name == "bench":
             for k, v in (("d", 1792), ("nb", 18), ("nt", 4), ("T", 56), ("iters", 10), ("gpu", 0), ("batch", BATCH)):
                 p.add_argument(f"--{k}", type=int, default=v)
