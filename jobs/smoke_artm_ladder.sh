@@ -107,9 +107,9 @@ grep "sample check\|^task \|^artm ladder evaluations" $OUT/E1.log | cut -c1-400 
 log "END E1 rc=$rc"
 [ $rc -eq 0 ] || { fail=1; tail -n 30 $OUT/E1.log; tail -n 30 $OUT/raw_view/artm_ladder/*/eval_*.log 2>/dev/null; }
 [ -L $OUT/raw_view/artm_ladder/artm-d14-smoke/exp_ladder_d1280/ms-step=000320.ckpt ] || { log "FAIL: the raw view of artm-d14-smoke is not a link"; fail=1; }
-# E2: the full evaluation at d10
+# E2: the full evaluation at d10 (smoke w2642, 2026-11-13: 50K captions took 23:06 to predict on 8 H100s, so 1500 s cut the FD; now 2400 s)
 log "START E2 (d10: artm on 50K captions)"
-timeout -k 60 1500 bash $WT/jobs/evals_artm_ladder.sh --root $OUT artm-d10-smoke:768:10:2:320 > $OUT/E2.log 2>&1
+timeout -k 60 2400 bash $WT/jobs/evals_artm_ladder.sh --root $OUT artm-d10-smoke:768:10:2:320 > $OUT/E2.log 2>&1
 rc=$?
 grep "^task \|^artm ladder evaluations" $OUT/E2.log | cut -c1-300 | tee -a $OUT/phases.log
 log "END E2 rc=$rc"
