@@ -11,8 +11,9 @@
 # official noise (--noise below), EMA, no CFG. Finished tasks are skipped, so a rerun does only the rest.
 # K = 0 evaluates a point model. --link <run dir> links that run's ms checkpoints into <root>/exp_ladder_<size>, so nothing is written in its directory (the ladder's
 # own evaluations, official noise and Euler at 50 steps, have no other call counts, so the ladder's checkpoints are evaluated again here).
-# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--scope image] <step:sampler:calls[:substeps]> ...
+# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--scope image] [--par] <step:sampler:calls[:substeps]> ...
 # --scope image: one mixture per image (docs/gmflow.md section 15; eval_gmflow.sh EVAL_SCOPE, checked against the root's scope.txt); default pixel.
+# --par: one evaluation per GPU, 8 side by side (EVAL_DEVICES=1), for short evaluations whose sampling is a small part of the time.
 # --noise: official (the default since 2026-11-06, owner: the official evaluation setup except CFG = 1; one noise for all prompts, directories end in _official) or
 # prompt (each prompt's own noise, the protocol of every result before; the old directory names); eval_gmflow.sh EVAL_NOISE.
 # --spread pixel: the run has the per-pixel spread (docs/gmflow.md section 7; eval_gmflow.sh EVAL_SPREAD); default image.
@@ -21,7 +22,7 @@
 # Code: the frozen worktree gpic-wt/gmflow_run2, or gpic-wt/<worktree> with --wt; every evaluation checks that it still holds the commit of the start.
 set -o pipefail
 source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
-[ $# -ge 7 ] || { echo "usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--scope image] <tasks...>"; exit 2; }
+[ $# -ge 7 ] || { echo "usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--scope image] [--par] <tasks...>"; exit 2; }
 K=$1 SIZE=$2 WD=$3 NB=$4 NT=$5 ROOT=$6; shift 6
 LINK=""
 if [ "$1" = "--link" ]; then LINK=$2; shift 2; [ -d "$LINK" ] || { echo "no run directory $LINK"; exit 2; }; fi
@@ -36,6 +37,8 @@ if [ "$1" = "--noise" ]; then NOISE=$2; shift 2; case $NOISE in official|prompt)
 NTAG=""; [ $NOISE = prompt ] || NTAG=official
 SCOPE=pixel
 if [ "$1" = "--scope" ]; then SCOPE=$2; shift 2; case $SCOPE in pixel|image) ;; *) echo "--scope must be pixel or image"; exit 2 ;; esac; fi
+PAR=0
+if [ "$1" = "--par" ]; then PAR=1; shift; fi
 [ $# -ge 1 ] || { echo "no tasks"; exit 2; }
 WT=$WC/project/gpic-wt/$WTN
 [ -f "$WT/baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py" ] || { echo "$WT holds old code"; exit 2; }
@@ -58,15 +61,53 @@ for t in "$@"; do
 done
 [ -f $ROOT/commit.txt ] || echo $SHA > $ROOT/commit.txt
 export GMFLOW_WT=$WT LADDER_RUN_ROOT=$ROOT EVAL_SIZE=$SIZE EVAL_D=$WD EVAL_NB=$NB EVAL_NT=$NT EVAL_SPREAD=$SPREAD EVAL_NOISE=$NOISE EVAL_SCOPE=$SCOPE
-fail=0
-for t in "$@"; do
+run_task() {   # <task>: one evaluation, skipped if it has its metrics.json; returns its exit status
+  local t=$1 STEP rest S C N D LOG
   STEP=${t%%:*} rest=${t#*:}; S=${rest%%:*} C=${rest#*:}
   N=""; case $C in *:*) N=${C#*:}; C=${C%%:*} ;; esac   # step:sampler:calls:substeps
   D=$(eval_dir $(printf %06d $STEP) $S $C "$N" "$TABLE" "$NTAG")
-  if [ -f $RUN/$D/metrics.json ]; then echo "eval $t done before"; continue; fi
-  [ "$(git -C $WT rev-parse HEAD)" = "$SHA" ] || { echo "$WT moved from $SHA"; exit 2; }
+  if [ -f $RUN/$D/metrics.json ]; then echo "eval $t done before"; return 0; fi
+  [ "$(git -C $WT rev-parse HEAD)" = "$SHA" ] || { echo "$WT moved from $SHA"; return 2; }
   LOG=eval_${STEP}_${S}_$C${N:+_n$N}${NTAG:+_$NTAG}; [ $S != gm_ode_cal ] || LOG=eval_${STEP}_${D#eval_*_}   # the old log names (+ _official); a table's hash for gm_ode_cal
-  EVAL_SUBSTEPS=$N bash $WT/jobs/eval_gmflow.sh $K $STEP $S $C > $ROOT/$LOG.log 2>&1 || fail=1
-  echo "eval $t fail=$fail"
-done
-exit $fail
+  if [ "${EVAL_PHASE:-all}" = score ]; then EVAL_SUBSTEPS=$N bash $WT/jobs/eval_gmflow.sh $K $STEP $S $C >> $ROOT/$LOG.log 2>&1
+  else EVAL_SUBSTEPS=$N bash $WT/jobs/eval_gmflow.sh $K $STEP $S $C > $ROOT/$LOG.log 2>&1; fi
+}
+fail=0
+if [ $PAR = 0 ]; then
+  # gpic-28 2026-11-09 (the eval idle-GPU work; run6: jobs/eval_chain_lib.sh): with several tasks, task i's scoring (DINOv2 on the GPUs, Inception beside it) runs in
+  # the background while task i+1's predict runs; the predict after it sets up and compiles beside them and waits at its batch 1; one
+  # scoring overlaps one predict. The samples wait in a job-level directory in /dev/shm, removed at exit (env.sh's EXIT trap kept).
+  # A caller's EVAL_PHASE (jobs/evals_group.sh: one task per call) passes through to eval_gmflow.sh unchanged.
+  if [ $# -gt 1 ] && [ "${EVAL_PHASE:-all}" = all ] && [ "${EVAL_PIPELINE:-1}" = 1 ] && [ -z "${EVAL_LIMIT_BATCHES:-}" ] && [ -d /dev/shm ]; then
+    find /dev/shm -maxdepth 1 -name 'gpic_evals_*' -user "$USER" -mmin +360 -exec rm -rf {} + 2>/dev/null || true   # a killed job's
+    export EVAL_SHM_ROOT=$(mktemp -d /dev/shm/gpic_evals_XXXXXX)
+    _prev_exit_cmd=$(trap -p EXIT | sed -E "s/^trap -- '(.*)' EXIT$/\1/; s/'\\\\''/'/g")
+    _on_exit() { rm -rf -- "$EVAL_SHM_ROOT"; eval "$_prev_exit_cmd"; }
+    trap _on_exit EXIT
+    source $WT/jobs/eval_chain_lib.sh   # run6: the next predict sets up beside this one (no idle gap between predicts)
+    TASKS=("$@"); NEXT=0
+    chain_next() { if [ $NEXT -lt ${#TASKS[@]} ]; then CHAIN_I=$NEXT; NEXT=$((NEXT + 1)); else CHAIN_I=-1; fi; }
+    chain_cmd() { EVAL_PHASE=$1 run_task ${TASKS[$2]}; }
+    chain_run
+    for i in $CHAIN_FAILED; do echo "eval ${TASKS[$i]} failed"; fail=1; done
+    exit $fail
+  fi
+  for t in "$@"; do run_task $t || fail=1; echo "eval $t fail=$fail"; done
+  exit $fail
+fi
+# --par: one evaluation per GPU, 8 side by side; each worker takes the next task from a shared counter (flock), so no GPU idles
+# while tasks remain. Each evaluation predicts and scores on its own GPU (EVAL_DEVICES=1).
+TASKS=("$@"); CNT=$TMPDIR/evals_counter; FAILS=$TMPDIR/evals_failed; echo 0 > $CNT; : > $FAILS
+worker() {
+  local g=$1 i
+  while :; do
+    i=$(flock $CNT.lock bash -c 'n=$(cat '"$CNT"'); echo $((n + 1)) > '"$CNT"'; echo $n')
+    [ $i -lt ${#TASKS[@]} ] || return 0
+    if CUDA_VISIBLE_DEVICES=$g EVAL_DEVICES=1 run_task ${TASKS[$i]}; then echo "eval ${TASKS[$i]} on GPU $g ok"
+    else echo "eval ${TASKS[$i]} on GPU $g FAILED"; echo ${TASKS[$i]} >> $FAILS; fi
+  done
+}
+for g in 0 1 2 3 4 5 6 7; do worker $g & done
+wait
+[ ! -s $FAILS ] || { echo "failed: $(tr '\n' ' ' < $FAILS)"; exit 1; }
+exit 0
