@@ -1,0 +1,18 @@
+# Overlay on lite_ladder_sample.yaml: the exact step of ImplicitSampler on a point model: deterministic DDIM, with no clamp and a last step on x_hat. The control of the energy head (docs/energy_head.md, section 9). num_steps = network calls per image.
+model:
+  diffusion_sampler:
+    class_path: src.diffusion.flow_matching.sampling_implicit.ImplicitSampler
+    init_args:
+      w_scheduler:
+        class_path: src.diffusion.flow_matching.scheduling.LinearScheduler
+      timeshift: 1.0
+      guidance_interval_min: 0.0
+      guidance_interval_max: 1.0
+      step_fn: src.diffusion.flow_matching.sampling.ode_step_fn
+      last_step: null
+      last_step_fn: src.diffusion.flow_matching.sampling.ode_step_fn
+      scheduler:
+        class_path: src.diffusion.flow_matching.scheduling.LinearScheduler
+      guidance_fn: src.diffusion.base.guidance.simple_guidance_fn
+      num_steps: 50
+      guidance: 1.0

@@ -1,0 +1,11 @@
+# Overlay on lite_ladder.yaml: the autoregressive model (docs/autoregressive.md). The optimizer, LR, EMA, data and CFG dropout are the official recipe's.
+model:
+  denoiser:
+    class_path: src.models.transformer.AR_JiT.ARJiT
+  diffusion_trainer:
+    class_path: src.diffusion.flow_matching.training_ar.ARTrainer
+    init_args:
+      P_mean: -0.8
+      P_std: 1.6
+      t_eps: 0.05
+      null_condition_p: 0.1

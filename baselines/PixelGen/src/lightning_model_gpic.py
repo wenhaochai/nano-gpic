@@ -1,5 +1,6 @@
 from typing import Callable, Iterable, Any, Optional, Union, Sequence, Mapping, Dict
 import os.path
+import zlib
 import copy
 import torch
 import torch.nn as nn
@@ -171,7 +172,21 @@ class LightningModel(pl.LightningModule):
             clip_coef = gradient_clip_val / (total_norm + 1e-6)
             opt.clip_coef = torch.clamp(clip_coef, max=1.0)
             return
-        torch.nn.utils.clip_grad_norm_(params, gradient_clip_val, foreach=True)
+        trainer = self.diffusion_trainer
+        check = getattr(self.denoiser, "code_dim", 0) and trainer._calls % trainer._check_every == 0   # plan A: the flow's parameters get only the prior's gradient, the others only the main loss's
+        prior = torch.stack([p.grad.norm() for p in self.denoiser.code_prior.parameters() if p.grad is not None]).norm().item() if check else None
+        total = torch.nn.utils.clip_grad_norm_(params, gradient_clip_val, foreach=True)
+        # gmflow-ladder: the pre-clip norm (review F4) only for the mixture, on the steps whose logs are written (no extra host
+        # sync), so the point model logs exactly what 5ac69ab logs
+        if getattr(self.denoiser, "gm_k", 0) and getattr(self, "_log_now", False):
+            self.log("train/grad_norm_preclip", total, on_step=True, sync_dist=False)
+        grad_print = int(os.environ.get("GPIC_GRAD_PRINT") or 0)   # diagnostics only: rank 0 prints the global pre-clip norm every N optimizer steps (a host sync)
+        if grad_print and self.global_step % grad_print == 0 and self.global_rank == 0:
+            print(f"[grad] step {self.global_step}: grad norm before the clip {total.item():.4f}", flush=True)
+        if getattr(self.denoiser, "gm_k", 0) and trainer._print_every and trainer._calls % trainer._print_every == 0:   # smoke test only (GPIC_GM_PRINT): a host sync
+            print(f"[gmflow] call {trainer._calls}: grad norm before the clip {total.item():.4f}", flush=True)
+        if check:
+            print(f"[code] call {trainer._calls}: grad norm before the clip {total.item():.4f}, of which the flow {prior:.4f}, clip at {gradient_clip_val}", flush=True)
 
     def configure_callbacks(self) -> Union[Sequence[Callback], Callback]:
         return [self.ema_tracker]
@@ -310,6 +325,11 @@ class LightningModel(pl.LightningModule):
                 x, condition, metadata["y_pack"] = self._rebalancer.exchange(x, condition, p)
                 if p.get("types") is not None:
                     metadata["caption_type"] = p["types"]
+        self._log_now = self.logger is not None and self.trainer._logger_connector.should_update_logs
+        if hasattr(self.diffusion_trainer, "diag_now"):   # GMFlow: its diagnostics only on the steps whose logs are written
+            self.diffusion_trainer.diag_now = self._log_now
+        if hasattr(self.diffusion_trainer, "anneal_steps"):   # GMFlow: the temperature of one mixture per image follows the global step (restored on a resume)
+            self.diffusion_trainer.step = self.global_step
         loss = self.diffusion_trainer(self.denoiser, self.ema_denoiser, self.diffusion_sampler, x, condition, uncondition, metadata)
 
         # --- GPIC: log per-caption-type training loss ---
@@ -321,7 +341,7 @@ class LightningModel(pl.LightningModule):
         # perf C2: the per-caption-type losses need host syncs (index tensors from Python lists) and four sync_dist
         # all-reduces; compute them only on steps whose on_step logs are written (Lightning's own condition), so the
         # logged values are unchanged and every other step runs without them
-        log_now = self.logger is not None and self.trainer._logger_connector.should_update_logs
+        log_now = self._log_now
         if log_now and caption_types is not None and loss_per_sample is not None:
             CAPTION_TYPES = ["tag", "short", "medium", "long"]
             for ct in CAPTION_TYPES:
@@ -358,13 +378,27 @@ class LightningModel(pl.LightningModule):
         # sample images
         net = self.denoiser if self.eval_original_model else self.ema_denoiser
         y_mask = meta.get("y_mask")
-        if y_mask is not None:   # ladder option B: masked text; with CFG != 1 the sampler's batch is [uncond, cond]
+        if getattr(net, "is_ar", False):   # docs/autoregressive.md: x_T is not used; each image's randomness comes from the draws, and each rank has its own stream
+            assert float(self.diffusion_sampler.guidance) == 1.0, "CFG is fixed at 1.0 (owner, 2026-11-01)"
+            if batch_idx == 0:
+                torch.manual_seed(2000 + self.global_rank)
+            return fp2uint8(self.vae.decode(net.ar_sample(condition, y_mask)))
+        if getattr(net, "code_dim", 0):   # plan A (docs/distribution_step.md 5.2): one z per image, fixed along the path
+            assert float(self.diffusion_sampler.guidance) == 1.0, "CFG is fixed at 1.0 (owner, 2026-11-01)"
+            # z0 has its own seed, from the prompt's key: each prompt keeps its z on any rank, and z0 is independent of xT. The official xT is the same tensor for all prompts (gpic_jsonl_dataset.py), so z0 must not come from it.
+            z0 = torch.stack([torch.randn(net.code_dim, generator=torch.Generator().manual_seed(zlib.crc32(m["key"].encode()))) for m in metadata]).to(xT.device)
+            z = net.code_flow(z0, condition, y_mask)
+            base = net
+
+            def net(x, t, c, _base=base, _m=y_mask, _z=z):
+                return _base(x, t, c, y_mask=_m, z=_z)
+        elif y_mask is not None:   # ladder option B: masked text; with CFG != 1 the sampler's batch is [uncond, cond]
             null = torch.zeros_like(y_mask)
             null[:, 0] = True
             base = net
 
-            def net(x, t, c, _base=base, _m=y_mask, _n=null):
-                return _base(x, t, c, y_mask=_m if x.shape[0] == _m.shape[0] else torch.cat([_n, _m], dim=0))
+            def net(x, t, c, _base=base, _m=y_mask, _n=null, **kw):   # kw: gm_mode of the GMFlow samplers
+                return _base(x, t, c, y_mask=_m if x.shape[0] == _m.shape[0] else torch.cat([_n, _m], dim=0), **kw)
         samples = self.diffusion_sampler(net, xT, condition, uncondition)
 
         samples = self.vae.decode(samples)

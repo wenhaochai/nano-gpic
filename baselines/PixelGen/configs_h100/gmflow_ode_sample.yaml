@@ -1,0 +1,20 @@
+# Overlay on lite_ladder_sample.yaml: GM-ODE, first order, with analytic sub-steps (docs/gmflow.md). gm_k comes from the command line (jobs/eval_gmflow.sh).
+# num_steps = network calls per image; substeps: 3 at 50 calls, 16 at 8 calls (set by jobs/eval_gmflow.sh).
+model:
+  diffusion_sampler:
+    class_path: src.diffusion.flow_matching.sampling_gmflow.GMODESampler
+    init_args:
+      w_scheduler:
+        class_path: src.diffusion.flow_matching.scheduling.LinearScheduler
+      timeshift: 1.0
+      guidance_interval_min: 0.0
+      guidance_interval_max: 1.0
+      step_fn: src.diffusion.flow_matching.sampling.ode_step_fn
+      last_step: null
+      last_step_fn: src.diffusion.flow_matching.sampling.ode_step_fn
+      scheduler:
+        class_path: src.diffusion.flow_matching.scheduling.LinearScheduler
+      guidance_fn: src.diffusion.base.guidance.simple_guidance_fn
+      num_steps: 50
+      guidance: 1.0
+      substeps: 3

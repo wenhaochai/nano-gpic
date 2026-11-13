@@ -1,0 +1,19 @@
+# Overlay on lite_ladder.yaml: plan A (docs/distribution_step.md 5.2). code_rate (nats) comes from the command line (jobs/run_code.sh).
+model:
+  denoiser:
+    init_args:
+      code_dim: 64
+      code_rate: 64.0
+  diffusion_trainer:
+    class_path: src.diffusion.flow_matching.training_code.CodeJiTTrainer
+    init_args:
+      scheduler:
+        class_path: src.diffusion.flow_matching.scheduling.LinearScheduler
+      loss_weight_fn: src.diffusion.flow_matching.training_JiT.constant
+      lognorm_t: true
+      timeshift: 1.0
+      P_mean: -0.8
+      P_std: 0.8
+      t_eps: 0.05
+      null_condition_p: 0.1
+      prior_weight: 0.01
