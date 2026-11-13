@@ -31,7 +31,19 @@ Subcommands (run from anywhere; the repo's baselines/PixelGen and tools/ go on s
                                      computes the tasks; with --tasks, workers share the list through a lockf counter
                                      (each takes the next task); appends one JSON line per (checkpoint, weights)
   bench --d 1792 --nb 18 --nt 4      seconds per forward of a random model, and the implied minutes per checkpoint
-Idempotent: a (checkpoint, weights, N_val, N_train, num_t, seed, data file) that has a line in the output is skipped.
+Idempotent: a (checkpoint, weights, N_val, N_train, num_t, seed, data file, nll) that has a line in the output is skipped.
+
+gmflow-ladder (2026-11-12, docs/gmflow_ladder_port.md): a run of the per-pixel mixture (GMFlowTrainer, gm_k >= 1, gm_spread
+image, gm_scope pixel) is scored as well. Its loss is the loss of the mixture's mean, sum_k A_k mu_k, as the x prediction: the
+same quantity as the point model's (JiT_T2I's default gm_mode "mean" output, unchanged here). `work --nll` adds, per level, the
+held-out negative log-likelihood per dimension, in nats, in v space (v = (x - x_t) / (1 - t), the space of the loss):
+  nll_<split>_t[k] = mean over images of -(1 / (C H W)) log p(v | x_t, y), and nll_<split> = their mean over the levels;
+  the mixture: p(v) = prod_pixels sum_k A_k N(v; (mu_k - x_t) / (1 - t), s_u^2 I_C), exactly the per-pixel mixture it trains
+  (gmflow.gm_nll plus the constant C/2 log 2 pi); in x space this is the NLL minus log(1 - t) per dimension, the same for every
+  model at a level;
+  gauss_nll_<split>_t[k] = 0.5 log(2 pi e MSE_k), MSE_k = loss_<split>_t[k]: the NLL of the best fixed-variance Gaussian around
+  the model's mean (one variance per level, fitted on this data), the point model's counterpart; recorded for both models.
+The NLL lines carry nll = true and go to their own done keys (a line without it is a loss-only line, as before).
 """
 import argparse
 import fcntl
@@ -262,18 +274,31 @@ def image_noise(seed, j, num_t, shape, out=None):
     return torch.randn((num_t, *shape), generator=g, out=out)
 
 
-def level_loss(net, tr, x, y, y_mask, t, noise, autocast):
+def level_loss(net, tr, x, y, y_mask, t, noise, autocast, nll=False):
     """Per-image loss at one level t (0-d tensor): FixedValLoss._loss's body, which is JiTTrainer._impl_trainstep's
     with t and the noise given."""
     t = t.expand(x.shape[0])
     alpha, sigma = tr.scheduler.alpha(t), tr.scheduler.sigma(t)
     x_t = alpha * x + noise * sigma
     v_t = (x - x_t) / (1 - t.view(-1, 1, 1, 1)).clamp_min(tr.t_eps)
+    if not nll:
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
+            pred = net.forward(x_t, t, y, y_mask=y_mask)
+        out = (pred.float() - x_t) / (1 - t.view(-1, 1, 1, 1)).clamp_min(tr.t_eps)
+        loss = tr.loss_weight_fn(alpha, sigma) * (out - v_t) ** 2
+        return loss.mean(dim=(1, 2, 3))
+    # gmflow-ladder --nll: one forward gives the loss of the mean (as above) and the NLL per dimension in v space
+    from src.diffusion.flow_matching.gmflow import gm_nll
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
-        pred = net.forward(x_t, t, y, y_mask=y_mask)
-    out = (pred.float() - x_t) / (1 - t.view(-1, 1, 1, 1)).clamp_min(tr.t_eps)
-    loss = tr.loss_weight_fn(alpha, sigma) * (out - v_t) ** 2
-    return loss.mean(dim=(1, 2, 3))
+        gm = net.forward(x_t, t, y, y_mask=y_mask, gm_mode="full")
+    lw, means = gm["logweights"].float(), gm["means"].float()
+    pred = (lw.exp() * means).sum(1)   # JiT_T2I's "mean" output, the same expression
+    s = (1 - t.view(-1, 1, 1, 1)).clamp_min(tr.t_eps)
+    out = (pred - x_t) / s
+    loss = (tr.loss_weight_fn(alpha, sigma) * (out - v_t) ** 2).mean(dim=(1, 2, 3))
+    C = x.shape[1]
+    nll_v = gm_nll(v_t, (means - x_t.unsqueeze(1)) / s.unsqueeze(1), lw, gm["logstd"].float()).mean(dim=(1, 2))   # (B,): per pixel over C, mean over pixels
+    return loss, (nll_v + 0.5 * C * math.log(2 * math.pi)) / C
 
 
 def _noise_feed(batches, seed, num_t, shape, threads, pin):
@@ -320,15 +345,18 @@ def _noise_feed(batches, seed, num_t, shape, threads, pin):
 
 
 @torch.no_grad()
-def evaluate(nets, tr, split, ts, seed=SEED, batch=BATCH, device="cpu", autocast=False, threads=4, log=None):
+def evaluate(nets, tr, split, ts, seed=SEED, batch=BATCH, device="cpu", autocast=False, threads=4, log=None, nll=False):
     """Sums over images of the per-image loss at every level, for every net, on one data split; all nets see the same
-    x_t. Returns {name: dict(level_mean [num_t], image_mean [N] (the mean over levels per image))} in float64."""
+    x_t. Returns {name: dict(level_mean [num_t], image_mean [N] (the mean over levels per image))} in float64.
+    nll (a mixture's nets only): also nll_level_mean [num_t] and nll_image_mean [N], the NLL per dimension in v space."""
     N, num_t = len(split["lens"]), len(ts)
     shape = tuple(split["img"].shape[i] for i in (3, 1, 2))
     order = split["order"]
     batches = [order[i:i + batch] for i in range(0, N, batch)]
     sums = {k: torch.zeros(num_t, dtype=torch.float64, device=device) for k in nets}
     per = {k: torch.zeros(N, dtype=torch.float64, device=device) for k in nets}
+    nsums = {k: torch.zeros(num_t, dtype=torch.float64, device=device) for k in nets}
+    nper = {k: torch.zeros(N, dtype=torch.float64, device=device) for k in nets}
     ts = ts.to(device)
     pin = torch.device(device).type == "cuda"
     t0 = time.time()
@@ -339,12 +367,23 @@ def evaluate(nets, tr, split, ts, seed=SEED, batch=BATCH, device="cpu", autocast
         y, mask = text_batch(split, idx, device)
         for k in range(num_t):
             for name, net in nets.items():
-                l = level_loss(net, tr, x, y, mask, ts[k], noise[:, k], autocast).double()
+                if nll:
+                    l, n = level_loss(net, tr, x, y, mask, ts[k], noise[:, k], autocast, nll=True)
+                    n = n.double()
+                    nsums[name][k] += n.sum()
+                    nper[name].index_add_(0, it, n)
+                else:
+                    l = level_loss(net, tr, x, y, mask, ts[k], noise[:, k], autocast)
+                l = l.double()
                 sums[name][k] += l.sum()
                 per[name].index_add_(0, it, l)
         if log and (b + 1) % max(1, len(batches) // 4) == 0:
             log(f"batch {b + 1}/{len(batches)} {time.time() - t0:.0f} s")
-    return {k: dict(level_mean=(sums[k] / N).cpu(), image_mean=(per[k] / num_t).cpu()) for k in nets}
+    out = {k: dict(level_mean=(sums[k] / N).cpu(), image_mean=(per[k] / num_t).cpu()) for k in nets}
+    if nll:
+        for k in nets:
+            out[k].update(nll_level_mean=(nsums[k] / N).cpu(), nll_image_mean=(nper[k] / num_t).cpu())
+    return out
 
 
 # -------------------------------------------------------------------------------------------------------------- model
@@ -376,10 +415,15 @@ def run_config(run_dir):
             m = yaml.safe_load(f)["model"]
         den, trn = m["denoiser"], m["diffusion_trainer"]
         assert den["class_path"] == "src.models.transformer.JiT_T2I.JiT_T2I", (c, den["class_path"])
-        assert trn["class_path"] == "src.diffusion.flow_matching.training_JiT.JiTTrainer", (c, trn["class_path"])
         kw = dict(den["init_args"])
-        for k in ("gm_k", "xi_dim", "code_dim", "head_width"):
-            assert not kw.get(k), f"{c}: {k} = {kw.get(k)}: not the point model"
+        if kw.get("gm_k"):   # gmflow-ladder: the per-pixel mixture, scored by its mean (and with --nll by its NLL)
+            assert trn["class_path"] == "src.diffusion.flow_matching.training_gmflow.GMFlowTrainer", (c, trn["class_path"])
+            assert kw.get("gm_spread", "image") == "image" and kw.get("gm_scope", "pixel") == "pixel", \
+                f"{c}: gm_spread {kw.get('gm_spread')}, gm_scope {kw.get('gm_scope')}: only the per-pixel mixture with one s_u per image is scored"
+        else:
+            assert trn["class_path"] == "src.diffusion.flow_matching.training_JiT.JiTTrainer", (c, trn["class_path"])
+        for k in ("xi_dim", "code_dim", "head_width"):
+            assert not kw.get(k), f"{c}: {k} = {kw.get(k)}: not the point model or the per-pixel mixture"
         ta = trn["init_args"]
         loss = dict(scheduler=ta["scheduler"]["class_path"], loss_weight_fn=ta["loss_weight_fn"],
                     lognorm_t=ta["lognorm_t"], timeshift=ta["timeshift"], P_mean=ta["P_mean"], P_std=ta["P_std"],
@@ -483,12 +527,12 @@ def done_keys(out):
                     except json.JSONDecodeError:   # a writer killed inside its write; that entry is redone
                         print(f"[heldout] {out}: skips an unreadable line: {line[:80]!r}", file=sys.stderr, flush=True)
                         continue
-                    keys.add((r["ckpt"], r["weights"], r["n_val"], r["n_train"], r["num_t"], r["seed"], r["data"]))
+                    keys.add((r["ckpt"], r["weights"], r["n_val"], r["n_train"], r["num_t"], r["seed"], r["data"], bool(r.get("nll"))))
     return keys
 
 
 def todo_weights(spec, done, a, tag):
-    return [w for w, _ in WEIGHTS if (spec["ckpt"], w, a.n_val, a.n_train, NUM_T, SEED, tag) not in done]
+    return [w for w, _ in WEIGHTS if (spec["ckpt"], w, a.n_val, a.n_train, NUM_T, SEED, tag, bool(getattr(a, "nll", False))) not in done]
 
 
 # Seconds per eager forward of 128 images at T = 56 (bf16 autocast, both nets alike), measured on a vis2 A40 with `bench`
@@ -612,7 +656,9 @@ def run_task(spec, weights, data, a, device):
     load_s = time.time() - t0
     log(f"loaded {','.join(nets)}{' (the EMA slot holds the same bytes: one pass)' if one_pass else ''} in {load_s:.0f} s")
     autocast = torch.device(device).type == "cuda"
-    res = {s: evaluate(nets, tr, data[s], ts, SEED, a.batch, device, autocast, a.threads, log=lambda m, s=s: log(f"{s} {m}"))
+    nll = bool(getattr(a, "nll", False))
+    mix = nll and bool(kw.get("gm_k"))   # the point model's NLL is the Gaussian one, from its per-level loss
+    res = {s: evaluate(nets, tr, data[s], ts, SEED, a.batch, device, autocast, a.threads, log=lambda m, s=s: log(f"{s} {m}"), nll=mix)
            for s in a.splits}
     elapsed = time.time() - t0
     gpu = torch.cuda.get_device_name(device) if autocast else "cpu"
@@ -620,7 +666,7 @@ def run_task(spec, weights, data, a, device):
     for w in weights:
         r = dict(spec)
         r.pop("est_min", None)
-        r.update(weights=w, n_val=a.n_val, n_train=a.n_train, num_t=NUM_T, seed=SEED, data=data["tag"],
+        r.update(weights=w, n_val=a.n_val, n_train=a.n_train, num_t=NUM_T, seed=SEED, data=data["tag"], nll=nll, gm_k=int(kw.get("gm_k") or 0),
                  train_shard=os.path.basename(data["train_shard"]), t=ts.tolist(),
                  d=kw["hidden_size"], nb=kw["num_blocks"], nt=kw["num_text_blocks"])
         for s in a.splits:
@@ -628,6 +674,15 @@ def run_task(spec, weights, data, a, device):
             r[f"loss_{s}"] = float(lm.mean())
             r[f"loss_{s}_t"] = lm.tolist()
             r[f"loss_{s}_se"] = float(im.std() / math.sqrt(len(im)))   # over images, of the mean over levels
+            if nll:
+                g = 0.5 * torch.log(2 * math.pi * math.e * lm)
+                r[f"gauss_nll_{s}_t"] = g.tolist()
+                r[f"gauss_nll_{s}"] = float(g.mean())
+                if mix:
+                    nl, ni = (res[s]["raw" if one_pass else w][k] for k in ("nll_level_mean", "nll_image_mean"))
+                    r[f"nll_{s}_t"] = nl.tolist()
+                    r[f"nll_{s}"] = float(nl.mean())
+                    r[f"nll_{s}_se"] = float(ni.std() / math.sqrt(len(ni)))
         r.update(elapsed_s=round(elapsed, 1), load_s=round(load_s, 1), weights_in_task=list(weights), one_pass=one_pass, gpu=gpu,
                  compiled=compiled,
                  host=socket.gethostname(), job=os.environ.get("FETCHED_JOB_ID") or os.environ.get("SLURM_JOB_ID", ""),
@@ -733,6 +788,8 @@ def main(argv=None):
             p.add_argument("--batch", type=int, default=BATCH)
             p.add_argument("--threads", type=int, default=6, help="CPU threads that draw the noise")
             p.add_argument("--splits", default="val,train", help="comma-separated, of " + ",".join(SPLITS))
+        if name in ("list", "work"):
+            p.add_argument("--nll", action="store_true", help="gmflow-ladder: also the NLL per dimension per level (module docstring)")
         if name == "bench":
             for k, v in (("d", 1792), ("nb", 18), ("nt", 4), ("T", 56), ("iters", 10), ("gpu", 0), ("batch", BATCH)):
                 p.add_argument(f"--{k}", type=int, default=v)

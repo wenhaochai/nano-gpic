@@ -425,8 +425,61 @@ def H6():
         assert worst < 1e-6, worst
 
 
+@test
+def H7():
+    """the per-pixel mixture: the loss of its mean with and without --nll, and the NLL per dimension against a brute force"""
+    import math
+    split = fake_split(5, seed=11)
+    tr = H.make_trainer(LOSS)
+    ts = H.levels(LOSS["P_mean"], LOSS["P_std"], LOSS["timeshift"])
+    N, num_t, C = 5, len(ts), 3
+    shape = (C, 64, 64)
+    for K in (8, 1):
+        torch.manual_seed(20 + K)
+        net = JiT_T2I(**SMALL, gm_k=K).eval()
+        with torch.no_grad():
+            for p in net.parameters():
+                if p.requires_grad:
+                    p.add_(0.05 * torch.randn_like(p))
+        nets = {"m": net}
+        plain = H.evaluate(nets, tr, split, ts, seed=3, batch=2, threads=2)
+        full = H.evaluate(nets, tr, split, ts, seed=3, batch=2, threads=2, nll=True)
+        assert "nll_level_mean" not in plain["m"] and "nll_level_mean" in full["m"]
+        rel = ((full["m"]["level_mean"] - plain["m"]["level_mean"]).abs() / plain["m"]["level_mean"]).max().item()
+        rel_i = ((full["m"]["image_mean"] - plain["m"]["image_mean"]).abs() / plain["m"]["image_mean"]).max().item()
+        # brute force, image by image and pixel by pixel in float64: v = (x - x_t) / (1 - t), the component means (mu_k - x_t) / (1 - t), one s per image
+        ref = torch.zeros(num_t, N, dtype=torch.float64)
+        mse = torch.zeros(num_t, N, dtype=torch.float64)
+        for j in range(N):
+            x = H.to_input(split["img"][torch.tensor([j])])
+            y, mask = H.text_batch(split, [j], "cpu")
+            for k in range(num_t):
+                t = ts[k].expand(1)
+                noise = H.image_noise(3, j, num_t, shape)[k][None]
+                x_t = t.view(1, 1, 1, 1) * x + (1 - t.view(1, 1, 1, 1)) * noise
+                with torch.no_grad():
+                    gm = net.forward(x_t, t, y, y_mask=mask, gm_mode="full")
+                s = max(1 - float(t), LOSS["t_eps"])
+                v = ((x - x_t) / s).double()[0]                                   # (C, H, W)
+                mu = ((gm["means"].float() - x_t.unsqueeze(1)) / s).double()[0]   # (K, C, H, W)
+                lw = gm["logweights"].double()[0, :, 0]                           # (K, H, W)
+                ls = float(gm["logstd"].double().flatten()[0])
+                comp = (-0.5 * ((v[None] - mu) / math.exp(ls)) ** 2 - ls - 0.5 * math.log(2 * math.pi)).sum(1)   # (K, H, W): log N over the C channels
+                ref[k, j] = -torch.logsumexp(lw + comp, dim=0).mean() / C
+                mean_v = (lw.exp()[:, None] * mu).sum(0)
+                mse[k, j] = ((mean_v - v) ** 2).mean()
+        got = full["m"]["nll_level_mean"]
+        d = (got - ref.mean(1)).abs().max().item()
+        di = (full["m"]["nll_image_mean"] - ref.mean(0)).abs().max().item()
+        dm = ((full["m"]["level_mean"] - mse.mean(1)).abs() / mse.mean(1)).max().item()
+        print(f"  K={K}: loss {full['m']['level_mean'].mean():.6f}; with --nll against without, max rel diff per level {rel:.2e}, per image {rel_i:.2e}; "
+              f"against the brute-force mean {dm:.2e}; NLL per dimension {got.mean():.5f}, max abs diff per level {d:.2e}, per image {di:.2e}")
+        assert rel < 2e-5 and rel_i < 2e-5 and dm < 2e-5, (rel, rel_i, dm)
+        assert d < 2e-5 and di < 2e-5, (d, di)
+
+
 def main():
-    tests = [H1, H2, H3, H4, H5, H6]
+    tests = [H1, H2, H3, H4, H5, H6, H7]
     want = set(sys.argv[1:])
     for t in tests:
         if not want or t.__name__ in want:
