@@ -19,6 +19,8 @@
 # EVAL_SPREAD (image | pixel, default image: gm_spread of the model; the checkpoint must hold the per-pixel offset head if and only if it is pixel);
 # EVAL_DTM (dtm-ladder, docs/dtm_ladder.md): the width of the DTM flow head of the checkpoint (K must be 0); the model is built with dtm_width EVAL_DTM, the sampler
 # dtm_draw draws each patch from the head at every call (sampling_dtm.DTMDrawSampler), and euler_mean runs Euler on the head's mean (the model's default output).
+# EVAL_ARTM (artm-ladder, docs/artm_ladder.md): ARTM's number of transitions T of the checkpoint (K must be 0, the sampler artm, calls = T): predict_step runs the
+# model's artm_sample (X_0 = the official noise, each patch drawn by the head, a KV cache) with EVAL_ARTM_BS images per GPU (default 128).
 # EVAL_SCOPE (pixel | image, default pixel: gm_scope of the model, docs/gmflow.md section 15; it must equal the run root's scope.txt, none = pixel; image takes
 # only gm_draw and euler_mean);
 # EVAL_DEVICES (default 8): the GPUs one evaluation uses, for prediction and for the FD (jobs/evals_gmflow.sh --par runs one evaluation per GPU).
@@ -78,6 +80,7 @@ case $SAMPLER in
   gm_ode2) SARGS=(--config configs_h100/gmflow_ode_sample.yaml --model.diffusion_sampler.init_args.substeps $SUBSTEPS --model.diffusion_sampler.init_args.order 2) ;;
   euler_mean|euler) SARGS=(--config configs_h100/gmflow_euler_sample.yaml) ;;
   dtm_draw) SARGS=(--config configs_h100/dtm_draw_sample.yaml) ;;
+  artm) SARGS=(--config configs_h100/artm_sample.yaml --data.pred_batch_size ${EVAL_ARTM_BS:-128}) ;;
   gm_ode_cal)
     [ $K -eq 0 ] || { echo "gm_ode_cal is for a point model (K = 0); use gm_ode"; exit 2; }
     [ -f "${EVAL_SPREAD_TABLE:-}" ] || { echo "gm_ode_cal needs EVAL_SPREAD_TABLE=<table.json>"; exit 2; }
@@ -96,6 +99,13 @@ if [ $DTMW -gt 0 ]; then
   case $SAMPLER in dtm_draw|euler_mean) ;; *) echo "a DTM run is evaluated with dtm_draw or euler_mean"; exit 2 ;; esac
   grep -q "dtm_width" $WT/baselines/PixelGen/src/models/transformer/JiT_T2I.py || { echo "$WT has no DTM code"; exit 2; }
 elif [ $SAMPLER = dtm_draw ]; then echo "dtm_draw needs EVAL_DTM (a DTM run)"; exit 2; fi
+ARTMT=${EVAL_ARTM:-0}
+[[ $ARTMT =~ ^[0-9]+$ ]] || { echo "EVAL_ARTM must be the number of transitions"; exit 2; }
+if [ $ARTMT -gt 0 ]; then
+  [ $K -eq 0 ] && [ $DTMW -eq 0 ] && [ $SPREAD = image ] && [ $SCOPE = pixel ] && [ $SAMPLER = artm ] && [ $CALLS -eq $ARTMT ] \
+    || { echo "an ARTM run has K = 0, no DTM, spread or scope option, the sampler artm and calls = EVAL_ARTM"; exit 2; }
+  [ -f $WT/baselines/PixelGen/src/models/transformer/ARTM_JiT.py ] || { echo "$WT has no ARTM code"; exit 2; }
+elif [ $SAMPLER = artm ]; then echo "the sampler artm needs EVAL_ARTM (an ARTM run)"; exit 2; fi
 [ -f "$WT/baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py" ] || { echo "$WT holds old code"; exit 2; }
 if [ $SPREAD = pixel ] || [ ${SAMPLER%2} != $SAMPLER ]; then
   grep -q "def gm_second_order" $WT/baselines/PixelGen/src/diffusion/flow_matching/gmflow.py || { echo "$WT has no per-pixel spread or second-order sampler"; exit 2; }
@@ -120,17 +130,22 @@ if [ $SAMPLER = gm_ode_cal ]; then   # the table belongs to this checkpoint and 
   python -m src.diffusion.flow_matching.gm_spread check "$TABLE" $STEP $CALLS || exit 2
 fi
 # the checkpoint loads with strict=False, so a wrong head or size would give a wrong FD and no error
-python - "$CKPT" $K $WD $NB $NT $SPREAD $DTMW <<'PY'
+python - "$CKPT" $K $WD $NB $NT $SPREAD $DTMW $ARTMT <<'PY'
 import re, sys, torch
 sd = torch.load(sys.argv[1], map_location="cpu", mmap=True, weights_only=False)["state_dict"]
 k, d, nb, nt = map(int, sys.argv[2:6])
 spread = sys.argv[6]
 dtm = int(sys.argv[7])
+artm = int(sys.argv[8])
+assert ("ema_denoiser.art_head.out.weight" in sd and "ema_denoiser.art_bos" in sd) == (artm > 0), f"ARTM head presence does not match EVAL_ARTM={artm}"
+if artm:
+    assert "ema_denoiser.final_layer.linear.weight" not in sd
+    dtm = 0
 assert ("ema_denoiser.dtm_head.out.weight" in sd) == (dtm > 0), f"DTM head presence does not match EVAL_DTM={dtm}"
 if dtm:   # the head of this width, on 768 patch values; FinalLayer has no linear
     assert tuple(sd["ema_denoiser.dtm_head.out.weight"].shape) == (768, dtm), sd["ema_denoiser.dtm_head.out.weight"].shape
     assert "ema_denoiser.final_layer.linear.weight" not in sd
-out = 768 if dtm else sd["ema_denoiser.final_layer.linear.weight"].shape[0]
+out = 768 if (dtm or artm) else sd["ema_denoiser.final_layer.linear.weight"].shape[0]
 n = lambda part: len({m.group(1) for key in sd for m in [re.match(rf"ema_denoiser\.{part}\.(\d+)\.", key)] if m})
 got = (sd["ema_denoiser.y_pos_embedding"].shape[-1], n("blocks"), n("text_refine_blocks"))
 assert got == (d, nb, nt), f"checkpoint has d, nb, nt = {got}, arguments {(d, nb, nt)}"
@@ -139,7 +154,7 @@ assert any(n.startswith("ema_denoiser.gm_logstd") for n in sd) == (k > 0), "s-ML
 assert ("ema_denoiser.gm_spread_head.weight" in sd) == (spread == "pixel"), f"per-pixel offset head presence does not match EVAL_SPREAD={spread}"
 PY
 mkdir -p $OUT
-echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K spread=$SPREAD scope=$SCOPE sampler=$SAMPLER calls=$CALLS substeps=$SUBSTEPS noise=$NOISE$([ $DTMW -eq 0 ] || echo " dtm_width=$DTMW")" | tee $OUT/ckpt.txt
+echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K spread=$SPREAD scope=$SCOPE sampler=$SAMPLER calls=$CALLS substeps=$SUBSTEPS noise=$NOISE$([ $DTMW -eq 0 ] || echo " dtm_width=$DTMW")$([ $ARTMT -eq 0 ] || echo " artm_T=$ARTMT")" | tee $OUT/ckpt.txt
 [ $SAMPLER != gm_ode_cal ] || { echo "spread_table=$TABLE sha1=$(sha1sum < "$TABLE" | cut -c1-40)" | tee -a $OUT/ckpt.txt; cp "$TABLE" $OUT/spread_table.json; }
 SPREAD_ARGS=(); [ $SPREAD = image ] || SPREAD_ARGS=(--model.denoiser.init_args.gm_spread $SPREAD)   # image: the command line of before this option
 [ $SCOPE = pixel ] || SPREAD_ARGS+=(--model.denoiser.init_args.gm_scope $SCOPE)   # pixel: the command line of before this option

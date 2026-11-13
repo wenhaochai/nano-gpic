@@ -1,0 +1,11 @@
+# Overlay on lite_ladder_sample.yaml: ARTM (docs/artm_ladder.md). predict_step calls the model's artm_sample: X_0 = x_T (the official noise), then T transitions,
+# each patch drawn by the flow head from its distribution, with a KV cache. The diffusion sampler is not used (CFG is asserted 1.0).
+model:
+  denoiser:
+    class_path: src.models.transformer.ARTM_JiT.ARTMJiT
+    init_args:
+      art_T: 3
+      art_head_width: 1024
+      art_head_depth: 3
+      art_head_steps: 32
+      art_t_eps: 0.05
