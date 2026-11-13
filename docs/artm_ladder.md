@@ -42,7 +42,11 @@ So at equal compute ARTM sees about half the images the point model sees. The pa
 `tools/artm_ladder/test_artm.py` (A1-A7): the init equals the point model's; the mask (a target position reads only earlier target patches, the
 context and the real caption tokens); the KV-cached sampling equals the full masked forward to 2e-6 at every transition and position, with and
 without a caption mask; the process and the loss by hand; sampling; training with no EMA and an exact resume; Muon marks. All pass. The GPU smoke
-repeats the cache check in bf16 with and without the fused norm (`tools/artm_ladder/kv_check.py`).
+repeats the cache check in bf16 with and without the fused norm (`tools/artm_ladder/kv_check.py`). Smoke w2642 (2026-11-13) failed that
+stage at its first threshold (bf16 max gap 0.11 against a gate of 0.05) while every other stage of training passed. On CPU with the smoke's
+checkpoint the fp32 gap is under 5e-5 and bf16 rounding alone, with no cache, gives a max gap of 0.125 to 0.138 (rms 0.004 to 0.006), the same
+as the cache's bf16 gap (max 0.125, rms 0.003 to 0.004): the max over about 10^6 values is a tail of rounding, not a cache error
+(`tmp/ladder_prof/dist_phase2/kv_floor.py`). kv_check.py now gates on fp32 (< 1e-3) and reports bf16 next to bf16 rounding alone.
 
 ## Differences from the paper
 
