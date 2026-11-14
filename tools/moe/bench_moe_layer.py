@@ -76,16 +76,22 @@ if moe.router is not None:
 moe_c = torch.compile(moe)
 res["moe_ms"] = timed(fwd_bwd(moe_c, (tt,)))
 # the same layer with the Triton operators (src/models/layers/moe_ops.py: segmented sums for the combine and the gather's backward)
-moe_mod._KERNELS = True
+moe_mod._KERNELS = 1
 torch._dynamo.reset()
 res["moe_kernels_ms"] = timed(fwd_bwd(torch.compile(moe), (tt,)))
-moe_mod._KERNELS = False
+# v2 (GPIC_MOE_KERNELS=2, 2026-11-14): the sums in token order through the inverse slot map
+moe_mod._KERNELS = 2
+torch._dynamo.reset()
+moe_v2 = torch.compile(moe)
+res["moe_v2_ms"] = timed(fwd_bwd(moe_v2, (tt,)))
+moe_mod._KERNELS = 0
 torch._dynamo.reset()
 moe_c = torch.compile(moe)
 res["dense_tflops"] = flops / res["dense_ms"] / 1e9
 res["moe_tflops_active"] = flops / res["moe_ms"] / 1e9
 res["ratio"] = res["moe_ms"] / res["dense_ms"]
 res["ratio_kernels"] = res["moe_kernels_ms"] / res["dense_ms"]
+res["ratio_v2"] = res["moe_v2_ms"] / res["dense_ms"]
 
 # ---- the parts, each compiled on its own (forward + backward where it has one) ----
 xb = x0.to(torch.bfloat16)
@@ -157,16 +163,34 @@ if a.profile:
     tot = sum(k.device_time_total for k in ka) or 1
     top = sorted(ka, key=lambda k: -k.device_time_total)[:14]
     res["top_kernels"] = [(k.key[:90], round(k.device_time_total / 5 / 1000, 3), round(100 * k.device_time_total / tot, 1)) for k in top]
+    moe_mod._KERNELS = 2   # the v2 path's top kernels (its compiled module was built with _KERNELS = 2)
+    run = fwd_bwd(moe_v2, (tt,))
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(5):
+            run()
+        torch.cuda.synchronize()
+    moe_mod._KERNELS = 0
+    ka = prof.key_averages()
+    tot = sum(k.device_time_total for k in ka) or 1
+    top = sorted(ka, key=lambda k: -k.device_time_total)[:14]
+    res["top_kernels_v2"] = [(k.key[:90], round(k.device_time_total / 5 / 1000, 3), round(100 * k.device_time_total / tot, 1)) for k in top]
 
 print(json.dumps(res), flush=True)
 s = res
 print(f"d{d} images {a.images} ({M} tokens) {a.route} n{a.experts} G{a.active} (h {h}, cap {cap}): dense {s['dense_ms']:.2f} ms "
       f"({s['dense_tflops']:.0f} TFLOPS), moe {s['moe_ms']:.2f} ms ({s['moe_tflops_active']:.0f} active TFLOPS), ratio {s['ratio']:.3f}; "
-      f"with the Triton operators {s['moe_kernels_ms']:.2f} ms, ratio {s['ratio_kernels']:.3f}; parts: "
+      f"with the Triton operators {s['moe_kernels_ms']:.2f} ms, ratio {s['ratio_kernels']:.3f}; v2 {s['moe_v2_ms']:.2f} ms, ratio {s['ratio_v2']:.3f}; parts: "
       f"route {s['route_ms_fwd']:.2f}, gather {s['gather_ms']:.2f}, experts {s['experts_ms']:.2f} ({s['experts_tflops']:.0f} TFLOPS), combine "
       f"{s['combine_ms']:.2f} ms; Muon NS dense {s['muon_dense_ms']:.2f} ms, moe {s['muon_moe_ms']:.2f} ms", flush=True)
 for k in s.get("top_kernels", []):
     print("   ", k, flush=True)
+if s.get("top_kernels_v2"):
+    print("  v2 top kernels:", flush=True)
+    for k in s["top_kernels_v2"]:
+        print("   ", k, flush=True)
 if a.out:
     with open(a.out, "a") as f:
         f.write(json.dumps(res) + "\n")

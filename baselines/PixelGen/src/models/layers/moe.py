@@ -45,7 +45,9 @@ import torch.nn.functional as F
 ROUTES = ("tc", "ecb", "eci", "noise", "pos", "hash")
 # GPIC_MOE_KERNELS=1: the gather's backward and the combine as one deterministic segmented sum per token (src/models/layers/moe_ops.py,
 # Triton; the same values up to the order of a token's fp32 terms). Off: the torch path below (fp32 atomics).
-_KERNELS = os.environ.get("GPIC_MOE_KERNELS", "0") == "1"
+# GPIC_MOE_KERNELS=2 (2026-11-14, after the step profile w2686): the same two sums in token order through the inverse slot map (moe_ops.py v2:
+# no sort, no atomics, no fp32 buffer, deterministic), and the gather without the fp32 round trip.
+_KERNELS = int(os.environ.get("GPIC_MOE_KERNELS", "0"))
 
 
 class MoEFeedForward(nn.Module):
@@ -130,6 +132,15 @@ class MoEFeedForward(nn.Module):
         n, h, d = self.n, self.h, self.dim
         cap = idx.shape[1]
         flat = idx.reshape(-1)
+        if _KERNELS == 2 and xf.is_cuda:
+            from src.models.layers import moe_ops   # noqa: F401  (registers torch.ops.gpic.*)
+            valid = (gate.reshape(-1) != 0) if gate is not None else torch.ones_like(flat, dtype=torch.bool)
+            inv = torch.ops.gpic.moe_inv(flat, valid, xf.shape[0], n)
+            xe = torch.ops.gpic.moe_gather2(xf, flat, inv).view(n, cap, d)
+            a1, a2 = torch.bmm(xe, self.e12.view(n, 2 * h, d).mT).chunk(2, dim=-1)
+            o = torch.bmm(F.silu(a1) * a2, self.e3t.view(n, h, d)).reshape(n * cap, d)
+            g = gate.reshape(-1) if gate is not None else o.new_zeros(0, dtype=torch.float32)
+            return torch.ops.gpic.moe_combine2(o, g, flat, inv, xf.shape[0], gate is not None)
         if _KERNELS and xf.is_cuda:
             from src.models.layers import moe_ops   # noqa: F401  (registers torch.ops.gpic.*)
             perm, offsets = torch.ops.gpic.moe_csr(flat, xf.shape[0])

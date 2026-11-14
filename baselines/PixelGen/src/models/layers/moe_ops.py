@@ -153,3 +153,122 @@ def _combine_bwd(ctx, g):
 
 
 moe_combine.register_autograd(_combine_bwd, setup_context=_combine_setup)
+
+
+# ==== v2 (GPIC_MOE_KERNELS=2; 2026-11-14, after the step profile w2686) ====
+# The step profile put about 1.16 ms per layer (d12, 16 experts, 2 active) into the torch path's glue: two fp32 index_add (atomics into a
+# zero-filled fp32 [tokens, d] buffer), the casts around them and the zero fills; v1's sorted segmented sums did not beat it (the sort per
+# layer, one token per program). v2 sums in token order through the inverse slot map instead: inv [tokens, n] int32, inv[t, e] = the row r
+# of token t among expert e's slots (slot s = e * cap + r), -1 where expert e did not take t. A sum over a token's slots reads its n entries
+# in expert order, loads only the valid rows, adds them in fp32 registers and writes the output dtype once: no sort, no atomics, no fp32
+# buffer, and the same order on every run. Empty slots (gate 0) are left out: their terms are 0 in the combine and their gradient rows are 0
+# in the gather's backward, so the sums are the same.
+#   gpic::moe_inv(flat, valid, tokens, n) -> inv                          valid [S] bool (False: an empty slot)
+#   gpic::moe_gather2(x, flat, inv) -> xe                                 xe[s] = x[flat[s]]; backward: grad_x[t] = sum over t's slots
+#   gpic::moe_combine2(o, gate, flat, inv, tokens, has_gate) -> out       out[t] = sum gate[s] o[s]; backward as v1 (one kernel per slot)
+
+@triton.jit
+def _tsum_kernel(src_ptr, w_ptr, inv_ptr, out_ptr, M, D, cap, s_src, s_out,
+                 N_EXP: tl.constexpr, HAS_W: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_D: tl.constexpr):
+    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    cols = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    tmask = t < M
+    cmask = cols < D
+    t64 = t.to(tl.int64)
+    acc = tl.zeros([BLOCK_T, BLOCK_D], dtype=tl.float32)
+    for e in range(N_EXP):
+        r = tl.load(inv_ptr + t64 * N_EXP + e, mask=tmask, other=-1)
+        valid = r >= 0
+        row = (e * cap + r).to(tl.int64)
+        v = tl.load(src_ptr + row[:, None] * s_src + cols[None, :], mask=valid[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+        if HAS_W:
+            v = v * tl.load(w_ptr + row, mask=valid, other=0.0)[:, None]
+        acc += v
+    tl.store(out_ptr + t64[:, None] * s_out + cols[None, :], acc.to(out_ptr.dtype.element_ty), mask=tmask[:, None] & cmask[None, :])
+
+
+def _tsum(src, w, inv, tokens, n):
+    S, D = src.shape
+    cap = S // n
+    out = torch.empty(tokens, D, dtype=src.dtype, device=src.device)
+    BT, BD = 16, min(128, triton.next_power_of_2(D))
+    _tsum_kernel[(triton.cdiv(tokens, BT), triton.cdiv(D, BD))](src, w if w is not None else src, inv, out, tokens, D, cap,
+                                                              src.stride(0), out.stride(0), N_EXP=n, HAS_W=w is not None,
+                                                              BLOCK_T=BT, BLOCK_D=BD, num_warps=4)
+    return out
+
+
+@torch.library.custom_op("gpic::moe_inv", mutates_args=())
+def moe_inv(flat: torch.Tensor, valid: torch.Tensor, tokens: int, n: int) -> torch.Tensor:
+    S = flat.shape[0]
+    cap = S // n
+    s = torch.arange(S, device=flat.device)
+    # every slot writes once to its own place: a valid slot to (token, expert), an empty one to a spare cell past the table
+    dest = torch.where(valid, flat.to(torch.int64) * n + s // cap, tokens * n + s)
+    inv = torch.full((tokens * n + S,), -1, dtype=torch.int32, device=flat.device)
+    inv.scatter_(0, dest, (s % cap).to(torch.int32))
+    return inv[:tokens * n].view(tokens, n).clone()
+
+
+@moe_inv.register_fake
+def _(flat, valid, tokens, n):
+    return flat.new_empty(tokens, n, dtype=torch.int32)
+
+
+@torch.library.custom_op("gpic::moe_tsum", mutates_args=())
+def moe_tsum(src: torch.Tensor, inv: torch.Tensor, tokens: int, n: int) -> torch.Tensor:
+    return _tsum(src.contiguous(), None, inv, tokens, n)
+
+
+@moe_tsum.register_fake
+def _(src, inv, tokens, n):
+    return src.new_empty(tokens, src.shape[1])
+
+
+@torch.library.custom_op("gpic::moe_gather2", mutates_args=())
+def moe_gather2(x: torch.Tensor, flat: torch.Tensor, inv: torch.Tensor) -> torch.Tensor:
+    return x.index_select(0, flat)
+
+
+@moe_gather2.register_fake
+def _(x, flat, inv):
+    return x.new_empty(flat.shape[0], x.shape[1])
+
+
+def _gather2_setup(ctx, inputs, output):
+    x, flat, inv = inputs
+    ctx.save_for_backward(inv)
+    ctx.tokens = x.shape[0]
+
+
+def _gather2_bwd(ctx, g):
+    (inv,) = ctx.saved_tensors
+    return torch.ops.gpic.moe_tsum(g, inv, ctx.tokens, inv.shape[1]), None, None
+
+
+moe_gather2.register_autograd(_gather2_bwd, setup_context=_gather2_setup)
+
+
+@torch.library.custom_op("gpic::moe_combine2", mutates_args=())
+def moe_combine2(o: torch.Tensor, gate: torch.Tensor, flat: torch.Tensor, inv: torch.Tensor, tokens: int, has_gate: bool) -> torch.Tensor:
+    return _tsum(o.contiguous(), gate.float().contiguous() if has_gate else None, inv, tokens, inv.shape[1])
+
+
+@moe_combine2.register_fake
+def _(o, gate, flat, inv, tokens, has_gate):
+    return o.new_empty(tokens, o.shape[1])
+
+
+def _combine2_setup(ctx, inputs, output):
+    o, gate, flat, inv, tokens, has_gate = inputs
+    ctx.save_for_backward(o, gate, flat)
+    ctx.has_gate = has_gate
+
+
+def _combine2_bwd(ctx, g):
+    o, gate, flat = ctx.saved_tensors
+    go, gw = moe_combine_bwd(g, o, gate, flat, ctx.has_gate)
+    return go, (gw.to(gate.dtype) if ctx.has_gate else None), None, None, None, None
+
+
+moe_combine2.register_autograd(_combine2_bwd, setup_context=_combine2_setup)
