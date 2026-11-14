@@ -20,8 +20,7 @@ Routes (route=):
          Static shapes need a capacity: each expert takes at most capacity * G * tokens / n tokens in training (the
          surplus is dropped and counted); in evaluation nothing is dropped.
   ecb    expert choice over the micro-batch: each expert takes exactly G * tokens / n tokens, those with its highest
-         scores (found with a 4096-bin histogram, no sort; ties inside the boundary bin go by token order). A token gets
-         0 to n experts. The boundary score per expert is averaged (EMA, in the callback) into moe_thr; in evaluation a
+         scores (torch.topk along the tokens). A token gets 0 to n experts. The boundary score per expert is averaged (EMA, in the callback) into moe_thr; in evaluation a
          token takes expert e when sigmoid(score) >= moe_thr[e], so one image's routing does not depend on the batch.
   eci    expert choice inside each image: each expert takes exactly G * T / n tokens of every image (EC-DiT's rule).
          The same in training and evaluation.
@@ -42,8 +41,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-BINS = 4096
-ROUTES = ("tc", "ecb", "eci", "noise", "pos", "hash")
+ROUTES =("tc", "ecb", "eci", "noise", "pos", "hash")
 
 
 class MoEFeedForward(nn.Module):
@@ -128,28 +126,30 @@ class MoEFeedForward(nn.Module):
         n, h, d = self.n, self.h, self.dim
         cap = idx.shape[1]
         flat = idx.reshape(-1)
-        xe = xf.index_select(0, flat).view(n, cap, d)
+        # sums over a token's slots in fp32: the combine below, and the gather's backward (the round trip through fp32 makes it
+        # a scatter-add into an fp32 gradient). In bf16 a token's G or more expert terms would each round to bf16 (the main
+        # line's packed-caption path avoids bf16 atomics for this reason, lever E). The forward values are unchanged:
+        # bf16 -> fp32 -> bf16 is exact.
+        xe = xf.float().index_select(0, flat).to(xf.dtype).view(n, cap, d)
         a1, a2 = torch.bmm(xe, self.e12.view(n, 2 * h, d).mT).chunk(2, dim=-1)
         o = torch.bmm(F.silu(a1) * a2, self.e3t.view(n, h, d))
-        if gate is not None:
-            o = o * gate.unsqueeze(-1).to(o.dtype)
-        return o.new_zeros(xf.shape[0], d).index_add_(0, flat, o.reshape(n * cap, d))   # o's dtype (bf16 under autocast)
+        o = o.float() if gate is None else o.float() * gate.unsqueeze(-1).float()
+        return torch.zeros(xf.shape[0], d, dtype=torch.float32, device=xf.device).index_add_(
+            0, flat, o.reshape(n * cap, d)).to(xe.dtype)
 
     @staticmethod
     def _compact(sel, cap, w=None):
-        """sel [M, n] bool -> slot table: idx [n, cap] (0 in an empty slot), gate [n, cap] (w's value in a filled slot, else 0;
-        w = None: 1), kept [M, n] bool. Each expert keeps its first cap selected tokens, in token order. Static shapes."""
+        """sel [M, n] bool -> slot table: idx [n, cap], gate [n, cap], kept [M, n] bool. Each expert keeps its first cap selected
+        tokens in token order (a stable sort of the unselected flag along the tokens: no scan over the tokens, which Inductor's
+        CUDA codegen cannot fuse with a reduction, 'NYI TritonSplitDimKernel reductions'); a slot past the expert's selected
+        tokens holds an unselected token with gate 0. gate: w's value in a kept slot (w = None: 1), else 0. Static shapes."""
         M, n = sel.shape
-        pos = sel.cumsum(0, dtype=torch.int32) - 1
-        kept = sel & (pos < cap)
-        base = torch.arange(n, device=sel.device, dtype=torch.int64) * cap
-        slot = torch.where(kept, pos.to(torch.int64) + base, n * cap).reshape(-1)        # n * cap: a scratch slot
-        tok = torch.arange(M, device=sel.device, dtype=torch.int64)[:, None].expand(M, n).reshape(-1)
-        idx = torch.zeros(n * cap + 1, dtype=torch.int64, device=sel.device).scatter_(0, slot, tok)[:n * cap].view(n, cap)
-        src = kept.to(torch.float32) if w is None else w * kept
-        gate = torch.zeros(n * cap + 1, dtype=torch.float32, device=sel.device).scatter(0, slot, src.reshape(-1))
-        # the scratch slot may hold any of the unkept values: zero it by construction (unkept sources are 0)
-        return idx, gate[:n * cap].view(n, cap), kept
+        st = sel.t()                                                                   # [n, M]
+        idx = torch.sort((~st).to(torch.uint8), dim=1, stable=True).indices[:, :cap]   # selected first, each in token order
+        taken = st.gather(1, idx)                                                     # [n, cap]: the slot holds a selected token
+        gate = taken.to(torch.float32) if w is None else w.t().gather(1, idx) * taken
+        kept = torch.zeros(n, M, dtype=torch.bool, device=sel.device).scatter(1, idx, taken).t()   # out of place (Inductor)
+        return idx, gate, kept
 
     def _scores(self, x, xn, cond):
         r = x if self.router_in == "mod" else xn + cond
@@ -162,20 +162,10 @@ class MoEFeedForward(nn.Module):
         return self.G * sig / den
 
     def _ecb_select(self, sig, capn):
-        """Each expert's capn highest tokens of the micro-batch, without a sort: sel_hi = above the boundary bin, sel_bd =
-        the boundary bin (filled in token order). Returns sel [M, n] with exactly capn per expert, thr [n] (boundary score)."""
-        M, n = sig.shape
-        b = (sig * BINS).to(torch.int64).clamp_(0, BINS - 1)
-        base = torch.arange(n, device=sig.device, dtype=torch.int64) * BINS
-        hist = torch.zeros(n * BINS, dtype=torch.float32, device=sig.device).scatter_add_(
-            0, (b + base).reshape(-1), torch.ones(M * n, dtype=torch.float32, device=sig.device)).view(n, BINS)
-        above = hist.flip(1).cumsum(1).flip(1)                      # above[e, j] = tokens of expert e in bins >= j
-        jb = (above >= capn).sum(1) - 1                             # the boundary bin: the highest j with above >= capn
-        hi = b > jb
-        n_hi = hi.sum(0)
-        bd = b == jb
-        take = bd & ((bd.cumsum(0, dtype=torch.int32) - 1) < (capn - n_hi))
-        return hi | take, jb.to(torch.float32) / BINS
+        """Each expert's capn highest-scoring tokens of the micro-batch (torch.topk along the tokens): idx [n, capn], and the
+        boundary score per expert (its lowest selected score) [n]."""
+        v, i = sig.t().topk(capn, dim=1)
+        return i, v[:, -1]
 
     # ---- forward ----
     def forward(self, x, t=None, cond=None, xn=None):
@@ -197,15 +187,17 @@ class MoEFeedForward(nn.Module):
         if self.route == "tc":
             sig = torch.sigmoid(self._scores(x, xn, cond))
             top = (sig + self.moe_bias).topk(G, dim=1).indices
-            sel = torch.zeros(M, n, dtype=torch.bool, device=x.device).scatter_(1, top, True)
+            sel = torch.zeros(M, n, dtype=torch.bool, device=x.device).scatter(1, top, True)
             cap = min(M, -(-int(math.ceil(self.capacity * G * M / n)) // 8) * 8)
             idx, gate, kept = self._compact(sel, cap, self._gates(sig, sel))
             self._stat(sel.sum(0), None, (sel & ~kept).sum(), M)
         elif self.route == "ecb":
             assert (G * M) % n == 0, (G, M, n)
             sig = torch.sigmoid(self._scores(x, xn, cond))
-            sel, thr = self._ecb_select(sig, G * M // n)
-            idx, gate, _ = self._compact(sel, G * M // n, self._gates(sig, sel))
+            idx, thr = self._ecb_select(sig, G * M // n)
+            sel = torch.zeros(M, n, dtype=torch.bool, device=x.device).scatter(
+                0, idx.t(), torch.ones(G * M // n, n, dtype=torch.bool, device=x.device))
+            gate = self._gates(sig, sel).t().gather(1, idx)
             self._stat(sel.sum(0), thr, None, M)
         elif self.route == "eci":
             assert (G * T) % n == 0, (G, T, n)
@@ -214,13 +206,15 @@ class MoEFeedForward(nn.Module):
             sig = torch.sigmoid(s)
             top = s.view(B, T, n).transpose(1, 2).topk(c, dim=2).indices                          # [B, n, c] tokens in the image
             idx = (top + torch.arange(B, device=x.device)[:, None, None] * T).permute(1, 0, 2).reshape(n, B * c)
-            sel = torch.zeros(M, n, dtype=torch.bool, device=x.device).scatter_(
+            sel = torch.zeros(M, n, dtype=torch.bool, device=x.device).scatter(
                 0, idx.t(), torch.ones(B * c, n, dtype=torch.bool, device=x.device))
             gate = self._gates(sig, sel).t().gather(1, idx)
             self._stat(sel.sum(0), None, None, M)
         elif self.route == "noise":
-            e = torch.bucketize(t.reshape(B).float(), self.moe_edges)                             # [B] expert of each image
-            sel = (e[:, None] == torch.arange(n, device=x.device)[None, :])[:, None, :].expand(B, T, n).reshape(M, n)
+            # [B] expert of each image: the number of edges below t (torch.bucketize's index, right=False; bucketize itself
+            # breaks Inductor's CUDA lowering of the load sum below, 'StarDep does not have an index')
+            e = (t.reshape(B, 1).float() > self.moe_edges[None, :]).sum(1)
+            sel = e[:, None].expand(B, T).reshape(M)[:, None] == torch.arange(n, device=x.device)[None, :]   # [M, n]
             cap = min(M, -(-int(math.ceil(self.capacity * M / n)) // T) * T)
             idx, gate, kept = self._compact(sel, cap)
             self._stat(sel.sum(0), None, (sel & ~kept).sum(), M)
@@ -251,7 +245,7 @@ class MoEFeedForward(nn.Module):
         sig = torch.sigmoid(self._scores(x, xn, cond))
         if self.route == "tc":
             top = (sig + self.moe_bias).topk(G, dim=1).indices
-            sel = torch.zeros(M, n, dtype=torch.bool, device=x.device).scatter_(1, top, True)
+            sel = torch.zeros(M, n, dtype=torch.bool, device=x.device).scatter(1, top, True)
         else:
             sel = sig >= self.moe_thr
         cap = max(256, -(-int(sel.sum(0).max()) // 256) * 256)

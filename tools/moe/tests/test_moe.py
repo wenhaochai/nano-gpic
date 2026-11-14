@@ -2,8 +2,8 @@
 """CPU tests of the MoE feed-forward (src/models/layers/moe.py, branch moe), fp32:
  1. one expert, one active = the dense SwiGLU with the same weights (training and evaluation paths);
  2. every route's slot table: the layer's output equals a token-by-token loop over the slots, and the table has the
-    route's properties (tc: G experts per token, weights sum to G; ecb: exactly G M / n tokens per expert, the highest
-    scores up to one histogram bin; eci: the top G T / n tokens of every image; noise, pos, hash: the fixed rule);
+    route's properties (tc: G experts per token, weights sum to G; ecb: exactly G M / n tokens per expert, its highest
+    scores; eci: the top G T / n tokens of every image; noise, pos, hash: the fixed rule);
  3. evaluation does not depend on the batch: an image alone gives the same output as inside a batch (all routes);
  4. the router gets a finite, nonzero gradient (tc, ecb, eci);
  5. the balance callback: tc's bias moves by rate * sign(mean - load) and lowers MaxVio of a skewed router; ecb's
@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "baselines", "PixelGen"))
 sys.path.insert(0, SRC)
-from src.models.layers.moe import MoEFeedForward, BINS   # noqa: E402
+from src.models.layers.moe import MoEFeedForward   # noqa: E402
 from src.models.layers.swiglu import SwiGLU   # noqa: E402
 
 torch.manual_seed(0)
@@ -109,7 +109,7 @@ for name, m in cases:
         lo = torch.where(got, sig, torch.ones_like(sig)).min(0).values       # the lowest selected score per expert
         hi = torch.where(got, torch.zeros_like(sig), sig).max(0).values      # the highest unselected
         check("2 ecb: exactly G M / n tokens per expert", bool((per == G * M // n).all()))
-        check("2 ecb: the highest scores, up to one histogram bin", bool((hi - lo <= 1.0 / BINS + 1e-7).all()),
+        check("2 ecb: its highest scores (no unselected token scores above a selected one)", bool((hi <= lo).all()),
               f"max (unselected - selected) {float((hi - lo).max()):.1e}")
         check("2 ecb: weights of a token sum to G (tokens with an expert)", bool(((wsum - G).abs() < 1e-4)[cnt > 0].all()),
               f"tokens without an expert {int((cnt == 0).sum())} of {M}, most experts on one token {int(cnt.max())}")
@@ -123,7 +123,7 @@ for name, m in cases:
                 ok &= mine == set(s[b, :, e].topk(c).indices.tolist())
         check("2 eci: the top G T / n tokens of every image for every expert", ok)
     if name == "noise":
-        e_img = torch.bucketize(t, torch.tensor([0.25, 0.5, 0.75]))
+        e_img = (t[:, None] > torch.tensor([0.25, 0.5, 0.75])[None, :]).sum(1)   # torch.bucketize(t, edges), right=False
         got = torch.full((M,), -1)
         for e in range(n):
             got[idx[e][gate[e] > 0]] = e
