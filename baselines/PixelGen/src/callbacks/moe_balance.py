@@ -37,19 +37,19 @@ class MoEBalance(Callback):
         stat = torch.stack([m.moe_stat for m in self.layers])
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             dist.all_reduce(stat)
+        # No host sync: the branches on GPU tensors are torch.where (2026-11-14, step profile w2686: `if calls > 0` and
+        # `bool(moe_thr_set)` synced 24 times a step at d12, the first one waiting for the whole backward, so the optimizer
+        # and the next forward ran host-bound). The same values bit for bit (tools/moe/tests/test_balance_nosync.py).
         for m, s in zip(self.layers, stat):
             n = m.n
             load, thr, calls = s[:n], s[n:2 * n], s[2 * n + 2]
-            if calls > 0:
-                if m.route == "tc":
-                    m.moe_bias.add_(m.bias_rate * torch.sign(load.mean() - load))
-                elif m.route == "ecb":
-                    mean = thr / calls
-                    if bool(m.moe_thr_set):
-                        m.moe_thr.lerp_(mean, 1 - self.thr_decay)
-                    else:
-                        m.moe_thr.copy_(mean)
-                        m.moe_thr_set.fill_(True)
+            on = calls > 0
+            if m.route == "tc":
+                m.moe_bias.copy_(torch.where(on, m.moe_bias + m.bias_rate * torch.sign(load.mean() - load), m.moe_bias))
+            elif m.route == "ecb":
+                mean = thr / calls.clamp_min(1)
+                m.moe_thr.copy_(torch.where(on, torch.where(m.moe_thr_set, torch.lerp(m.moe_thr, mean, 1 - self.thr_decay), mean), m.moe_thr))
+                m.moe_thr_set.logical_or_(on)
             m.moe_stat.zero_()
         return stat
 
