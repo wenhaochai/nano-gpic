@@ -15,6 +15,8 @@ Ops (torch.library custom ops, opaque to Inductor, so a compiled block calls the
   gpic::moe_combine(o, gate, flat, perm, offsets) -> out          out[t] = sum gate[s] o[s]; backward: grad_o[s] = gate[s] g[flat[s]],
                                                                    grad_gate[s] = <o[s], g[flat[s]]> (fp32), one kernel
 tools/moe/tests/test_moe_ops.py checks them against the torch path."""
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -423,3 +425,183 @@ def _combine3_bwd(ctx, g):
 
 
 moe_combine3.register_autograd(_combine3_bwd, setup_context=_combine3_setup)
+
+
+# ==== v4 (GPIC_MOE_KERNELS=4; 2026-11-14, w2722's profile and the granularity runs) ====
+# The slot tensors [S, d] (S = tokens x G slots) are the layer's memory traffic: every pass over one reads or writes S x d values, and S
+# grows with the granularity. v3's combine carries the gates: its backward reads g and o and writes the gradient of o (one kernel over
+# three slot tensors: 0.16 ms a layer at d12 with 2 active experts, against 0.08 ms for a plain row gather), and o is kept for it until
+# the backward. v4 puts the gate on the experts' hidden activations instead (y = sum gate[s] (hid[s] @ W3) = sum (gate[s] hid[s]) @ W3:
+# the same function): the combine is a plain sum over a token's slots, its backward a plain row gather of g (grad_o[s] = g[flat[s]]), o is
+# not kept, and the gate's gradient comes from the hidden side ([S, h], h = hidden / G wide). An empty slot (gate 0) has a zero gated
+# hidden, so its row of o is 0, and the gradients of its hidden and of the weights are 0 as in v3. The gated hidden is rounded to bf16
+# before the last GEMM, so the forward differs from v3's in bf16 rounding.
+#   gpic::moe_sum4(o, flat, perm, offsets, tokens) -> out      out[t] = sum of o[s] over t's (valid) slots; backward: g[flat[s]]
+
+@torch.library.custom_op("gpic::moe_rows4", mutates_args=())
+def moe_rows4(g: torch.Tensor, flat: torch.Tensor) -> torch.Tensor:
+    return _gather_rows(g, flat)
+
+
+@moe_rows4.register_fake
+def _(g, flat):
+    return g.new_empty(flat.shape[0], g.shape[1])
+
+
+@torch.library.custom_op("gpic::moe_sum4", mutates_args=())
+def moe_sum4(o: torch.Tensor, flat: torch.Tensor, perm: torch.Tensor, offsets: torch.Tensor, tokens: int) -> torch.Tensor:
+    return _csum(o.contiguous(), None, perm, offsets, tokens)
+
+
+@moe_sum4.register_fake
+def _(o, flat, perm, offsets, tokens):
+    return o.new_empty(tokens, o.shape[1])
+
+
+def _sum4_setup(ctx, inputs, output):
+    o, flat, perm, offsets, tokens = inputs
+    ctx.save_for_backward(flat)
+
+
+def _sum4_bwd(ctx, g):
+    (flat,) = ctx.saved_tensors
+    return torch.ops.gpic.moe_rows4(g, flat), None, None, None, None
+
+
+moe_sum4.register_autograd(_sum4_bwd, setup_context=_sum4_setup)
+
+
+# ==== the router's scores (GPIC_MOE_ROUTER=1; 2026-11-14, w2722's profile) ====
+# moe.py's _scores casts the layer's input to fp32 and calls F.linear: a cast pass over [tokens, d] (0.10 ms a layer at d12), an fp32 copy
+# of the input kept for the backward (134 MB a layer), a TF32 GEMM, and in the backward an fp32 [tokens, d] gradient and its cast back:
+# about 3 ms a step at d12. Here one kernel reads the input in its own dtype and the fp32 weight and writes the fp32 scores (products and
+# sums in IEEE fp32; a bf16 value is exact in fp32); the backward writes the input's gradient in the input's dtype and sums the weight's
+# gradient in fp32 (per chunk of tokens, then over the chunks). Nothing in fp32 of the size of the input is made or kept.
+# The products: TF32 on the tensor cores by default, as the GEMM of F.linear on an H100 (torch's fp32 matmul precision "high": the inputs
+# rounded to 10 mantissa bits, which holds a bf16 value exactly; fp32 sums). GPIC_MOE_ROUTER_PREC=ieee: IEEE fp32 products (no tensor
+# cores: about 2 TFLOPS on an A40, 8 x the time at 128 experts).
+#   gpic::moe_scores(x [M, d], w [n, d]) -> s [M, n] fp32      s = x @ w.T
+
+@triton.jit
+def _scores_kernel(x_ptr, w_ptr, out_ptr, M, D, N, s_x, s_w, s_out,
+                   BLOCK_T: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, PREC: tl.constexpr):
+    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    e = tl.arange(0, BLOCK_N)
+    tmask = t < M
+    emask = e < N
+    acc = tl.zeros([BLOCK_T, BLOCK_N], dtype=tl.float32)
+    for k0 in range(0, D, BLOCK_K):
+        k = k0 + tl.arange(0, BLOCK_K)
+        kmask = k < D
+        xt = tl.load(x_ptr + t.to(tl.int64)[:, None] * s_x + k[None, :], mask=tmask[:, None] & kmask[None, :], other=0.0).to(tl.float32)
+        wt = tl.load(w_ptr + k[:, None] + e[None, :] * s_w, mask=kmask[:, None] & emask[None, :], other=0.0).to(tl.float32)   # w.T's block
+        acc = tl.dot(xt, wt, acc, input_precision=PREC)
+    tl.store(out_ptr + t.to(tl.int64)[:, None] * s_out + e[None, :], acc, mask=tmask[:, None] & emask[None, :])
+
+
+@triton.jit
+def _scores_gx_kernel(g_ptr, w_ptr, out_ptr, M, D, N, s_g, s_w, s_out,
+                      BLOCK_T: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, PREC: tl.constexpr):
+    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    e = tl.arange(0, BLOCK_N)
+    tmask = t < M
+    kmask = k < D
+    emask = e < N
+    g = tl.load(g_ptr + t.to(tl.int64)[:, None] * s_g + e[None, :], mask=tmask[:, None] & emask[None, :], other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + e[:, None] * s_w + k[None, :], mask=emask[:, None] & kmask[None, :], other=0.0).to(tl.float32)
+    out = tl.dot(g, w, input_precision=PREC)
+    tl.store(out_ptr + t.to(tl.int64)[:, None] * s_out + k[None, :], out.to(out_ptr.dtype.element_ty), mask=tmask[:, None] & kmask[None, :])
+
+
+@triton.jit
+def _scores_gw_kernel(g_ptr, x_ptr, out_ptr, M, D, N, s_g, s_x,
+                      CHUNK: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, PREC: tl.constexpr):
+    c = tl.program_id(0)
+    k = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    e = tl.arange(0, BLOCK_N)
+    kmask = k < D
+    emask = e < N
+    acc = tl.zeros([BLOCK_N, BLOCK_K], dtype=tl.float32)
+    for i in range(0, CHUNK, BLOCK_T):
+        t = (c * CHUNK + i + tl.arange(0, BLOCK_T)).to(tl.int64)
+        tmask = t < M
+        gt = tl.load(g_ptr + e[:, None] + t[None, :] * s_g, mask=emask[:, None] & tmask[None, :], other=0.0).to(tl.float32)   # g.T's block
+        xt = tl.load(x_ptr + t[:, None] * s_x + k[None, :], mask=tmask[:, None] & kmask[None, :], other=0.0).to(tl.float32)
+        acc = tl.dot(gt, xt, acc, input_precision=PREC)
+    row = (c * N + e).to(tl.int64)
+    tl.store(out_ptr + row[:, None] * D + k[None, :], acc, mask=emask[:, None] & kmask[None, :])
+
+
+_SC_BT, _SC_BK, _SC_CHUNK = 64, 64, 512
+_SC_PREC = os.environ.get("GPIC_MOE_ROUTER_PREC", "tf32")
+assert _SC_PREC in ("tf32", "ieee"), _SC_PREC
+
+
+def _scores(x, w):
+    x, w = x.contiguous(), w.contiguous()
+    M, D = x.shape
+    N = w.shape[0]
+    out = torch.empty(M, N, dtype=torch.float32, device=x.device)
+    _scores_kernel[(triton.cdiv(M, _SC_BT),)](x, w, out, M, D, N, x.stride(0), w.stride(0), out.stride(0), BLOCK_T=_SC_BT,
+                                             BLOCK_N=max(16, triton.next_power_of_2(N)), BLOCK_K=_SC_BK, PREC=_SC_PREC, num_warps=4)
+    return out
+
+
+@torch.library.custom_op("gpic::moe_scores", mutates_args=())
+def moe_scores(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    return _scores(x, w)
+
+
+@moe_scores.register_fake
+def _(x, w):
+    return x.new_empty(x.shape[0], w.shape[0], dtype=torch.float32)
+
+
+@torch.library.custom_op("gpic::moe_scores_gx", mutates_args=())
+def moe_scores_gx(g: torch.Tensor, w: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """The gradient of x (x itself gives only the dtype and the shape): g @ w, [M, d]."""
+    g, w = g.float().contiguous(), w.contiguous()
+    M, N = g.shape
+    D = w.shape[1]
+    out = torch.empty(M, D, dtype=x.dtype, device=g.device)
+    _scores_gx_kernel[(triton.cdiv(M, _SC_BT), triton.cdiv(D, _SC_BK))](g, w, out, M, D, N, g.stride(0), w.stride(0), out.stride(0),
+                                                                       BLOCK_T=_SC_BT, BLOCK_N=max(16, triton.next_power_of_2(N)),
+                                                                       BLOCK_K=_SC_BK, PREC=_SC_PREC, num_warps=4)
+    return out
+
+
+@moe_scores_gx.register_fake
+def _(g, w, x):
+    return x.new_empty(x.shape)
+
+
+@torch.library.custom_op("gpic::moe_scores_gw", mutates_args=())
+def moe_scores_gw(g: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """The gradient of w: g.T @ x, [n, d] fp32."""
+    g, x = g.float().contiguous(), x.contiguous()
+    M, N = g.shape
+    D = x.shape[1]
+    C = triton.cdiv(M, _SC_CHUNK)
+    part = torch.empty(C, N, D, dtype=torch.float32, device=g.device)
+    _scores_gw_kernel[(C, triton.cdiv(D, _SC_BK))](g, x, part, M, D, N, g.stride(0), x.stride(0), CHUNK=_SC_CHUNK, BLOCK_T=_SC_BT,
+                                                  BLOCK_N=max(16, triton.next_power_of_2(N)), BLOCK_K=_SC_BK, PREC=_SC_PREC, num_warps=4)
+    return part.sum(0)
+
+
+@moe_scores_gw.register_fake
+def _(g, x):
+    return g.new_empty(g.shape[1], x.shape[1], dtype=torch.float32)
+
+
+def _scores_setup(ctx, inputs, output):
+    x, w = inputs
+    ctx.save_for_backward(x, w)
+
+
+def _scores_bwd(ctx, g):
+    x, w = ctx.saved_tensors
+    return torch.ops.gpic.moe_scores_gx(g, w, x), torch.ops.gpic.moe_scores_gw(g, x).to(w.dtype)
+
+
+moe_scores.register_autograd(_scores_bwd, setup_context=_scores_setup)

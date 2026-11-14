@@ -53,6 +53,14 @@ _KERNELS = int(os.environ.get("GPIC_MOE_KERNELS", "0"))
 # 0.09 ms a layer at d12 with 16 experts); here the backward computes bmm(g, W) and bmm(g.mT, xe), both contiguous. The same products;
 # cuBLAS may pick another kernel for the transposed problem, so the bf16 rounding of the gradient may differ.
 _BMM_WT = os.environ.get("GPIC_MOE_BMM_WT", "0") == "1"
+# GPIC_MOE_KERNELS=4 (2026-11-14, w2722's profile and the granularity runs): v3 with the gate on the experts' hidden activations, not on
+# their outputs (moe_ops.py v4): the combine is a plain sum over a token's slots and its backward a plain row gather, and the experts'
+# outputs [slots, d] are not kept for the backward. The same function; the forward differs from v3's in bf16 rounding (the gated hidden is
+# rounded before the last GEMM).
+# GPIC_MOE_ROUTER=1 (2026-11-14, w2722's profile): the router's scores from the layer's input in its own dtype (moe_ops.py
+# gpic::moe_scores: IEEE fp32 products and sums, no fp32 copy of the input, the input's gradient written in its dtype). Off: F.linear on
+# an fp32 cast of the input (a TF32 GEMM on an H100). The scores differ in fp32 rounding.
+_ROUTER = os.environ.get("GPIC_MOE_ROUTER", "0") == "1"
 
 
 class _BmmWT(torch.autograd.Function):
@@ -155,6 +163,18 @@ class MoEFeedForward(nn.Module):
         n, h, d = self.n, self.h, self.dim
         cap = idx.shape[1]
         flat = idx.reshape(-1)
+        if _KERNELS == 4 and xf.is_cuda:   # v4: v3's gather; the gate on the hidden side; a plain sum over each token's slots
+            from src.models.layers import moe_ops   # noqa: F401  (registers torch.ops.gpic.*)
+            valid = (gate.reshape(-1) != 0) if gate is not None else torch.ones_like(flat, dtype=torch.bool)
+            inv = torch.ops.gpic.moe_inv(flat, valid, xf.shape[0], n)
+            perm, offsets = torch.ops.gpic.moe_csr3(inv, cap)
+            xe = torch.ops.gpic.moe_gather3(xf, flat, perm, offsets).view(n, cap, d)
+            a1, a2 = _bmm_wt(xe, self.e12.view(n, 2 * h, d)).chunk(2, dim=-1)
+            hid = F.silu(a1) * a2
+            if gate is not None:   # fp32 gate x bf16 hidden, rounded to the hidden's dtype once (one fused kernel when compiled)
+                hid = (hid * gate.unsqueeze(-1)).to(hid.dtype)
+            o = torch.bmm(hid, self.e3t.view(n, h, d)).reshape(n * cap, d)
+            return torch.ops.gpic.moe_sum4(o, flat, perm, offsets, xf.shape[0])
         if _KERNELS == 3 and xf.is_cuda:   # v3: the same sums over each token's slot list (CSR from the inverse map, no sort)
             from src.models.layers import moe_ops   # noqa: F401  (registers torch.ops.gpic.*)
             valid = (gate.reshape(-1) != 0) if gate is not None else torch.ones_like(flat, dtype=torch.bool)
@@ -209,6 +229,9 @@ class MoEFeedForward(nn.Module):
 
     def _scores(self, x, xn, cond):
         r = x if self.router_in == "mod" else xn + cond
+        if _ROUTER and r.is_cuda:
+            from src.models.layers import moe_ops   # noqa: F401  (registers torch.ops.gpic.*)
+            return torch.ops.gpic.moe_scores(r.reshape(-1, self.dim), self.router.weight)                # [M, n] fp32
         with torch.autocast(device_type=x.device.type, enabled=False):
             s = F.linear(r.reshape(-1, self.dim).float(), self.router.weight.float())      # [M, n] fp32
         return s

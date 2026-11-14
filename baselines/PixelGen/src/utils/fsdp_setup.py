@@ -125,7 +125,15 @@ def shard(net, mesh, compute_bf16, compile_blocks, group=None, names=None, train
     net._b3_kmap (keys qualified by names, {module: name} of the module that is checkpointed; default net's own)."""
     import os
     from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-    mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16 if compute_bf16 else None, reduce_dtype=torch.float32,
+    # GPIC_MFU_FSDP_REDUCE=bf16 (2026-11-14, the MoE line's step profiles: an MoE model reduce-scatters 5.7 GB of fp32 gradients a step at
+    # d12, and FSDP2 first casts the bf16 gradients into that fp32 buffer, chunk_cat 4.7 ms): the gradients reduce in bf16, half the
+    # bytes. Changes the numerics: the 8 ranks' bf16 gradients are summed with 8 mantissa bits, not 24. Off by default; an A/B arm only
+    # until a run validates it. Not with gradient accumulation (the micro-batches' sum would be kept in bf16 too).
+    red = os.environ.get("GPIC_MFU_FSDP_REDUCE", "fp32")
+    assert red in ("fp32", "bf16") and (red == "fp32" or compute_bf16), red
+    net.__dict__["_gpic_reduce_bf16"] = red == "bf16"
+    mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16 if compute_bf16 else None,
+                              reduce_dtype=torch.bfloat16 if red == "bf16" else torch.float32,
                               cast_forward_inputs=False)   # the blocks' RoPE tables and masks stay as they are
     keep = _keep(net)
     g = int(group or os.environ.get("GPIC_MFU_FSDP_GROUP", "1"))
@@ -237,6 +245,8 @@ def _nosync_strategy():
         def block_backward_sync(self):
             from torch.distributed.fsdp import FSDPModule
             mods = [m for m in self.model.modules() if isinstance(m, FSDPModule)]
+            assert not any(getattr(m, "_gpic_reduce_bf16", False) for m in self.model.modules()), \
+                "GPIC_MFU_FSDP_REDUCE=bf16 with gradient accumulation: the micro-batches' gradients would add up in bf16"
             for m in mods:
                 m.set_requires_gradient_sync(False, recurse=False)
                 m.set_reshard_after_backward(False, recurse=False)
