@@ -323,7 +323,12 @@ def moe_csr3(inv: torch.Tensor, cap: int) -> tuple[torch.Tensor, torch.Tensor]:
     counts = valid.sum(1, dtype=torch.int32)
     offsets = torch.zeros(M + 1, dtype=torch.int32, device=inv.device)
     offsets[1:] = torch.cumsum(counts, 0, dtype=torch.int32)
-    rank = torch.cumsum(valid.to(torch.int32), 1, dtype=torch.int32) - 1
+    # rank[t, e] = the experts e' <= e that took t, minus 1, as a matmul with an upper triangle of ones: torch.cumsum along the 16-wide expert
+    # dimension took 0.39 ms on an A40 at 32,768 tokens (w2722's H100 profile: tensor_kernel_scan_innermost_dim 0.22 ms per layer), the
+    # matmul 0.03 ms; exact (fp16 holds every count up to 2048, n <= 64 here)
+    assert n <= 2048, n
+    U = torch.triu(torch.ones(n, n, device=inv.device, dtype=torch.float16))
+    rank = (valid.to(torch.float16) @ U).to(torch.int32) - 1
     e = torch.arange(n, device=inv.device, dtype=torch.int32)
     S = n * cap
     pos = torch.where(valid, offsets[:-1, None] + rank, S + torch.arange(M * n, device=inv.device, dtype=torch.int32).view(M, n))
