@@ -18,6 +18,10 @@ from torch.optim.adam import adam as _adam_fn
 
 from src.optim.muon import MuonAdamW, add_units, msign
 
+# GPIC_MUON_FUSE=1 (MoE line, 2026-11-14): Muon's element-wise passes over the shards in two launches (src/optim/muon_add.py), the same bits
+import os
+_MUON_FUSE = os.environ.get("GPIC_MUON_FUSE", "0") == "1"
+
 
 def _is_dt(t):
     from torch.distributed.tensor import DTensor
@@ -106,14 +110,23 @@ class ShardMuonAdamW(MuonAdamW):
             grads.append(_loc(g))
             bufs.append(_loc(st["momentum_buffer"]))
         beta, lr, wd = group["momentum"], group["lr"], group["weight_decay"]
-        torch._foreach_lerp_(bufs, grads, 1 - beta)                      # m <- beta m + (1 - beta) g, on the shards
         if self._plan is None:
             self._plan = self._build_shard_plan(group)
         plan = self._plan
         world, rank, units, dt = plan["world"], plan["rank"], plan["units"], self.ns_dtype
         dev = bufs[0].device
-        # this rank's Nesterov input, per parameter (rows of its block), in the Newton-Schulz dtype
-        u_loc = [(g.lerp(m, beta) if group["nesterov"] else m).to(dt) for g, m in zip(grads, bufs)]
+        # GPIC_MUON_FUSE=1 (src/optim/muon_add.py): the momentum, the Nesterov input and its cast in one launch, and below the weight
+        # decay inside the add: the same bits, half the memory traffic over the shards
+        fuse = _MUON_FUSE and dev.type == "cuda" and dt == torch.bfloat16 and all(
+            g.dtype == torch.float32 and m.dtype == torch.float32 and g.is_contiguous() and m.is_contiguous() for g, m in zip(grads, bufs))
+        if fuse:
+            from src.optim.muon_add import nesterov_units_triton
+            u_loc = [torch.empty(g.shape, dtype=dt, device=dev) for g in grads]
+            nesterov_units_triton(grads, bufs, u_loc, beta, group["nesterov"])
+        else:
+            torch._foreach_lerp_(bufs, grads, 1 - beta)                  # m <- beta m + (1 - beta) g, on the shards
+            # this rank's Nesterov input, per parameter (rows of its block), in the Newton-Schulz dtype
+            u_loc = [(g.lerp(m, beta) if group["nesterov"] else m).to(dt) for g, m in zip(grads, bufs)]
         s0 = [plan["rows"][i][rank][0] for i in range(len(params))]
         pieces = []
         for d in range(world):
@@ -153,7 +166,10 @@ class ShardMuonAdamW(MuonAdamW):
         recv2 = torch.empty(sum(plan["send_sizes"]), dtype=dt, device=dev)
         _a2a(recv2, send2, plan["send_sizes"], plan["recv_sizes"])
         w_loc = [_loc(p) for p in params]
-        if wd:
+        # the units' pieces on this rank partition its rows of every parameter (each row belongs to one unit), so the decay can ride in the
+        # add; checked by the element count (a parameter without units would keep the plain mul_)
+        fuse_wd = fuse and plan.get("covered", False) and all(w.dtype == torch.float32 and w.is_contiguous() for w in w_loc)
+        if wd and not fuse_wd:
             torch._foreach_mul_(w_loc, 1 - lr * wd)
         off = 0
         D, S_, A = [], [], []
@@ -173,7 +189,14 @@ class ShardMuonAdamW(MuonAdamW):
                 S_.append(O_of[j].contiguous())   # a tall unit's update is a transposed view; add_units reads contiguous rows
                 D.append(w_loc[u["p"]][u["r0"] - s0[u["p"]]:u["r1"] - s0[u["p"]]])
                 A.append(-lr * u["coef"])
-        add_units(D, S_, A)
+        if "covered" not in plan:
+            plan["covered"] = sum(d.numel() for d in D) == sum(w.numel() for w in w_loc)
+            fuse_wd = False   # this first step took the plain mul_ above
+        if fuse_wd and D:
+            from src.optim.muon_add import decay_add_units_triton
+            decay_add_units_triton(D, S_, A, 1 - lr * wd if wd else 1.0)
+        else:
+            add_units(D, S_, A)
 
     @torch.no_grad()
     def _adamw_step(self, group):
