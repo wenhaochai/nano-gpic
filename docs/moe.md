@@ -121,3 +121,27 @@ each code adding one change to the one before. GPU ms per step, median of steps 
   Switch `GPIC_MUON_NS_COMPILE` (`muon.py`).
 - Phase 1 stays on 0381670 (the bit-for-bit change alone is under 3%); phase 2 takes nosync and local, and the
   Newton-Schulz switch after its own A/B. Fair ratio with nosync + local: 1.32 x (155.6 / 118.0).
+
+## Newton-Schulz under max-autotune and the v3 operators (A/B w2722, 2026-11-14)
+
+The layer benchmark's default mode (fp32 parameters and input under autocast) misled: an opaque gather read fp32 rows and
+the layer cast its weights every call, which FSDP2 training does not. `bench_moe_layer.py --mp bf16` runs the layer as
+FSDP2 trains it; there (A40, d12 ecb16, 16,384 tokens) v2's token sums are about 3 x faster than the fp32 index_add, and
+v3 (`GPIC_MOE_KERNELS=3`: the same sums over a sort-free CSR, and a Triton gather) brings the glue kernels from 2.3 to
+0.95 ms per call.
+
+d12, FSDP2, GPU ms per step (median of steps 20-299), one worktree (f2ee279):
+
+| code | ms/step | change |
+|---|---|---|
+| dense | 118.3 | |
+| dense, Newton-Schulz max-autotune | 117.6 | -0.6% |
+| MoE: nosync + local | 156.2 | |
+| + Newton-Schulz max-autotune | 154.1 | -1.3% |
+| + v3 operators | 151.5 | -1.7% |
+
+MoE / dense: 1.320 -> 1.311 -> 1.289. Under max-autotune the first step takes about 3 min (one compile per batch shape);
+a second launch with the same Inductor cache 7 s, so long runs should keep a persistent cache. A profile of the v3 arm
+showed v3's CSR spending 0.22 ms a layer in a cumsum along the 16-wide expert dimension; moe 83a88d9 computes it as a
+matmul with an upper triangle of ones (0.39 -> 0.03 ms on an A40, the same integers). Validation w2725: the whole phase 2
+infra against phase 1's code at d11, 3000 steps, two runs per code.
