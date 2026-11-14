@@ -48,6 +48,29 @@ ROUTES = ("tc", "ecb", "eci", "noise", "pos", "hash")
 # GPIC_MOE_KERNELS=2 (2026-11-14, after the step profile w2686): the same two sums in token order through the inverse slot map (moe_ops.py v2:
 # no sort, no atomics, no fp32 buffer, deterministic), and the gather without the fp32 round trip.
 _KERNELS = int(os.environ.get("GPIC_MOE_KERNELS", "0"))
+# GPIC_MOE_BMM_WT=1 (2026-11-14, w2722's profile): the experts' first GEMM, xe @ W^T per expert, with its gradients in their own layouts.
+# autograd of bmm(xe, W.mT) makes W's gradient as [n, d, 2h] and copies it into the parameter's [n, 2h, d] (triton_poi_fused_clone,
+# 0.09 ms a layer at d12 with 16 experts); here the backward computes bmm(g, W) and bmm(g.mT, xe), both contiguous. The same products;
+# cuBLAS may pick another kernel for the transposed problem, so the bf16 rounding of the gradient may differ.
+_BMM_WT = os.environ.get("GPIC_MOE_BMM_WT", "0") == "1"
+
+
+class _BmmWT(torch.autograd.Function):
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
+    def forward(ctx, xe, w):   # xe [n, cap, d], w [n, k, d] -> [n, cap, k]
+        ctx.save_for_backward(xe, w)
+        return torch.bmm(xe, w.mT)
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")   # the backward under the forward's autocast state (bf16 GEMMs on fp32 weights)
+    def backward(ctx, g):
+        xe, w = ctx.saved_tensors
+        return torch.bmm(g, w), torch.bmm(g.mT, xe)
+
+
+def _bmm_wt(xe, w):
+    return _BmmWT.apply(xe, w) if _BMM_WT else torch.bmm(xe, w.mT)
 
 
 class MoEFeedForward(nn.Module):
@@ -138,7 +161,7 @@ class MoEFeedForward(nn.Module):
             inv = torch.ops.gpic.moe_inv(flat, valid, xf.shape[0], n)
             perm, offsets = torch.ops.gpic.moe_csr3(inv, cap)
             xe = torch.ops.gpic.moe_gather3(xf, flat, perm, offsets).view(n, cap, d)
-            a1, a2 = torch.bmm(xe, self.e12.view(n, 2 * h, d).mT).chunk(2, dim=-1)
+            a1, a2 = _bmm_wt(xe, self.e12.view(n, 2 * h, d)).chunk(2, dim=-1)
             o = torch.bmm(F.silu(a1) * a2, self.e3t.view(n, h, d)).reshape(n * cap, d)
             g = gate.reshape(-1) if gate is not None else o.new_zeros(0, dtype=torch.float32)
             return torch.ops.gpic.moe_combine3(o, g, flat, perm, offsets, xf.shape[0], gate is not None)
@@ -147,7 +170,7 @@ class MoEFeedForward(nn.Module):
             valid = (gate.reshape(-1) != 0) if gate is not None else torch.ones_like(flat, dtype=torch.bool)
             inv = torch.ops.gpic.moe_inv(flat, valid, xf.shape[0], n)
             xe = torch.ops.gpic.moe_gather2(xf, flat, inv).view(n, cap, d)
-            a1, a2 = torch.bmm(xe, self.e12.view(n, 2 * h, d).mT).chunk(2, dim=-1)
+            a1, a2 = _bmm_wt(xe, self.e12.view(n, 2 * h, d)).chunk(2, dim=-1)
             o = torch.bmm(F.silu(a1) * a2, self.e3t.view(n, h, d)).reshape(n * cap, d)
             g = gate.reshape(-1) if gate is not None else o.new_zeros(0, dtype=torch.float32)
             return torch.ops.gpic.moe_combine2(o, g, flat, inv, xf.shape[0], gate is not None)
@@ -155,7 +178,7 @@ class MoEFeedForward(nn.Module):
             from src.models.layers import moe_ops   # noqa: F401  (registers torch.ops.gpic.*)
             perm, offsets = torch.ops.gpic.moe_csr(flat, xf.shape[0])
             xe = torch.ops.gpic.moe_gather(xf, flat, perm, offsets).view(n, cap, d)
-            a1, a2 = torch.bmm(xe, self.e12.view(n, 2 * h, d).mT).chunk(2, dim=-1)
+            a1, a2 = _bmm_wt(xe, self.e12.view(n, 2 * h, d)).chunk(2, dim=-1)
             o = torch.bmm(F.silu(a1) * a2, self.e3t.view(n, h, d)).reshape(n * cap, d)
             g = gate.reshape(-1) if gate is not None else o.new_zeros(0, dtype=torch.float32)
             return torch.ops.gpic.moe_combine(o, g, flat, perm, offsets, xf.shape[0], gate is not None)
@@ -164,7 +187,7 @@ class MoEFeedForward(nn.Module):
         # line's packed-caption path avoids bf16 atomics for this reason, lever E). The forward values are unchanged:
         # bf16 -> fp32 -> bf16 is exact.
         xe = xf.float().index_select(0, flat).to(xf.dtype).view(n, cap, d)
-        a1, a2 = torch.bmm(xe, self.e12.view(n, 2 * h, d).mT).chunk(2, dim=-1)
+        a1, a2 = _bmm_wt(xe, self.e12.view(n, 2 * h, d)).chunk(2, dim=-1)
         o = torch.bmm(F.silu(a1) * a2, self.e3t.view(n, h, d))
         o = o.float() if gate is None else o.float() * gate.unsqueeze(-1).float()
         return torch.zeros(xf.shape[0], d, dtype=torch.float32, device=xf.device).index_add_(
