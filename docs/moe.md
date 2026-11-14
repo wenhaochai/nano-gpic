@@ -159,3 +159,75 @@ matmul with an upper triangle of ones (0.39 -> 0.03 ms on an A40, the same integ
 trainings' wq snapshots were replaced with `tmp/ladder_prof/moe/train_sweep_moe2.sh` (worktree `gpic-wt/moe_run2` at 83a88d9
 and the three switches). Open: `GPIC_MOE_BMM_WT=1` (the experts' first GEMM with its gradients in their own layouts; bit
 for bit with v3 on an A40) waits for an H100 A/B.
+
+## Where the remaining time goes (w2722's profile against the dense one, 2026-11-14)
+
+Kernel by kernel on rank 0 (d12, ecb:16:2, FSDP2; the v3 arm against the dense FSDP2 arm of w2686): 148.3 against 115.4 ms of
+GPU kernels a step, +32.9 ms, none of it waiting (in a clean step the all-gathers overlap compute; 1.2 ms exposed).
+
+| source | +ms/step | switch |
+|---|---|---|
+| Newton-Schulz of the expert matrices | 5.6 | (the algorithm) |
+| FSDP2: bf16 gradients copied into the fp32 reduce-scatter input (chunk_cat), the all-gather's copy-out | 5.2 | `GPIC_MFU_FSDP_REDUCE=bf16` (changes the numerics) |
+| the slot passes: two token sums, the combine's backward, the gather | 5.5 | v4 (one pass fewer) |
+| Muon's element-wise passes and copies on the shards | 3.8 | `GPIC_MUON_FUSE=1` |
+| the router: fp32 cast of the input, the TF32 GEMM, its backward | about 3.4 | `GPIC_MOE_ROUTER=1` |
+| the CSR's cumsum | 2.7 | fixed in 83a88d9 |
+| the weight gradient's layout copy | 1.1 | `GPIC_MOE_BMM_WT=1` |
+| the model's GEMMs | 2.0 | |
+| small kernels | about 3 | |
+
+The slot kernels run near the memory bandwidth (an A40 profile at 128 experts with 16 active: the combine's backward at 82% of
+the bandwidth, the token sums at about 75%).
+
+## New switches (moe 108b4ad, 2e6ea1a; all off by default)
+
+- `GPIC_MOE_ROUTER=1`: `gpic::moe_scores` computes the scores from the layer's input in its own dtype (TF32 products, as
+  F.linear's GEMM on an H100; `GPIC_MOE_ROUTER_PREC=ieee` for IEEE products), with its own backward kernels: no fp32 copy of
+  the input. Against F.linear the (token, expert) choices differ in 2e-4 to 8e-4 of the pairs (TF32 rounding).
+- `GPIC_MOE_KERNELS=4` (v4): the gate multiplies the experts' hidden activations instead of their outputs (the same function):
+  the combine is a plain sum over a token's slots, its backward a row gather, and the experts' outputs are not kept for the
+  backward. A40 layer benchmark (`tools/moe/bench_moe_arms.py`, FSDP2's precision): -2.5% and -11% of the layer's peak memory
+  at 128 experts with 16 active; +3% at 16 experts with 2 active (the gate's gradient becomes a reduction over the hidden side).
+- `GPIC_MUON_FUSE=1`: Muon's momentum, Nesterov input and its cast in one launch, the weight decay inside the add
+  (`src/optim/muon_add.py`). ATen's operations in ATen's order with explicit fused multiply-adds, so every value is the same
+  bits (`tools/mfu/tests/test_muon_fuse.py`: 0 of 16.7M values differ; under FSDP2 on 2 GPUs, dense and MoE models, with and
+  without `GPIC_MUON_LOCAL`, every parameter and momentum buffer equal). A plain `w * f + a * o` differs in a quarter of the
+  values: the compiler contracts it the other way.
+- `GPIC_MFU_FSDP_REDUCE=bf16`: FSDP2's reduce dtype; half the bytes of the reduce-scatter and of its input copy. Changes the
+  gradient sum's numerics; refused with gradient accumulation (the micro-batches' sum would be kept in bf16).
+- Tests: `tools/moe/tests/test_moe_ops4.py` (98 checks: the score operator against float64 with IEEE and TF32 products, the
+  layer with v4 and the score operator against the torch path for every route and the granularity runs' shapes, evaluation,
+  the choices under TF32), on an A40.
+
+The H100 A/B is w2733 (`tmp/ladder_prof/moe/ab_moe_infra4.sh`, worktree `gpic-wt/moe_ab8` at 2e6ea1a).
+
+## Granularity: the shapes' cost (shape smoke w2732, 2026-11-14)
+
+`tmp/ladder_prof/moe/smoke_moe_grain.sh`: d11 = 896 x (11+2), 128 images per GPU, FSDP2, phase 1's code (83a88d9), 400 steps
+per arm on 8 H100. GPU ms/step, x the dense arm, peak GiB:
+
+| shape (experts : active) | expansion | ms/step | x dense | peak |
+|---|---|---|---|---|
+| dense, FSDP2, Newton-Schulz max-autotune | | 91.0 | 1.000 | 33.1 |
+| 4 : 1 | 4 | 103.2 | 1.134 | 35.6 |
+| 16 : 4 | 4 | 108.6 | 1.194 | 40.0 |
+| 32 : 8 | 4 | 118.9 | 1.307 | 44.2 |
+| 16 : 2 (phase 1's baseline, w2725) | 8 | 114.3 | 1.256 | |
+| 128 : 16 | 8 | 144.0 | 1.582 | 55.6 |
+| 16 : 1 | 16 | 129.4 | 1.422 | 40.5 |
+| 64 : 4 | 16 | 135.6 | 1.490 | 44.9 |
+| 128 : 8 | 16 | 147.1 | 1.616 | 49.4 |
+| noise, 4 experts, capacity 2 | 4 | 137.8 | 1.514 | 42.2 |
+| noise, 16 experts, capacity 2 | 16 | 163.4 | 1.796 | 47.4 |
+
+Two costs add up. The experts' total parameters (expansion): at G = 1, 4 -> 16 adds 26 ms (Newton-Schulz grows with the
+parameters times the smaller dimension, about 6 ms of it; the rest is FSDP2's traffic and the optimizer's passes). The
+granularity at a fixed expansion: the slot tensors are [tokens x G, d], so every pass over them grows with G (8 -> 16 active at
+expansion 8: +29.7 ms). The noise route pads every expert to twice its mean load (16 : 1 at capacity 2: +34 ms over ecb's
+16 : 1, the same shapes otherwise).
+
+A grouped GEMM that reads its rows through the slot table (no gathered copy; the gather's backward and the weight gradients
+likewise) would remove up to four slot passes per layer, about 14 ms a step at 128 : 16. A Triton prototype on an A100
+(scratch, not committed): correct, but 113-143 TFLOPS against cuBLAS's 181-220 for the same products, so it loses at 16 : 2
+and about breaks even at 128 : 16 against v3's Triton gather. Not pursued without a TMA-class kernel.
