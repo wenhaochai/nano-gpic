@@ -64,6 +64,35 @@ NS: Muon's Newton-Schulz of one layer's matrices on one GPU (a step splits it ov
 - The largest MoE-only kernels of a layer (d12 ecb16): the cat in the SwiGLU backward 0.45 ms, two index_add 0.26 ms each,
   the combine's backward reduction 0.20 ms, four casts 0.13 ms each. At G8 the two index_add take 1.03 ms each.
 
-G0 f (step time <= 1.15 x dense at X 8, G 2) fails: 1.33 x under FSDP2. Next: the step profile w2686
-(`tmp/ladder_prof/moe/prof_moe_step.sh`: dense DDP and FSDP2, ecb16 FSDP2, DDP, DDP with the Triton sums) splits the
-overhead before any change.
+## The training step on 8 H100 (step profile w2686, 2026-11-14)
+
+`tmp/ladder_prof/moe/prof_moe_step.sh`: d12, 128 images per GPU, torch.profiler steps 302-304 on all 8 ranks (GPU timeline),
+views from who-ate-my-flops; full report in `runs/gpic-speed/moe_step_prof_1114_060842/report.md`.
+
+| arm | GPU ms/step | x dense FSDP2 |
+|---|---|---|
+| dense, DDP | 121.2 | 1.03 |
+| dense, FSDP2 | 118.0 | 1.00 |
+| ecb16, FSDP2 | 161.4 | 1.37 |
+| ecb16, DDP | 188.9 | 1.60 |
+| ecb16, DDP, Triton sums | 188.3 | 1.60 |
+
+The fair ratio is 1.37 x (both FSDP2). The MoE step is 39.4 ms busier than the dense one:
+
+| source | +ms/step |
+|---|---|
+| glue of the gather and the combine (two fp32 index_add per layer, casts, zero fills; `moe.py` `_experts`) | about 16 |
+| Newton-Schulz of the expert matrices | 6.7 |
+| FSDP2 packing (chunk_cat of bf16 gradients into the fp32 reduce-scatter input, split copy-out) | 5.2 |
+| Muon's pack and unpack copies around its all-to-all (`muon_fsdp.py`, per-unit loops) | 4.6 |
+| optimizer element-wise passes on the shards | 2.4 |
+| the model's GEMMs (expert bmm vs dense FFN) | 2.3 |
+
+and it waits on the host: `MoEBalance.update` branched on GPU tensors (`if calls > 0`, `bool(moe_thr_set)`), 24 host
+syncs a step, the first one waiting 75-90 ms for the backward; the optimizer and the next forward then ran host-bound.
+moe 9215213 makes the update sync-free with the same values bit for bit (`tools/moe/tests/test_balance_nosync.py`); its
+A/B is w2719. Under DDP the MoE is slower because every rank runs the whole optimizer (+13 ms element-wise, +17 ms
+all-gather of the updates). The minimal traffic of the four glue passes is about 0.94 GB per layer (0.31 ms at 3 TB/s),
+so fused bf16 sums could save up to about 10 ms a step; the Triton segmented sums of `moe_ops.py` do not (188.3 vs 188.9).
+
+G0 f (step time <= 1.15 x dense at X 8, G 2) fails: 1.37 x under FSDP2 against the dense model under FSDP2.
