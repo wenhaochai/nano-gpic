@@ -143,5 +143,19 @@ d12, FSDP2, GPU ms per step (median of steps 20-299), one worktree (f2ee279):
 MoE / dense: 1.320 -> 1.311 -> 1.289. Under max-autotune the first step takes about 3 min (one compile per batch shape);
 a second launch with the same Inductor cache 7 s, so long runs should keep a persistent cache. A profile of the v3 arm
 showed v3's CSR spending 0.22 ms a layer in a cumsum along the 16-wide expert dimension; moe 83a88d9 computes it as a
-matmul with an upper triangle of ones (0.39 -> 0.03 ms on an A40, the same integers). Validation w2725: the whole phase 2
-infra against phase 1's code at d11, 3000 steps, two runs per code.
+matmul with an upper triangle of ones (0.39 -> 0.03 ms on an A40, the same integers).
+
+## Validation and the switch of phase 1 (w2725, 2026-11-14)
+
+`tmp/ladder_prof/moe/val_p2_infra.sh`: d11 ecb16 FSDP2 with phase 1's baseline line, 3000 steps, two runs per code.
+
+| code | GPU ms/step | mean loss, last 500 steps |
+|---|---|---|
+| 0381670 (phase 1 as queued) | 125.1, 125.1 | 0.07534, 0.07545 |
+| 83a88d9 (nosync, local, NS max-autotune, v3) | 114.3, 114.4 | 0.07531, 0.07533 |
+
+-8.6% per step. The largest gap between the 500-step mean losses of two runs of one code is 0.46% (0381670) and 0.26%
+(83a88d9); between the codes' means 0.10%. Owner (popup): 「换成新 infra（推荐）」. Before any phase 1 run started, the 18
+trainings' wq snapshots were replaced with `tmp/ladder_prof/moe/train_sweep_moe2.sh` (worktree `gpic-wt/moe_run2` at 83a88d9
+and the three switches). Open: `GPIC_MOE_BMM_WT=1` (the experts' first GEMM with its gradients in their own layouts; bit
+for bit with v3 on an A40) waits for an H100 A/B.
