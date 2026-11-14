@@ -47,12 +47,24 @@ FUSED_PARTS = {"attn.qkv_x.weight": 3, "attn.qkv.weight": 3, "attn.kv_y.weight":
 def tag_muon_params(model, prefixes=("blocks.", "text_refine_blocks.")):
     """Mark the 2D weights inside the transformer blocks for Muon: p._muon_parts = number of fused parts along d_out.
     Everything outside the blocks (patch, time and text embeddings, the final layer) and every non-matrix parameter
-    stays with AdamW. Returns (n_tagged, numel_tagged)."""
+    stays with AdamW. Returns (n_tagged, numel_tagged).
+    A module with muon_units() (the MoE layer, src/models/layers/moe.py) names its own parameters: {name: (row units,
+    stored transposed, factor on the update coefficient)}, or None for a parameter that stays with AdamW (the router)."""
+    spec = {}
+    for mname, m in model.named_modules():
+        if hasattr(m, "muon_units"):
+            for pname, v in m.muon_units().items():
+                spec[f"{mname}.{pname}"] = v
     n = numel = 0
     for name, p in model.named_parameters():
         if p.ndim != 2 or not p.requires_grad or not name.startswith(prefixes):
             continue
-        parts = next((k for suffix, k in FUSED_PARTS.items() if name.endswith(suffix)), 1)
+        if name in spec:
+            if spec[name] is None:
+                continue
+            parts, p._muon_T, p._muon_mult = spec[name]
+        else:
+            parts = next((k for suffix, k in FUSED_PARTS.items() if name.endswith(suffix)), 1)
         assert p.shape[0] % parts == 0, (name, tuple(p.shape), parts)
         p._muon_parts = parts
         p._muon_name = name
@@ -152,10 +164,16 @@ class MuonAdamW(torch.optim.Optimizer):
         world = dist.get_world_size() if dist.is_initialized() else 1
         units = []
         for i, p in enumerate(group["params"]):
-            parts = p._muon_parts if group["split"] else 1
+            # a parameter with _muon_T (an MoE layer's stacked experts) is always cut into its row units: each is one
+            # expert's matrix, whatever split says for the fused matrices
+            parts = p._muon_parts if group["split"] or hasattr(p, "_muon_T") else 1
             rows = p.shape[0] // parts
             for k in range(parts):
-                units.append({"p": i, "r0": k * rows, "r1": (k + 1) * rows, "shape": (rows, p.shape[1])})
+                shape = (rows, p.shape[1])
+                # the factor of lr: the MuP / Moonlight coefficient of the unit's matrix (its true [d_out, d_in] when the
+                # rows hold it transposed), times the parameter's own factor (1 for every dense matrix)
+                coef = self.update_coef(group, shape[::-1] if getattr(p, "_muon_T", False) else shape) * getattr(p, "_muon_mult", 1.0)
+                units.append({"p": i, "r0": k * rows, "r1": (k + 1) * rows, "shape": shape, "coef": coef})
         load = [0.0] * world
         order = sorted(range(len(units)), key=lambda j: (-math.prod(units[j]["shape"]) * min(units[j]["shape"]), j))
         for j in order:   # longest processing time first: Newton-Schulz cost ~ rows * cols * min(rows, cols)
@@ -212,7 +230,7 @@ class MuonAdamW(torch.optim.Optimizer):
             o0 = u["owner"] * plan["shard"] + u["off"]
             S_.append(full[o0:o0 + math.prod(u["shape"])].view(u["shape"]))
             D.append(params[u["p"]][u["r0"]:u["r1"]])
-            A.append(-lr * self.update_coef(group, u["shape"]))
+            A.append(-lr * u["coef"])
         add_units(D, S_, A)
 
     @torch.no_grad()

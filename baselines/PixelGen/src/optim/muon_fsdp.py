@@ -158,7 +158,7 @@ class ShardMuonAdamW(MuonAdamW):
                         k = (b - a) * u["shape"][1]
                         S_.append(recv2[off:off + k].view(b - a, u["shape"][1]))
                         D.append(w_loc[u["p"]][a - s0[u["p"]]:b - s0[u["p"]]])
-                        A.append(-lr * self.update_coef(group, u["shape"]))
+                        A.append(-lr * u["coef"])
                         off += k
         add_units(D, S_, A)
 

@@ -37,6 +37,10 @@ class SimpleEMA(Callback):
         self._groups = [([e for e, d in zip(self.ema_params, dt) if d == k], [n for n, d in zip(self.net_params, dt) if d == k])
                         for k in (True, False)]
         self._groups = [g for g in self._groups if g[0]]
+        # branch moe: the MoE layers' routing state (selection bias, evaluation thresholds) lives in buffers; mirror() copies
+        # them too, so the EMA slot of a checkpoint routes as the raw weights do
+        self._moe_bufs = [(eb, nb) for (kn, nb), (ke, eb) in zip(net.named_buffers(), ema_net.named_buffers())
+                          if kn.rsplit(".", 1)[-1] in ("moe_bias", "moe_thr", "moe_thr_set")]
         # MFU lever B2 (GPIC_MFU_LOCAL_OPT=1): the lerp on the DTensors' local tensors, taken at every step (FSDP2 may
         # re-point a shard's local tensor at its lazy init): the same kernel on the same data without DTensor's dispatch
         import os
@@ -68,6 +72,8 @@ class SimpleEMA(Callback):
         self._join()
         for ema_g, net_g in self._groups:
             torch._foreach_copy_(_local(ema_g), _local(net_g))
+        for eb, nb in getattr(self, "_moe_bufs", []):
+            eb.copy_(nb)
 
     def _join(self):
         """The default stream waits for the EMA update: the next optimizer step must not change the parameters the

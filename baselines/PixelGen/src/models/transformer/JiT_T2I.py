@@ -183,25 +183,37 @@ class Attention(nn.Module):
         return x
 
 class FlattenDiTBlock(nn.Module):
-    def __init__(self, hidden_size, groups,  mlp_ratio=4, ):
+    def __init__(self, hidden_size, groups,  mlp_ratio=4, moe=None):
+        """moe: None (the dense SwiGLU) or the arguments of MoEFeedForward (src/models/layers/moe.py, branch moe)."""
         super().__init__()
         self.norm1 = Norm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=groups, qkv_bias=False)
         self.norm2 = Norm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = FeedForward(hidden_size, mlp_hidden_dim)
+        self.moe = moe is not None
+        if self.moe:
+            from src.models.layers.moe import MoEFeedForward
+            self.mlp = MoEFeedForward(hidden_size, mlp_hidden_dim, **moe)
+        else:
+            self.mlp = FeedForward(hidden_size, mlp_hidden_dim)
         self.adaLN_modulation = nn.Sequential(
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, y, c, pos, mask=None):
+    def forward(self, x, y, c, pos, mask=None, t=None):
+        """t (MoE blocks only): the raw timesteps [B], for the noise route."""
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
         if _FUSED_NORM:   # lever K: norm1 + modulation; the first residual add + norm2 + modulation
             h = mod_rmsnorm(x, self.norm1.weight, shift_msa, scale_msa, self.norm1.variance_epsilon)
             x, h = res_mod_rmsnorm(x, self.attn(h, y, pos, mask), gate_msa, self.norm2.weight, shift_mlp, scale_mlp,
                                    self.norm2.variance_epsilon)
+            if self.moe:   # the plain router input (router_in = plain) is the normalized token before the modulation
+                return x + gate_mlp * self.mlp(h, t, c, self.norm2(x) if self.mlp.router_in == "plain" else None)
             return x + gate_mlp * self.mlp(h)
         x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), y, pos, mask)
+        if self.moe:
+            xn = self.norm2(x)
+            return x + gate_mlp * self.mlp(modulate(xn, shift_mlp, scale_mlp), t, c, xn if self.mlp.router_in == "plain" else None)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -367,7 +379,23 @@ class JiT_T2I(nn.Module):
             bottleneck_dim=256,
             weight_path=None,
             load_ema=False,
+            moe_experts=0,
+            moe_active=1,
+            moe_route="tc",
+            moe_capacity=1.5,
+            moe_shared_hidden=0,
+            moe_router_in="mod",
+            moe_first_dense=0,
+            moe_every=1,
+            moe_t_edges=None,
+            moe_bias_rate=1e-3,
+            moe_lr_mult=1.0,
+            moe_t_mean=-0.8,
+            moe_t_std=0.8,
     ):
+        """moe_experts > 0 (branch moe): the image blocks' feed-forward becomes a mixture of moe_experts experts with
+        moe_active of them per token (src/models/layers/moe.py); image block i is an MoE block when i >= moe_first_dense and
+        (i - moe_first_dense) % moe_every == 0. moe_experts = 0: the dense model, unchanged."""
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = in_channels
@@ -391,8 +419,19 @@ class JiT_T2I(nn.Module):
             requires_grad=True
         )
 
+        moe = None
+        if moe_experts:
+            if moe_route == "noise" and moe_t_edges is None:   # equal shares of the training timesteps: quantiles of
+                # sigmoid(mean + std z), the trainer's logit-normal (JiTTrainer P_mean, P_std; timeshift 1)
+                q = torch.arange(1, moe_experts, dtype=torch.float64) / moe_experts
+                moe_t_edges = torch.sigmoid(moe_t_mean + moe_t_std * torch.special.ndtri(q)).tolist()
+            moe = dict(experts=moe_experts, active=moe_active, route=moe_route, capacity=moe_capacity,
+                       shared_hidden=moe_shared_hidden, router_in=moe_router_in, t_edges=moe_t_edges,
+                       tokens=self.num_patches, bias_rate=moe_bias_rate, lr_mult=moe_lr_mult)
+        is_moe = lambda i: moe is not None and i >= moe_first_dense and (i - moe_first_dense) % moe_every == 0
+        self.moe_blocks = [i for i in range(self.num_blocks) if is_moe(i)]
         self.blocks = nn.ModuleList([
-            FlattenDiTBlock(self.hidden_size, self.num_groups) for _ in range(self.num_blocks)
+            FlattenDiTBlock(self.hidden_size, self.num_groups, moe=moe if is_moe(i) else None) for i in range(self.num_blocks)
         ])
         
         self.text_refine_blocks = nn.ModuleList([
@@ -480,6 +519,7 @@ class JiT_T2I(nn.Module):
         else:
             x = torch.nn.functional.unfold(x, kernel_size=self.patch_size, stride=self.patch_size).transpose(1, 2)
         xpos = self.fetch_pos(H // self.patch_size, W // self.patch_size, x.device)
+        t_raw = t.view(-1) if self.moe_blocks else None   # MoE blocks take the raw timesteps too (the noise route)
         if y_pack is not None:
             t = self.t_embedder(t.view(-1)).view(B, -1, self.hidden_size)
             y = self.y_embedder(y) + self.y_pos_embedding[0].index_select(0, y_pack["pos"]).to(y.dtype)
@@ -489,7 +529,7 @@ class JiT_T2I(nn.Module):
             x = self.x_embedder(x)
             x += self.pos_embed
             for block in self.blocks:
-                x = block(x, y, condition, xpos, y_pack)
+                x = block(x, y, condition, xpos, y_pack, t_raw) if block.moe else block(x, y, condition, xpos, y_pack)
             return self.unpatchify(self.final_layer(x), H, W)
         ypos = self.y_pos_embedding if y_mask is None else self.y_pos_embedding[:, :y.shape[1]]
         text_mask = full_mask = None
@@ -511,6 +551,9 @@ class JiT_T2I(nn.Module):
         for i, block in enumerate(self.blocks):
             if return_layer is not None and i==return_layer:
                 feat = x
+            if block.moe:
+                x = block(x, y, condition, xpos, full_mask, t_raw)
+                continue
             x = block(x, y, condition, xpos) if full_mask is None else block(x, y, condition, xpos, full_mask)
             
         x = self.final_layer(x)

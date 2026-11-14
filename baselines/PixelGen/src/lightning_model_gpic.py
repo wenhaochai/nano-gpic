@@ -174,6 +174,11 @@ class LightningModel(pl.LightningModule):
         torch.nn.utils.clip_grad_norm_(params, gradient_clip_val, foreach=True)
 
     def configure_callbacks(self) -> Union[Sequence[Callback], Callback]:
+        if getattr(self.denoiser, "moe_blocks", None):   # branch moe: the MoE layers' load balance and monitoring
+            from src.callbacks.moe_balance import MoEBalance
+            self.moe_balance = MoEBalance()
+            self.moe_balance.setup_layers(self.denoiser)
+            return [self.ema_tracker, self.moe_balance]
         return [self.ema_tracker]
 
     def state_dict(self, *args, **kwargs):

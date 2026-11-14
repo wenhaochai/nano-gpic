@@ -23,6 +23,9 @@ def _keep(net):
     keep = {p for m in net.modules() if isinstance(m, RMSNorm) for p in m.parameters()}
     if hasattr(net, "pos_embed"):
         keep.add(net.pos_embed)
+    for m in net.modules():   # branch moe: an MoE layer's router stays replicated in fp32 (it decides in full precision)
+        if hasattr(m, "fsdp_keep"):
+            keep.update(m.fsdp_keep())
     return keep
 
 

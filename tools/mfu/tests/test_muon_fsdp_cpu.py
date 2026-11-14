@@ -17,6 +17,10 @@ sys.path.insert(0, SRC)
 
 SMALL = dict(input_size=64, in_channels=3, num_groups=4, hidden_size=128, num_blocks=3, num_text_blocks=1, patch_size=16,
              txt_embed_dim=64, txt_max_length=16, bottleneck_dim=32)
+# branch moe: MUON_TEST_MODEL='{"moe_experts": 4, "moe_active": 2}' runs the same test on an MoE model (the experts' row
+# units, the transposed e3t units, the router replicated and with AdamW)
+import json
+SMALL.update(json.loads(os.environ.get("MUON_TEST_MODEL", "{}")))
 
 
 def run(rank, world, port):
