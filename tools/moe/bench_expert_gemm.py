@@ -6,6 +6,8 @@ eager (cuBLAS picks the kernels; torch.compile's default mode keeps the same ate
   bmm_N     torch.bmm(xe, W12n) with the weights stored [n, d, 2h] (no transposed view)
   loop_lin  F.linear per expert on its rows (cuBLAS's plain GEMM, as the dense layer)
   loop_mm   torch.mm per expert with [d, 2h] weights
+  bmm_T_at  bmm_T under torch.compile(mode="max-autotune-no-cudagraphs"): Inductor times its Triton bmm templates against cuBLAS and keeps
+            the fastest per GEMM (dense_at: the dense layer the same way, for a fair ratio)
 Gradients reach the inputs and the weights; .grad is cleared before every call (as an optimizer step does).
 usage: bench_expert_gemm.py --d 1024 --tokens 32768 --experts 16 --active 2"""
 import argparse, statistics
@@ -75,6 +77,21 @@ def loop_mm():
     torch.stack(outs).backward(ge)
 for name, fn in (("bmm_T", bmm_T), ("bmm_N", bmm_N), ("loop_lin", loop_lin), ("loop_mm", loop_mm)):
     res[name] = timed(fn)
+def exp_fwd(xe_, w12_, w3_):
+    a1, a2 = torch.bmm(xe_, w12_.view(n, 2 * h, d).mT).chunk(2, dim=-1)
+    return torch.bmm(F.silu(a1) * a2, w3_.view(n, h, d))
+def den_fwd(x_, w12_, w3_):
+    a1, a2 = F.linear(x_, w12_).chunk(2, dim=-1)
+    return F.linear(F.silu(a1) * a2, w3_)
+ef = torch.compile(exp_fwd, mode="max-autotune-no-cudagraphs"); df = torch.compile(den_fwd, mode="max-autotune-no-cudagraphs")
+def bmm_T_at():
+    clear(xe, E12, E3t)
+    ef(xe, E12, E3t).backward(ge)
+def dense_at():
+    for t in (x, w12, w3): t.grad = None
+    df(x, w12, w3).backward(gy)
+res["dense_at"] = timed(dense_at)
+res["bmm_T_at"] = timed(bmm_T_at)
 print(f"{torch.cuda.get_device_name()}: d {d}, tokens {M}, experts {n}, active {G} (hidden {h}, {cap} rows per expert); forward + backward ms "
       f"(TFLOPS at the dense layer's FLOPs):", flush=True)
 for k, v in res.items():
