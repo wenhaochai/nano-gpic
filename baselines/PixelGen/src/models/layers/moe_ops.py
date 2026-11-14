@@ -272,3 +272,149 @@ def _combine2_bwd(ctx, g):
 
 
 moe_combine2.register_autograd(_combine2_bwd, setup_context=_combine2_setup)
+
+
+# ==== v3 (GPIC_MOE_KERNELS=3; 2026-11-14) ====
+# v2's token sums loop over all n experts per token with a masked load each (at G = 2 of n = 16, 2 of 16 loads are real; at G = 8 of
+# n = 64, 8 of 64). v3 builds each token's slot list (CSR, in expert order) from the inverse map with counts and prefix sums, no sort:
+# offsets [tokens + 1] = the running sum of each token's slot count, rank[t, e] = the number of experts e' < e that took t, and
+# perm[offsets[t] + rank[t, e]] = e * cap + inv[t, e]; every position is written once, so the CSR is the same on every run. The sum
+# kernel then loops, per block of tokens, only as often as the block's longest list. The same terms in the same order as v2.
+#   gpic::moe_csr3(inv, cap) -> perm [S], offsets [tokens + 1]     (perm's tail past offsets[-1] is unused)
+#   gpic::moe_gather3(x, flat, perm, offsets) -> xe                xe[s] = x[flat[s]]; backward: grad_x[t] = sum over t's slots
+#   gpic::moe_combine3(o, gate, flat, perm, offsets, tokens, has_gate) -> out   out[t] = sum gate[s] o[s]; backward as v1
+
+@triton.jit
+def _csum_kernel(src_ptr, w_ptr, perm_ptr, off_ptr, out_ptr, M, D, s_src, s_out,
+                 HAS_W: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_D: tl.constexpr):
+    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    cols = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    tmask = t < M
+    cmask = cols < D
+    start = tl.load(off_ptr + t, mask=tmask, other=0)
+    end = tl.load(off_ptr + t + 1, mask=tmask, other=0)
+    n_k = end - start
+    longest = tl.max(n_k, axis=0)
+    acc = tl.zeros([BLOCK_T, BLOCK_D], dtype=tl.float32)
+    for k in range(0, longest):
+        live = k < n_k
+        s = tl.load(perm_ptr + start + k, mask=live, other=0).to(tl.int64)
+        v = tl.load(src_ptr + s[:, None] * s_src + cols[None, :], mask=live[:, None] & cmask[None, :], other=0.0).to(tl.float32)
+        if HAS_W:
+            v = v * tl.load(w_ptr + s, mask=live, other=0.0)[:, None]
+        acc += v
+    tl.store(out_ptr + t.to(tl.int64)[:, None] * s_out + cols[None, :], acc.to(out_ptr.dtype.element_ty), mask=tmask[:, None] & cmask[None, :])
+
+
+def _csum(src, w, perm, offsets, tokens):
+    S, D = src.shape
+    out = torch.empty(tokens, D, dtype=src.dtype, device=src.device)
+    BT, BD = 8, min(256, triton.next_power_of_2(D))
+    _csum_kernel[(triton.cdiv(tokens, BT), triton.cdiv(D, BD))](src, w if w is not None else src, perm, offsets, out, tokens, D,
+                                                              src.stride(0), out.stride(0), HAS_W=w is not None, BLOCK_T=BT,
+                                                              BLOCK_D=BD, num_warps=4)
+    return out
+
+
+@torch.library.custom_op("gpic::moe_csr3", mutates_args=())
+def moe_csr3(inv: torch.Tensor, cap: int) -> tuple[torch.Tensor, torch.Tensor]:
+    M, n = inv.shape
+    valid = inv >= 0
+    counts = valid.sum(1, dtype=torch.int32)
+    offsets = torch.zeros(M + 1, dtype=torch.int32, device=inv.device)
+    offsets[1:] = torch.cumsum(counts, 0, dtype=torch.int32)
+    rank = torch.cumsum(valid.to(torch.int32), 1, dtype=torch.int32) - 1
+    e = torch.arange(n, device=inv.device, dtype=torch.int32)
+    S = n * cap
+    pos = torch.where(valid, offsets[:-1, None] + rank, S + torch.arange(M * n, device=inv.device, dtype=torch.int32).view(M, n))
+    perm = torch.zeros(S + M * n, dtype=torch.int32, device=inv.device)
+    perm.scatter_(0, pos.reshape(-1).to(torch.int64), (e[None, :] * cap + inv).reshape(-1))
+    return perm[:S].clone(), offsets
+
+
+@moe_csr3.register_fake
+def _(inv, cap):
+    M, n = inv.shape
+    return inv.new_empty(n * cap), inv.new_empty(M + 1)
+
+
+@torch.library.custom_op("gpic::moe_csum", mutates_args=())
+def moe_csum(src: torch.Tensor, perm: torch.Tensor, offsets: torch.Tensor, tokens: int) -> torch.Tensor:
+    return _csum(src.contiguous(), None, perm, offsets, tokens)
+
+
+@moe_csum.register_fake
+def _(src, perm, offsets, tokens):
+    return src.new_empty(tokens, src.shape[1])
+
+
+@triton.jit
+def _gather_rows_kernel(x_ptr, flat_ptr, out_ptr, S, D, s_x, s_out, BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr):
+    s = tl.program_id(0) * BLOCK_S + tl.arange(0, BLOCK_S)
+    cols = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    m = (s < S)[:, None] & (cols < D)[None, :]
+    t = tl.load(flat_ptr + s, mask=s < S, other=0).to(tl.int64)
+    v = tl.load(x_ptr + t[:, None] * s_x + cols[None, :], mask=m)
+    tl.store(out_ptr + s.to(tl.int64)[:, None] * s_out + cols[None, :], v, mask=m)
+
+
+def _gather_rows(x, flat):
+    # ATen's index_select reached about a third of the A40's bandwidth here (2026-11-14, bench_moe_layer.py --mp bf16): 16 rows x 256
+    # columns per program, a pure copy
+    x = x.contiguous()
+    S, D = flat.shape[0], x.shape[1]
+    out = torch.empty(S, D, dtype=x.dtype, device=x.device)
+    BS, BD = 16, min(256, triton.next_power_of_2(D))
+    _gather_rows_kernel[(triton.cdiv(S, BS), triton.cdiv(D, BD))](x, flat, out, S, D, x.stride(0), out.stride(0), BLOCK_S=BS, BLOCK_D=BD,
+                                                                num_warps=4)
+    return out
+
+
+@torch.library.custom_op("gpic::moe_gather3", mutates_args=())
+def moe_gather3(x: torch.Tensor, flat: torch.Tensor, perm: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    return _gather_rows(x, flat)
+
+
+@moe_gather3.register_fake
+def _(x, flat, perm, offsets):
+    return x.new_empty(flat.shape[0], x.shape[1])
+
+
+def _gather3_setup(ctx, inputs, output):
+    x, flat, perm, offsets = inputs
+    ctx.save_for_backward(perm, offsets)
+    ctx.tokens = x.shape[0]
+
+
+def _gather3_bwd(ctx, g):
+    perm, offsets = ctx.saved_tensors
+    return torch.ops.gpic.moe_csum(g, perm, offsets, ctx.tokens), None, None, None
+
+
+moe_gather3.register_autograd(_gather3_bwd, setup_context=_gather3_setup)
+
+
+@torch.library.custom_op("gpic::moe_combine3", mutates_args=())
+def moe_combine3(o: torch.Tensor, gate: torch.Tensor, flat: torch.Tensor, perm: torch.Tensor, offsets: torch.Tensor, tokens: int,
+                 has_gate: bool) -> torch.Tensor:
+    return _csum(o.contiguous(), gate.float().contiguous() if has_gate else None, perm, offsets, tokens)
+
+
+@moe_combine3.register_fake
+def _(o, gate, flat, perm, offsets, tokens, has_gate):
+    return o.new_empty(tokens, o.shape[1])
+
+
+def _combine3_setup(ctx, inputs, output):
+    o, gate, flat, perm, offsets, tokens, has_gate = inputs
+    ctx.save_for_backward(o, gate, flat)
+    ctx.has_gate = has_gate
+
+
+def _combine3_bwd(ctx, g):
+    o, gate, flat = ctx.saved_tensors
+    go, gw = moe_combine_bwd(g, o, gate, flat, ctx.has_gate)
+    return go, (gw.to(gate.dtype) if ctx.has_gate else None), None, None, None, None, None
+
+
+moe_combine3.register_autograd(_combine3_bwd, setup_context=_combine3_setup)

@@ -26,12 +26,16 @@ p.add_argument("--experts", type=int, default=16); p.add_argument("--active", ty
 p.add_argument("--route", default="ecb"); p.add_argument("--capacity", type=float, default=1.5)
 p.add_argument("--out", default=""); p.add_argument("--profile", action="store_true")
 p.add_argument("--iters", type=int, default=30)
+# --mp bf16 (2026-11-14): FSDP2's mixed precision as in training (MixedPrecisionPolicy param_dtype bf16): the layers' parameters and the
+# input in bf16, the router replicated in fp32, autocast on. The default (fp32 parameters and input under autocast) makes an opaque gather
+# read fp32 rows and adds weight casts that FSDP2 training does not have (w2721: v2 slower here, faster in the training step).
+p.add_argument("--mp", default="fp32", choices=("fp32", "bf16"))
 a = p.parse_args()
 dev = "cuda"
 torch.manual_seed(0)
 d, H, T = a.d, 4 * a.d, 256
 M = a.images * T
-x0 = torch.randn(a.images, T, d, device=dev)
+x0 = torch.randn(a.images, T, d, device=dev, dtype=torch.bfloat16 if a.mp == "bf16" else torch.float32)
 tt = torch.rand(a.images, device=dev)
 
 
@@ -62,9 +66,11 @@ def fwd_bwd(mod, extra=()):
 
 
 res = dict(d=d, H=H, images=a.images, tokens=M, experts=a.experts, active=a.active, route=a.route, gpu=torch.cuda.get_device_name(),
-           torch=torch.__version__)
+           torch=torch.__version__, mp=a.mp)
 flops = 3 * 6 * d * H * M   # SwiGLU forward: 4 d H (w12, 2H x d) + 2 d H (w3) = 6 d H per token; x3 for forward + backward
 dense = SwiGLU(d, H).to(dev)
+if a.mp == "bf16":
+    dense = dense.to(torch.bfloat16)
 dense_c = torch.compile(dense)
 res["dense_ms"] = timed(fwd_bwd(dense_c))
 kw = dict(experts=a.experts, active=a.active, route=a.route, capacity=a.capacity, tokens=T)
@@ -73,6 +79,10 @@ if a.route == "noise":
 moe = MoEFeedForward(d, H, **kw).to(dev).train()
 if moe.router is not None:
     torch.nn.init.normal_(moe.router.weight, std=0.02)
+if a.mp == "bf16":   # as FSDP2's param_dtype: the sharded parameters in bf16; the router (fsdp_keep) and the buffers stay fp32
+    for name, q in moe.named_parameters():
+        if not name.startswith("router."):
+            q.data = q.data.to(torch.bfloat16)
 moe_c = torch.compile(moe)
 res["moe_ms"] = timed(fwd_bwd(moe_c, (tt,)))
 # the same layer with the Triton operators (src/models/layers/moe_ops.py: segmented sums for the combine and the gather's backward)
@@ -84,6 +94,10 @@ moe_mod._KERNELS = 2
 torch._dynamo.reset()
 moe_v2 = torch.compile(moe)
 res["moe_v2_ms"] = timed(fwd_bwd(moe_v2, (tt,)))
+moe_mod._KERNELS = 3   # v3: the same sums over each token's slot list (CSR from the inverse map, no sort)
+torch._dynamo.reset()
+moe_v3 = torch.compile(moe)
+res["moe_v3_ms"] = timed(fwd_bwd(moe_v3, (tt,)))
 moe_mod._KERNELS = 0
 torch._dynamo.reset()
 moe_c = torch.compile(moe)
@@ -92,6 +106,7 @@ res["moe_tflops_active"] = flops / res["moe_ms"] / 1e9
 res["ratio"] = res["moe_ms"] / res["dense_ms"]
 res["ratio_kernels"] = res["moe_kernels_ms"] / res["dense_ms"]
 res["ratio_v2"] = res["moe_v2_ms"] / res["dense_ms"]
+res["ratio_v3"] = res["moe_v3_ms"] / res["dense_ms"]
 
 # ---- the parts, each compiled on its own (forward + backward where it has one) ----
 xb = x0.to(torch.bfloat16)
@@ -163,8 +178,8 @@ if a.profile:
     tot = sum(k.device_time_total for k in ka) or 1
     top = sorted(ka, key=lambda k: -k.device_time_total)[:14]
     res["top_kernels"] = [(k.key[:90], round(k.device_time_total / 5 / 1000, 3), round(100 * k.device_time_total / tot, 1)) for k in top]
-    moe_mod._KERNELS = 2   # the v2 path's top kernels (its compiled module was built with _KERNELS = 2)
-    run = fwd_bwd(moe_v2, (tt,))
+    moe_mod._KERNELS = 3   # the v3 path's top kernels (its compiled module was built with _KERNELS = 3)
+    run = fwd_bwd(moe_v3, (tt,))
     for _ in range(3):
         run()
     torch.cuda.synchronize()
@@ -180,15 +195,15 @@ if a.profile:
 
 print(json.dumps(res), flush=True)
 s = res
-print(f"d{d} images {a.images} ({M} tokens) {a.route} n{a.experts} G{a.active} (h {h}, cap {cap}): dense {s['dense_ms']:.2f} ms "
+print(f"d{d} images {a.images} ({M} tokens, {a.mp}) {a.route} n{a.experts} G{a.active} (h {h}, cap {cap}): dense {s['dense_ms']:.2f} ms "
       f"({s['dense_tflops']:.0f} TFLOPS), moe {s['moe_ms']:.2f} ms ({s['moe_tflops_active']:.0f} active TFLOPS), ratio {s['ratio']:.3f}; "
-      f"with the Triton operators {s['moe_kernels_ms']:.2f} ms, ratio {s['ratio_kernels']:.3f}; v2 {s['moe_v2_ms']:.2f} ms, ratio {s['ratio_v2']:.3f}; parts: "
+      f"with the Triton operators {s['moe_kernels_ms']:.2f} ms, ratio {s['ratio_kernels']:.3f}; v2 {s['moe_v2_ms']:.2f} ms, ratio {s['ratio_v2']:.3f}; v3 {s['moe_v3_ms']:.2f} ms, ratio {s['ratio_v3']:.3f}; parts: "
       f"route {s['route_ms_fwd']:.2f}, gather {s['gather_ms']:.2f}, experts {s['experts_ms']:.2f} ({s['experts_tflops']:.0f} TFLOPS), combine "
       f"{s['combine_ms']:.2f} ms; Muon NS dense {s['muon_dense_ms']:.2f} ms, moe {s['muon_moe_ms']:.2f} ms", flush=True)
 for k in s.get("top_kernels", []):
     print("   ", k, flush=True)
 if s.get("top_kernels_v2"):
-    print("  v2 top kernels:", flush=True)
+    print("  v3 top kernels:", flush=True)
     for k in s["top_kernels_v2"]:
         print("   ", k, flush=True)
 if a.out:

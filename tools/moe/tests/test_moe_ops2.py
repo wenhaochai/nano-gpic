@@ -81,12 +81,19 @@ for route, n, G, kw in CASES:
             dynamo.reset(); mod = torch.compile(m)
         else:
             breaks = 0
-        yk, gk = run(2, mod); yk2, gk2 = run(2, mod)
         tol = 1e-5 if mode == "fp32" else 2e-2
-        e_y, e_g = rel(yk, yt), max(rel(a, b) for a, b in zip(gk, gt))
-        same = torch.equal(yk, yk2) and all(torch.equal(a, b) for a, b in zip(gk, gk2))
-        check(f"layer {route} n{n} G{G} {mode}: v2 = torch path", e_y < tol and e_g < tol and same and breaks == 0,
-              f"output {e_y:.1e}, gradients {e_g:.1e} (tolerance {tol:.0e}); repeat bit for bit {same}; graph breaks {breaks}")
+        res_k = {}
+        for K in (2, 3):
+            if mode == "bf16-compiled":
+                dynamo.reset(); mod = torch.compile(m)
+            yk, gk = run(K, mod); yk2, gk2 = run(K, mod)
+            res_k[K] = (yk, gk)
+            e_y, e_g = rel(yk, yt), max(rel(a, b) for a, b in zip(gk, gt))
+            same = torch.equal(yk, yk2) and all(torch.equal(a, b) for a, b in zip(gk, gk2))
+            check(f"layer {route} n{n} G{G} {mode}: v{K} = torch path", e_y < tol and e_g < tol and same and breaks == 0,
+                  f"output {e_y:.1e}, gradients {e_g:.1e} (tolerance {tol:.0e}); repeat bit for bit {same}; graph breaks {breaks}")
+        same23 = torch.equal(res_k[2][0], res_k[3][0]) and all(torch.equal(a, b) for a, b in zip(res_k[2][1], res_k[3][1]))
+        check(f"layer {route} n{n} G{G} {mode}: v3 = v2 bit for bit (the same terms in the same order)", same23)
 # ---- evaluation (routes tc and ecb route by threshold there: a slot table as wide as the busiest expert, eager) ----
 for route, n, G, kw in (("ecb", 16, 2, {}), ("tc", 16, 2, {"capacity": 1.5}), ("ecb", 64, 8, {})):
     for mode in ("fp32", "bf16"):
@@ -97,12 +104,12 @@ for route, n, G, kw in (("ecb", 16, 2, {}), ("tc", 16, 2, {"capacity": 1.5}), ("
             m.moe_thr.copy_(torch.rand(n, device=dev) * 0.2 + 0.45); m.moe_thr_set.fill_(True)
         xin = torch.randn(B, T, d, device=dev); tt = torch.rand(B, device=dev)
         outs = []
-        for k in (0, 2, 2):
+        for k in (0, 2, 2, 3):
             moe_mod._KERNELS = k
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=mode != "fp32"):
                 outs.append(m(xin, tt).float())
         tol = 1e-5 if mode == "fp32" else 2e-2
-        check(f"evaluation {route} n{n} G{G} {mode}: v2 = torch path", rel(outs[1], outs[0]) < tol and torch.equal(outs[1], outs[2]),
-              f"{rel(outs[1], outs[0]):.1e}; repeat bit for bit {torch.equal(outs[1], outs[2])}")
+        check(f"evaluation {route} n{n} G{G} {mode}: v2 = torch path, v3 = v2", rel(outs[1], outs[0]) < tol and torch.equal(outs[1], outs[2])
+              and torch.equal(outs[3], outs[1]), f"{rel(outs[1], outs[0]):.1e}; repeat bit for bit {torch.equal(outs[1], outs[2])}; v3 = v2 {torch.equal(outs[3], outs[1])}")
 moe_mod._KERNELS = 0
 print("MOE_OPS2_TEST " + ("PASS" if OK else "FAIL")); sys.exit(0 if OK else 1)

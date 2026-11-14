@@ -132,6 +132,16 @@ class MoEFeedForward(nn.Module):
         n, h, d = self.n, self.h, self.dim
         cap = idx.shape[1]
         flat = idx.reshape(-1)
+        if _KERNELS == 3 and xf.is_cuda:   # v3: the same sums over each token's slot list (CSR from the inverse map, no sort)
+            from src.models.layers import moe_ops   # noqa: F401  (registers torch.ops.gpic.*)
+            valid = (gate.reshape(-1) != 0) if gate is not None else torch.ones_like(flat, dtype=torch.bool)
+            inv = torch.ops.gpic.moe_inv(flat, valid, xf.shape[0], n)
+            perm, offsets = torch.ops.gpic.moe_csr3(inv, cap)
+            xe = torch.ops.gpic.moe_gather3(xf, flat, perm, offsets).view(n, cap, d)
+            a1, a2 = torch.bmm(xe, self.e12.view(n, 2 * h, d).mT).chunk(2, dim=-1)
+            o = torch.bmm(F.silu(a1) * a2, self.e3t.view(n, h, d)).reshape(n * cap, d)
+            g = gate.reshape(-1) if gate is not None else o.new_zeros(0, dtype=torch.float32)
+            return torch.ops.gpic.moe_combine3(o, g, flat, perm, offsets, xf.shape[0], gate is not None)
         if _KERNELS == 2 and xf.is_cuda:
             from src.models.layers import moe_ops   # noqa: F401  (registers torch.ops.gpic.*)
             valid = (gate.reshape(-1) != 0) if gate is not None else torch.ones_like(flat, dtype=torch.bool)
