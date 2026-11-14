@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "baselines", "PixelGen")))
+import src.models.layers.moe as moe_mod                    # noqa: E402
 from src.models.layers.moe import MoEFeedForward          # noqa: E402
 from src.models.layers.swiglu import SwiGLU               # noqa: E402
 from src.optim.muon import msign                          # noqa: E402
@@ -49,7 +50,11 @@ def timed(fn, iters=a.iters, warm=10):
 def fwd_bwd(mod, extra=()):
     x = x0.clone().requires_grad_(True)
     g = torch.randn_like(x0, dtype=torch.bfloat16)
+    params = list(mod.parameters())
     def run():
+        for q in params:   # as an optimizer step leaves them: no fp32 accumulation into old gradients
+            q.grad = None
+        x.grad = None
         with torch.autocast("cuda", dtype=torch.bfloat16):
             y = mod(x, *extra)
         y.backward(g)
@@ -70,9 +75,17 @@ if moe.router is not None:
     torch.nn.init.normal_(moe.router.weight, std=0.02)
 moe_c = torch.compile(moe)
 res["moe_ms"] = timed(fwd_bwd(moe_c, (tt,)))
+# the same layer with the Triton operators (src/models/layers/moe_ops.py: segmented sums for the combine and the gather's backward)
+moe_mod._KERNELS = True
+torch._dynamo.reset()
+res["moe_kernels_ms"] = timed(fwd_bwd(torch.compile(moe), (tt,)))
+moe_mod._KERNELS = False
+torch._dynamo.reset()
+moe_c = torch.compile(moe)
 res["dense_tflops"] = flops / res["dense_ms"] / 1e9
 res["moe_tflops_active"] = flops / res["moe_ms"] / 1e9
 res["ratio"] = res["moe_ms"] / res["dense_ms"]
+res["ratio_kernels"] = res["moe_kernels_ms"] / res["dense_ms"]
 
 # ---- the parts, each compiled on its own (forward + backward where it has one) ----
 xb = x0.to(torch.bfloat16)
@@ -148,7 +161,8 @@ if a.profile:
 print(json.dumps(res), flush=True)
 s = res
 print(f"d{d} images {a.images} ({M} tokens) {a.route} n{a.experts} G{a.active} (h {h}, cap {cap}): dense {s['dense_ms']:.2f} ms "
-      f"({s['dense_tflops']:.0f} TFLOPS), moe {s['moe_ms']:.2f} ms ({s['moe_tflops_active']:.0f} active TFLOPS), ratio {s['ratio']:.3f}; parts: "
+      f"({s['dense_tflops']:.0f} TFLOPS), moe {s['moe_ms']:.2f} ms ({s['moe_tflops_active']:.0f} active TFLOPS), ratio {s['ratio']:.3f}; "
+      f"with the Triton operators {s['moe_kernels_ms']:.2f} ms, ratio {s['ratio_kernels']:.3f}; parts: "
       f"route {s['route_ms_fwd']:.2f}, gather {s['gather_ms']:.2f}, experts {s['experts_ms']:.2f} ({s['experts_tflops']:.0f} TFLOPS), combine "
       f"{s['combine_ms']:.2f} ms; Muon NS dense {s['muon_dense_ms']:.2f} ms, moe {s['muon_moe_ms']:.2f} ms", flush=True)
 for k in s.get("top_kernels", []):

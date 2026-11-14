@@ -36,12 +36,16 @@ Statistics (training only) go to the non-persistent buffer moe_stat = [load per 
 dropped assignments, tokens, calls]; src/callbacks/moe_balance.py sums it over ranks, updates moe_bias / moe_thr and logs.
 """
 import math
+import os
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-ROUTES =("tc", "ecb", "eci", "noise", "pos", "hash")
+ROUTES = ("tc", "ecb", "eci", "noise", "pos", "hash")
+# GPIC_MOE_KERNELS=1: the gather's backward and the combine as one deterministic segmented sum per token (src/models/layers/moe_ops.py,
+# Triton; the same values up to the order of a token's fp32 terms). Off: the torch path below (fp32 atomics).
+_KERNELS = os.environ.get("GPIC_MOE_KERNELS", "0") == "1"
 
 
 class MoEFeedForward(nn.Module):
@@ -126,6 +130,14 @@ class MoEFeedForward(nn.Module):
         n, h, d = self.n, self.h, self.dim
         cap = idx.shape[1]
         flat = idx.reshape(-1)
+        if _KERNELS and xf.is_cuda:
+            from src.models.layers import moe_ops   # noqa: F401  (registers torch.ops.gpic.*)
+            perm, offsets = torch.ops.gpic.moe_csr(flat, xf.shape[0])
+            xe = torch.ops.gpic.moe_gather(xf, flat, perm, offsets).view(n, cap, d)
+            a1, a2 = torch.bmm(xe, self.e12.view(n, 2 * h, d).mT).chunk(2, dim=-1)
+            o = torch.bmm(F.silu(a1) * a2, self.e3t.view(n, h, d)).reshape(n * cap, d)
+            g = gate.reshape(-1) if gate is not None else o.new_zeros(0, dtype=torch.float32)
+            return torch.ops.gpic.moe_combine(o, g, flat, perm, offsets, xf.shape[0], gate is not None)
         # sums over a token's slots in fp32: the combine below, and the gather's backward (the round trip through fp32 makes it
         # a scatter-add into an fp32 gradient). In bf16 a token's G or more expert terms would each round to bf16 (the main
         # line's packed-caption path avoids bf16 atomics for this reason, lever E). The forward values are unchanged:
