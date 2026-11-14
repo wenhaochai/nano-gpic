@@ -81,4 +81,6 @@ class MoEBalance(Callback):
                     worst["entropy"] = min(worst["entropy"], r["entropy"])
                 out.update({f"moe/{k}_worst": v for k, v in worst.items()})
                 trainer.logger.log_metrics(out, step=trainer.global_step)
+                print(f"[moe] step {trainer.global_step}: worst layer over {self.log_every} steps: MaxVio {worst['maxvio']:.3f}, "
+                      f"entropy {worst['entropy']:.4f}, dead {worst['dead']:.3f}, dropped {worst['drop']:.4f}", flush=True)
             self._win = None
