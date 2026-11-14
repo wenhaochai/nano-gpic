@@ -35,6 +35,35 @@ G = active experts per token.
 - A DDP arm compiles 4-5.5 min with the GPUs at 0%; a second compile of the same graph in the same job took 53 s
   (Inductor cache in the job's TMPDIR).
 
+## One layer on one H100 (operator benchmark w2682, 2026-11-14)
+
+`tools/moe/bench_moe_layer.py` and `bench_expert_gemm.py` at 32,768 tokens (128 images), forward + backward, bf16, compiled
+(default mode) unless noted; worktree `gpic-wt/moe_bench1` (moe 4095805).
+
+| d | config | dense ms | MoE ms | ratio | experts ms (TFLOPS) | gather | combine | route | NS dense / MoE ms |
+|---|---|---|---|---|---|---|---|---|---|
+| 1024 | ecb n16 G2 | 4.45 | 6.18 | 1.39 | 5.02 (492) | 0.62 | 0.65 | 0.28 | 0.88 / 7.15 |
+| 1024 | tc n16 G2, capacity 1.5 | 4.36 | 8.37 | 1.92 | 7.14 (346) | 0.78 | 0.85 | 0.38 | 0.87 / 7.14 |
+| 1024 | eci n16 G2 | 4.36 | 6.12 | 1.40 | 5.03 (492) | 0.63 | 0.65 | 0.26 | 0.88 / 7.17 |
+| 1024 | ecb n8 G2 | 4.45 | 5.93 | 1.33 | 4.69 (528) | 0.65 | 0.67 | 0.27 | 0.87 / 3.67 |
+| 1024 | ecb n32 G2 | 4.52 | 6.63 | 1.47 | 5.57 (444) | 0.62 | 0.64 | 0.30 | 0.88 / 14.19 |
+| 1024 | ecb n64 G8 | 4.52 | 8.92 | 1.98 | 5.57 (444) | 1.77 | 2.08 | 0.38 | 0.88 / 5.40 |
+| 896 | ecb n16 G2 | 3.59 | 5.07 | 1.41 | 3.95 (479) | 0.55 | 0.57 | 0.27 | 0.70 / 5.87 |
+| 896 | ecb n64 G8 | 3.61 | 7.98 | 2.21 | 4.99 (380) | 1.54 | 1.81 | 0.36 | 0.70 / 4.38 |
+
+NS: Muon's Newton-Schulz of one layer's matrices on one GPU (a step splits it over 8 ranks).
+
+- The routed layer adds 1.73 ms per layer at d12 ecb16, 20.8 ms per step, as the smoke's fit (about 22 ms).
+- So the 40 ms that ecb16 adds under FSDP2 is about 21 ms routed layers, 9.4 ms Newton-Schulz and about 12 ms gradient
+  reduction and optimizer passes for 1.06e9 parameters.
+- The Triton segmented sums (`GPIC_MOE_KERNELS=1`) are slower than Inductor's fused index_add (1.43 vs 1.39 at G2, 2.10 vs
+  1.98 at G8): they buy determinism, not speed.
+- GEMM forms, eager, d12 n16 G2: the dense GEMMs 5.59 ms (442 TFLOPS); bmm with the transposed weight view 1.12 x; weights
+  stored [n, d, 2h] 1.045 x; a loop over experts 2.5-13 x. Under torch.compile max-autotune the dense GEMMs reach 601 TFLOPS
+  (0.74 x) and the bmm 538 TFLOPS (0.82 x): autotuning speeds up both sides, so it does not close the gap.
+- The largest MoE-only kernels of a layer (d12 ecb16): the cat in the SwiGLU backward 0.45 ms, two index_add 0.26 ms each,
+  the combine's backward reduction 0.20 ms, four casts 0.13 ms each. At G8 the two index_add take 1.03 ms each.
+
 G0 f (step time <= 1.15 x dense at X 8, G 2) fails: 1.33 x under FSDP2. Next: the step profile w2686
 (`tmp/ladder_prof/moe/prof_moe_step.sh`: dense DDP and FSDP2, ecb16 FSDP2, DDP, DDP with the Triton sums) splits the
 overhead before any change.
