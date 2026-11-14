@@ -90,8 +90,8 @@ res["route_ms_fwd"] = timed(route_c)
 moe.moe_stat.zero_()
 flat = idx.reshape(-1)
 xg = xb.reshape(M, d).detach().requires_grad_(True)
-def part_gather():
-    y = xg.index_select(0, flat)
+def part_gather():   # as MoEFeedForward._experts: an fp32 round trip, so the backward scatter-adds into an fp32 gradient
+    y = xg.float().index_select(0, flat).to(xg.dtype)
     y.backward(torch.ones_like(y))
 gather_c = torch.compile(part_gather)
 res["gather_ms"] = timed(gather_c)
@@ -109,9 +109,9 @@ res["experts_tflops"] = flops / res["experts_ms"] / 1e9
 o = torch.randn(n, cap, d, device=dev, dtype=torch.bfloat16).requires_grad_(True)
 gt = (gate if gate is not None else torch.ones(n, cap, device=dev)).detach()
 gy = torch.randn(M, d, device=dev, dtype=torch.bfloat16)
-def part_combine():
-    y = (o * gt.unsqueeze(-1).to(o.dtype)).reshape(n * cap, d)
-    out = y.new_zeros(M, d).index_add_(0, flat, y)
+def part_combine():   # as MoEFeedForward._experts: gate and sum in fp32
+    y = (o.float() * gt.unsqueeze(-1).float()).reshape(n * cap, d)
+    out = torch.zeros(M, d, dtype=torch.float32, device=dev).index_add_(0, flat, y).to(o.dtype)
     out.backward(gy)
 combine_c = torch.compile(part_combine)
 res["combine_ms"] = timed(combine_c)
