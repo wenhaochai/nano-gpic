@@ -200,7 +200,34 @@ the bandwidth, the token sums at about 75%).
   layer with v4 and the score operator against the torch path for every route and the granularity runs' shapes, evaluation,
   the choices under TF32), on an A40.
 
-The H100 A/B is w2733 (`tmp/ladder_prof/moe/ab_moe_infra4.sh`, worktree `gpic-wt/moe_ab8` at 2e6ea1a).
+### The H100 A/B (w2733, 2026-11-14)
+
+`tmp/ladder_prof/moe/ab_moe_infra4.sh`, worktree `gpic-wt/moe_ab8` at 2e6ea1a, FSDP2, Newton-Schulz max-autotune, 320 steps per arm,
+GPU ms/step (median of steps 20-299); each d12 code twice, the repeats within 0.1 ms:
+
+| d12 = 1024 x (12+3), ecb:16:2 | ms/step | change |
+|---|---|---|
+| dense | 117.8 | |
+| dense + `GPIC_MUON_FUSE=1` | 116.9 | -0.9 |
+| MoE, phase 1's settings (LOCAL, NS max-autotune, v3) | 149.3 | |
+| + `GPIC_MOE_BMM_WT=1` | 147.9 | -1.4 |
+| + `GPIC_MOE_ROUTER=1` | 146.8 | -1.1 |
+| + `GPIC_MUON_FUSE=1` | 145.2 | -1.6 |
+| + `GPIC_MOE_KERNELS=4` | 148.1 | +2.9 |
+
+MoE / dense: 1.268 -> 1.242. At d11 with 128 experts and 16 active: v3 + BMM_WT + FUSE 144.7 ms (the shape smoke w2732, without
+the switches, 144.0: no gain there); v4 + BMM_WT + ROUTER + FUSE 147.2 ms (+1.7%) with a peak of 44.0 GiB against 55.5 (-21%).
+So v4 is a memory switch for the large granularities (where 16 active experts at d13 and up would not fit 128 images per GPU),
+not a speed switch. `GPIC_MFU_FSDP_REDUCE=bf16` did not run (its assert also hit the fp32 EMA module's sharding; fixed in
+b818bf1); it changes the numerics and is not pursued.
+
+The profiled arm (BMM_WT, ROUTER, FUSE) against the dense profile: 140.5 against 115.4 ms of GPU kernels a step (+25.1, was
++32.9 with phase 1's code): Newton-Schulz +5.5, FSDP2's chunk_cat and copy-out +5.1, the slot kernels about +5, routing and
+gates about +3, the model's GEMMs +0.7 (the expert bmm runs about as fast as the dense FFN's GEMMs). Each remaining item is
+either the algorithm (Newton-Schulz), FSDP2's own copies, or kernels near the memory bandwidth.
+
+Validation before phase 2 uses the kept switches: w2749 (`tmp/ladder_prof/moe/val_p3_infra.sh`, d11 ecb:16:2, 3000 steps, two
+runs per code against phase 1's code, as w2725).
 
 ## Granularity: the shapes' cost (shape smoke w2732, 2026-11-14)
 
