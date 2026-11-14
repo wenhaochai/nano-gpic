@@ -130,10 +130,13 @@ def shard(net, mesh, compute_bf16, compile_blocks, group=None, names=None, train
     # bytes. Changes the numerics: the 8 ranks' bf16 gradients are summed with 8 mantissa bits, not 24. Off by default; an A/B arm only
     # until a run validates it. Not with gradient accumulation (the micro-batches' sum would be kept in bf16 too).
     red = os.environ.get("GPIC_MFU_FSDP_REDUCE", "fp32")
-    assert red in ("fp32", "bf16") and (red == "fp32" or compute_bf16), red
-    net.__dict__["_gpic_reduce_bf16"] = red == "bf16"
+    assert red in ("fp32", "bf16"), red
+    # only the trained model (bf16 compute): the EMA module is sharded here too, in fp32, and never makes gradients (w2733's bf16 arms
+    # stopped on an assert here that required bf16 compute of the EMA module as well)
+    red16 = red == "bf16" and compute_bf16
+    net.__dict__["_gpic_reduce_bf16"] = red16
     mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16 if compute_bf16 else None,
-                              reduce_dtype=torch.bfloat16 if red == "bf16" else torch.float32,
+                              reduce_dtype=torch.bfloat16 if red16 else torch.float32,
                               cast_forward_inputs=False)   # the blocks' RoPE tables and masks stay as they are
     keep = _keep(net)
     g = int(group or os.environ.get("GPIC_MFU_FSDP_GROUP", "1"))
