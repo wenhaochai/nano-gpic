@@ -57,7 +57,10 @@ WT=${LADDER_WT:-$WC/project/gpic-wt/ladder_full_run}
 ROOT=${LADDER_RUN_ROOT:-$WC/runs/gpic-speed}
 RUN=$ROOT/exp_ladder_$SIZE   # main.py: <default_root_dir>/exp_<tags.exp>
 if [ $((STEPS % 32)) -ne 0 ] || [ $((D % 64)) -ne 0 ]; then echo "max_steps must be a multiple of 32 and d of 64"; exit 2; fi
-MS=$((STEPS / 4)); LAST=${LADDER_LAST_EVERY:-$((STEPS / 32))}   # jobs/train_full.sh sets LADDER_LAST_EVERY per size
+MS=${LADDER_MS_EVERY:-$((STEPS / 4))}; LAST=${LADDER_LAST_EVERY:-$((STEPS / 32))}   # jobs/train_full.sh sets LADDER_LAST_EVERY per size
+# LADDER_MS_EVERY (branch moe): the steps between two ms checkpoints; an MoE run sets max_steps (its checkpoints hold every
+# expert, and only the last one is evaluated)
+[ "$MS" -gt 0 ] 2>/dev/null && [ $((STEPS % MS)) -eq 0 ] || { echo "bad LADDER_MS_EVERY $MS"; exit 2; }
 [ "$LAST" -gt 0 ] 2>/dev/null || { echo "bad LADDER_LAST_EVERY $LAST"; exit 2; }
 mkdir -p $RUN
 echo "$(date -u +%FT%TZ) $(git -C $WT rev-parse HEAD) size=$SIZE d=$D nb=$NB nt=$NT max_steps=$STEPS ms_every=$MS last_every=$LAST host=$(hostname) job=$JOBID" >> $RUN/launches.txt

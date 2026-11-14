@@ -423,8 +423,9 @@ class JiT_T2I(nn.Module):
         if moe_experts:
             if moe_route == "noise" and moe_t_edges is None:   # equal shares of the training timesteps: quantiles of
                 # sigmoid(mean + std z), the trainer's logit-normal (JiTTrainer P_mean, P_std; timeshift 1)
-                q = torch.arange(1, moe_experts, dtype=torch.float64) / moe_experts
-                moe_t_edges = torch.sigmoid(moe_t_mean + moe_t_std * torch.special.ndtri(q)).tolist()
+                import math, statistics   # plain Python: a tool may build the model on the meta device, where a tensor has no values
+                moe_t_edges = [1 / (1 + math.exp(-(moe_t_mean + moe_t_std * statistics.NormalDist().inv_cdf(q / moe_experts))))
+                               for q in range(1, moe_experts)]
             moe = dict(experts=moe_experts, active=moe_active, route=moe_route, capacity=moe_capacity,
                        shared_hidden=moe_shared_hidden, router_in=moe_router_in, t_edges=moe_t_edges,
                        tokens=self.num_patches, bias_rate=moe_bias_rate, lr_mult=moe_lr_mult)

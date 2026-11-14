@@ -80,18 +80,21 @@ class MoEFeedForward(nn.Module):
             assert tokens % n == 0, (tokens, n)
             side = int(round(math.sqrt(tokens)))
             assert side * side == tokens
+            # the partition in plain Python: a tool may build the model on the meta device (tools/heldout_loss.py), where a
+            # tensor has no values
             if route == "pos":   # n tiles of the side x side grid, as square as n allows (n = 8 on 16 x 16: 4 rows x 2 columns of 4 x 8 tiles)
                 ry = 2 ** math.ceil(math.log2(n) / 2); rx = n // ry
                 assert ry * rx == n and side % ry == 0 and side % rx == 0, (n, side)
-                yy, xx = torch.meshgrid(torch.arange(side), torch.arange(side), indexing="ij")
-                region = (yy // (side // ry)) * rx + xx // (side // rx)
-                region = region.reshape(-1)
+                region = [(y // (side // ry)) * rx + x // (side // rx) for y in range(side) for x in range(side)]
             else:
-                g = torch.Generator().manual_seed(20261113)
-                region = torch.empty(tokens, dtype=torch.long)
-                region[torch.randperm(tokens, generator=g)] = torch.arange(tokens) % n
-            order = torch.argsort(region, stable=True).view(n, tokens // n)   # the token positions of each expert
-            self.register_buffer("moe_tokens", order)
+                import random
+                perm = list(range(tokens))
+                random.Random(20261113).shuffle(perm)
+                region = [0] * tokens
+                for i, p in enumerate(perm):
+                    region[p] = i % n
+            order = [[i for i in range(tokens) if region[i] == e] for e in range(n)]   # the token positions of each expert
+            self.register_buffer("moe_tokens", torch.tensor(order, dtype=torch.int64))
         self.reset_parameters()
 
     def reset_parameters(self):
