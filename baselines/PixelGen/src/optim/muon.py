@@ -78,18 +78,37 @@ def tag_muon_params(model, prefixes=("blocks.", "text_refine_blocks.")):
     return n, numel
 
 
+# GPIC_MUON_NS_COMPILE=<torch.compile mode> (MoE line, 2026-11-14, w2721): Newton-Schulz on CUDA through torch.compile, e.g.
+# max-autotune-no-cudagraphs, under which Inductor times Triton bmm templates against cuBLAS per GEMM: on H100 one rank's batch of
+# 72 x [2048, 1024] (d12, 16 experts, 2 active) 10.49 -> 7.00 ms (369 -> 552 TFLOPS), d11's 66 x [1792, 896] 7.59 -> 5.28 ms, d12 G8's
+# 288 x [512, 1024] 7.64 -> 4.58 ms, with the same difference from an fp32 msign (2e-2); on an A40 no gain. "default" = the default mode.
+# The same polynomial; the GEMM kernels and so the bf16 rounding change. One compile per batch shape (a few per rank) at the first step.
+_NS_COMPILE = os.environ.get("GPIC_MUON_NS_COMPILE", "")
+_msign_compiled = None
+
+
 @torch.no_grad()
 def msign(G, steps=5, dtype=torch.bfloat16, fused=None):
     """Orthogonalize each matrix of G ([..., a, b]) with the quintic Newton-Schulz iteration (Keller Jordan), in bf16 by
     default. In bf16 the result moves by up to ~5% of its largest entry with the GEMM algorithm (e.g. batch size), so
     exact comparisons use dtype=torch.float32."""
+    fused = _NS_FUSED if fused is None else fused
+    if _NS_COMPILE and G.is_cuda:
+        global _msign_compiled
+        if _msign_compiled is None:
+            _msign_compiled = torch.compile(_msign_impl, **({} if _NS_COMPILE == "default" else {"mode": _NS_COMPILE}))
+        return _msign_compiled(G, steps, dtype, fused)
+    return _msign_impl(G, steps, dtype, fused)
+
+
+def _msign_impl(G, steps, dtype, fused):
     a, b, c = NS_COEFFS
     X = G.to(dtype)
     tall = G.size(-2) > G.size(-1)
     if tall:
         X = X.mT
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
-    if _NS_FUSED if fused is None else fused:
+    if fused:
         mm = torch.baddbmm if X.dim() == 3 else torch.addmm
         for _ in range(steps):
             A = X @ X.mT

@@ -96,3 +96,28 @@ all-gather of the updates). The minimal traffic of the four glue passes is about
 so fused bf16 sums could save up to about 10 ms a step; the Triton segmented sums of `moe_ops.py` do not (188.3 vs 188.9).
 
 G0 f (step time <= 1.15 x dense at X 8, G 2) fails: 1.37 x under FSDP2 against the dense model under FSDP2.
+
+## Three fixes, measured (A/B w2721, 2026-11-14)
+
+`tmp/ladder_prof/moe/ab_moe_infra2.sh`: d12 ecb16 FSDP2, 400 steps per arm, two arms per code (repeats agree within 0.4 ms),
+each code adding one change to the one before. GPU ms per step, median of steps 20-399:
+
+| code | change | ms/step | vs old |
+|---|---|---|---|
+| old 4095805 | (phase 1's computation) | 161.8 | |
+| nosync 9215213 | balance update without host syncs (same values bit for bit) | 159.1 | -2.7 (-1.7%) |
+| v2 eac2681 | `GPIC_MOE_KERNELS=2`: token-order sums through the inverse slot map | 158.4 | -3.4 (-2.1%) |
+| local aa8fced | `GPIC_MUON_LOCAL=1`: expert Muon parts owned where they live | 155.6 | -6.1 (-3.8%) |
+
+- The profiled idle overstated the syncs' cost: the mean start-to-start time falls by 4.0 ms (2.4%), the slow steps (p90)
+  by 9-11 ms.
+- v2 does not pay: in the layer benchmark (fp32 input under autocast) it is slower than the torch path (6.56 vs 6.26 ms at
+  d12 G2, 9.86 vs 8.85 at G8): the opaque gather is an ATen fp32 index_select (0.46 ms per layer) plus a cast that Inductor
+  fuses in the torch path, and `_tsum_kernel` (16 tokens per program, a masked load per expert) takes 0.30 ms per layer, 3 x
+  its bandwidth bound. Inductor's fused index_add is a strong baseline; the next step for the glue is a gather and scatter
+  fused into the expert GEMMs.
+- Newton-Schulz under torch.compile max-autotune on H100 (`tools/moe/bench_ns.py`): one rank's d12 G2 batch 10.49 -> 7.00 ms
+  (369 -> 552 TFLOPS), d11 G2 7.59 -> 5.28, d12 G8 7.64 -> 4.58, with the same difference from fp32 (2e-2); on an A40 no gain.
+  Switch `GPIC_MUON_NS_COMPILE` (`muon.py`).
+- Phase 1 stays on 0381670 (the bit-for-bit change alone is under 3%); phase 2 takes nosync and local, and the
+  Newton-Schulz switch after its own A/B. Fair ratio with nosync + local: 1.32 x (155.6 / 118.0).
