@@ -162,10 +162,10 @@ class MoEFeedForward(nn.Module):
         return self.G * sig / den
 
     def _ecb_select(self, sig, capn):
-        """Each expert's capn highest-scoring tokens of the micro-batch (torch.topk along the tokens): idx [n, capn], and the
-        boundary score per expert (its lowest selected score) [n]."""
-        v, i = sig.t().topk(capn, dim=1)
-        return i, v[:, -1]
+        """Each expert's capn highest-scoring tokens of the micro-batch (torch.topk along the tokens, unsorted: the set is the
+        same, and the slot order does not matter): idx [n, capn], and the boundary score per expert (its lowest selected score) [n]."""
+        v, i = sig.t().topk(capn, dim=1, sorted=False)
+        return i, v.min(dim=1).values
 
     # ---- forward ----
     def forward(self, x, t=None, cond=None, xn=None):
