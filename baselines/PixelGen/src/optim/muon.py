@@ -40,6 +40,11 @@ _MUON_ADD = os.environ.get("GPIC_MFU_MUON_ADD", "0") == "1"
 # 45 scalar multiplies and 59 adds over the stacked matrices). tools/mfu/tests/test_ns_fused.py: its error against fp32
 # Newton-Schulz is no larger than the reference's.
 _NS_FUSED = os.environ.get("GPIC_MFU_NS_FUSED", "0") == "1"
+# GPIC_MUON_LOCAL=1 (MoE line, 2026-11-14 after the step profile w2686): an MoE expert's matrix part (a parameter with _muon_T) whose rows all
+# lie in one rank's FSDP2 row block is owned by that rank, so under FSDP2 it skips the all-to-all and its pack and unpack copies (at d12 with
+# 16 experts every expert part does); the other parts keep the longest-processing-time assignment, started from the local parts' loads.
+# The same owners under DDP keep the two bit for bit equal; against the default plan the owners' Newton-Schulz batches change.
+_MUON_LOCAL = os.environ.get("GPIC_MUON_LOCAL", "0") == "1"
 FUSED_PARTS = {"attn.qkv_x.weight": 3, "attn.qkv.weight": 3, "attn.kv_y.weight": 2, "mlp.w12.weight": 2,
                "adaLN_modulation.0.weight": 6}
 
@@ -173,9 +178,19 @@ class MuonAdamW(torch.optim.Optimizer):
                 # the factor of lr: the MuP / Moonlight coefficient of the unit's matrix (its true [d_out, d_in] when the
                 # rows hold it transposed), times the parameter's own factor (1 for every dense matrix)
                 coef = self.update_coef(group, shape[::-1] if getattr(p, "_muon_T", False) else shape) * getattr(p, "_muon_mult", 1.0)
-                units.append({"p": i, "r0": k * rows, "r1": (k + 1) * rows, "shape": shape, "coef": coef})
+                u = {"p": i, "r0": k * rows, "r1": (k + 1) * rows, "shape": shape, "coef": coef}
+                if _MUON_LOCAL and hasattr(p, "_muon_T") and world > 1:
+                    c = -(-p.shape[0] // world)   # FSDP2's row block per rank (torch.chunk along dim 0)
+                    if u["r0"] // c == (u["r1"] - 1) // c:
+                        u["local"] = u["r0"] // c
+                units.append(u)
         load = [0.0] * world
-        order = sorted(range(len(units)), key=lambda j: (-math.prod(units[j]["shape"]) * min(units[j]["shape"]), j))
+        for u in units:   # GPIC_MUON_LOCAL=1: an expert's unit is owned by the rank whose FSDP2 shard holds all its rows
+            if "local" in u:
+                u["owner"] = u["local"]
+                load[u["owner"]] += math.prod(u["shape"]) * min(u["shape"])
+        order = sorted((j for j in range(len(units)) if "local" not in units[j]),
+                       key=lambda j: (-math.prod(units[j]["shape"]) * min(units[j]["shape"]), j))
         for j in order:   # longest processing time first: Newton-Schulz cost ~ rows * cols * min(rows, cols)
             r = min(range(world), key=lambda q: (load[q], q))
             units[j]["owner"] = r

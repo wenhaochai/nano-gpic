@@ -70,7 +70,11 @@ class ShardMuonAdamW(MuonAdamW):
             u["pieces"] = [(max(u["r0"], s0), min(u["r1"], s1)) for s0, s1 in rows[u["p"]]]
         units = plan["units"]
         mine = [j for j, u in enumerate(units) if u["owner"] == rank]
-        n = lambda u, q: max(0, u["pieces"][q][1] - u["pieces"][q][0]) * u["shape"][1]
+        n0 = lambda u, q: max(0, u["pieces"][q][1] - u["pieces"][q][0]) * u["shape"][1]
+        # GPIC_MUON_LOCAL=1: a unit owned by the rank that holds all its rows ("local", muon.py) stays out of the all-to-all: its owner
+        # reads the rows from its own shard and adds the update to them in place
+        direct = lambda u: "local" in u
+        n = lambda u, q: 0 if direct(u) else n0(u, q)
         # send: to each destination d, my piece of every unit d owns, in unit order; recv: from each source q, its
         # piece of every unit I own, in unit order (the return trip swaps the two)
         send_sizes = [sum(n(u, rank) for u in units if u["owner"] == d) for d in range(world)]
@@ -85,7 +89,7 @@ class ShardMuonAdamW(MuonAdamW):
         for j in mine:
             by_shape.setdefault(units[j]["shape"], []).append(j)
         plan.update(rows=rows, send_sizes=send_sizes, recv_sizes=recv_sizes, recv_off=recv_off, mine_ids=mine,
-                    by_shape=by_shape, n=n)
+                    by_shape=by_shape, n=n, direct=direct)
         return plan
 
     @torch.no_grad()
@@ -116,7 +120,7 @@ class ShardMuonAdamW(MuonAdamW):
             for u in units:
                 if u["owner"] == d:
                     a, b = u["pieces"][rank]
-                    if b > a:
+                    if b > a and not plan["direct"](u):
                         pieces.append(u_loc[u["p"]][a - s0[u["p"]]:b - s0[u["p"]]].reshape(-1))
         send = torch.cat(pieces) if pieces else torch.empty(0, dtype=dt, device=dev)
         recv = torch.empty(sum(plan["recv_sizes"]), dtype=dt, device=dev)
@@ -128,6 +132,9 @@ class ShardMuonAdamW(MuonAdamW):
             mats = []
             for j in js:
                 u = units[j]
+                if plan["direct"](u):   # all its rows are mine: the bf16 Nesterov input the all-to-all would have carried
+                    mats.append(u_loc[u["p"]][u["r0"] - s0[u["p"]]:u["r1"] - s0[u["p"]]])
+                    continue
                 parts = [recv[plan["recv_off"][(j, q)]:plan["recv_off"][(j, q)] + n(u, q)].view(-1, shape[1])
                          for q in range(world) if n(u, q)]
                 mats.append(torch.cat(parts, dim=0))
@@ -140,7 +147,7 @@ class ShardMuonAdamW(MuonAdamW):
             for j in plan["mine_ids"]:
                 u = units[j]
                 a, b = u["pieces"][q]
-                if b > a:
+                if b > a and not plan["direct"](u):
                     back.append(O_of[j][a - u["r0"]:b - u["r0"]].reshape(-1))
         send2 = torch.cat(back) if back else torch.empty(0, dtype=dt, device=dev)
         recv2 = torch.empty(sum(plan["send_sizes"]), dtype=dt, device=dev)
@@ -154,12 +161,18 @@ class ShardMuonAdamW(MuonAdamW):
             for u in units:
                 if u["owner"] == d:
                     a, b = u["pieces"][rank]
-                    if b > a:
+                    if b > a and not plan["direct"](u):
                         k = (b - a) * u["shape"][1]
                         S_.append(recv2[off:off + k].view(b - a, u["shape"][1]))
                         D.append(w_loc[u["p"]][a - s0[u["p"]]:b - s0[u["p"]]])
                         A.append(-lr * u["coef"])
                         off += k
+        for j in plan["mine_ids"]:   # my direct units: the update straight from Newton-Schulz to my rows
+            u = units[j]
+            if plan["direct"](u):
+                S_.append(O_of[j].contiguous())   # a tall unit's update is a transposed view; add_units reads contiguous rows
+                D.append(w_loc[u["p"]][u["r0"] - s0[u["p"]]:u["r1"] - s0[u["p"]]])
+                A.append(-lr * u["coef"])
         add_units(D, S_, A)
 
     @torch.no_grad()
