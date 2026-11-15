@@ -75,6 +75,8 @@ REPL = [(b"wenhaochai/nano-gpic", b"wenhaochai/nano-gpic"), (b"/scratch/gpfs/GRO
         (b"proxy", b"proxy"), (b"login2", b"login2"), (b"login1", b"login1")]
 NODE = re.compile(rb"h100-([a-z]+[0-9][0-9a-z]*)")
 def sub(b):
+    if b is None:   # a file the path filter drops reaches the filename callback as None
+        return b
     for a, c in REPL: b = b.replace(a, c)
     b = NODE.sub(rb"node-\1", b)
     return b.replace(b"H100", b"H100").replace(b"H100", b"H100").replace(b"h100", b"h100")
