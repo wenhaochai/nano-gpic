@@ -23,10 +23,14 @@ _FA3 = None
 def _lib():
     global _FA3
     if _FA3 is None:
-        path = os.environ.get("GPIC_FA3_PATH", "/scratch/gpfs/GROUP/USER/envs/mfu-extra/fa3_torch27_cu126")
-        if path not in sys.path:
-            sys.path.insert(0, path)
-        from flash_attn3 import flash_attn_interface as fai
+        try:   # the build installed in the environment as the module flash_attn3
+            from flash_attn3 import flash_attn_interface as fai
+        except ImportError:   # else the build's directory: GPIC_FA3_PATH, default <work root>/envs/mfu-extra/fa3_torch27_cu126
+            path = os.environ.get("GPIC_FA3_PATH") or os.path.join(os.environ.get("GPIC_WC", "/scratch/gpfs/GROUP/USER"),
+                                                                   "envs", "mfu-extra", "fa3_torch27_cu126")
+            if path not in sys.path:
+                sys.path.insert(0, path)
+            from flash_attn3 import flash_attn_interface as fai
         _FA3 = fai
     return _FA3
 

@@ -41,7 +41,7 @@ N, the image parameters, is 18 × image layers × width², the matrices of the i
 
 Each step runs on one node with 8 H100 GPUs, except the fit. Set `GPIC_WC` to a work root: the data go to `$GPIC_WC/data/gpic`, the runs to `$GPIC_WC/runs/final_ladder`.
 
-1. **Environment.** Python with `baselines/PixelGen/requirements.txt`, FlashAttention 3 and the evaluation toolkit (`pip install -e gpic_eval`). The scripts activate `$GPIC_WC/envs/pixgen`; `GPIC_VENV` names another environment, and `GPIC_VENV=` uses the python on `PATH`. The text encoder, Qwen/Qwen3-1.7B, must be in `$GPIC_WC/cache/huggingface`: the jobs run with the Hugging Face hub offline.
+1. **Environment.** Python with `baselines/PixelGen/requirements.txt`, FlashAttention 3 and the evaluation toolkit (`pip install -e gpic_eval`). FlashAttention 3 is the Hopper build of the Hugging Face kernels hub (`kernels-community/flash-attn3`, torch 2.7, CUDA 12.6), either installed as the module `flash_attn3` or in the directory `GPIC_FA3_PATH` (default `$GPIC_WC/envs/mfu-extra/fa3_torch27_cu126`). The scripts activate `$GPIC_WC/envs/pixgen`; `GPIC_VENV` names another environment, and `GPIC_VENV=` uses the python on `PATH`. The text encoder, Qwen/Qwen3-1.7B, must be in `$GPIC_WC/cache/huggingface`: the jobs run with the Hugging Face hub offline.
 2. **Data.** GPIC Lite, the validation shards, the 50K test captions and the reference statistics, then the rest of GPIC Full; then the captions' Qwen3-1.7B features, once (about 36 GPU-hours and 16.6 TiB for GPIC Full), and a check:
    ```bash
    python tools/download_lite.py $GPIC_WC/data/gpic

@@ -50,8 +50,9 @@ def main():
     ap.add_argument("--seconds", type=float, default=8)
     ap.add_argument("--min-frac", type=float, default=0.85)
     ap.add_argument("--worker", action="store_true")
-    ap.add_argument("--bad-nodes-file", default="/scratch/gpfs/GROUP/USER/tools/bad_nodes.txt"
-                    if os.environ.get("SLURM_JOB_ID") else "")
+    bad_default = os.path.join(os.environ.get("GPIC_WC", "/scratch/gpfs/GROUP/USER"), "tools", "bad_nodes.txt")
+    ap.add_argument("--bad-nodes-file", default=bad_default   # only inside a Slurm job, and only where that list's directory exists
+                    if os.environ.get("SLURM_JOB_ID") and os.path.isdir(os.path.dirname(bad_default)) else "")
     a = ap.parse_args()
     if a.worker:
         return worker(a.seconds)
