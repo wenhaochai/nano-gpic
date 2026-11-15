@@ -10,7 +10,7 @@ The goal:
 
 This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026; its README is [GPIC_README.md](GPIC_README.md)). Every run, number and figure is on the experiment page, [wenhaochai.com/exps/gpic-speed.html](https://wenhaochai.com/exps/gpic-speed.html). Training logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed). The speed records, their rules and the speed work are in [docs/speedrun.md](docs/speedrun.md).
 
-*Updated 2026-11-14.*
+*Updated 2026-11-15.*
 
 ## 1. The ladder
 
@@ -25,7 +25,7 @@ This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshi
 ### Recipe
 
 - **The first Muon ladder.** MiniT2I's settings (Adam, batch 1024, β2 0.95), turned into the MuP version of Muon by lr × 0.2√d ([Su, 2025](https://kexue.fm/archives/11416)): Muon at 3.4e-3 for the transformer matrices (6.8e-3 from d14), Adam for the rest, 1000 warmup steps and a constant rate after them, EMA 0.9996 per step.
-- **The next ladder (no EMA).** The same optimizer split, 1% warmup, a linear cooldown over the last 50% of the steps to an absolute 3e-5, Muon weight decay, the raw weights scored. Its rate, weight decay, shape and tokens per parameter come from the nine steps in part 2. The final configuration is set once the re-done iso-FLOP curves fix the tokens per parameter.
+- **The next ladder (no EMA).** The same optimizer split, 1% warmup, a linear cooldown over the last 50% of the steps to an absolute 3e-5, Muon weight decay, the raw weights scored. Its rate, weight decay, shape and tokens per parameter come from the nine steps in part 2; the tokens per parameter are about 50 (step 6).
 
 <img src="docs/readme/readme_muon_adamw.png" width="560" alt="FD at 1.4e19 FLOPs by parameters, Muon against AdamW">
 
@@ -82,6 +82,8 @@ In the held-out loss, the lowest point of each budget falls from 0.06857 at 3.6e
 | `gmflow-ladder` | the Gaussian mixture on the final ladder's sizes and budgets (K = 1 and 8), its evaluation (`jobs/evals_gm_ladder.sh`); notes in `docs/gmflow_ladder_port.md` |
 | `artm-ladder` | autoregressive transitions between noise levels on the final ladder, judged by FD (no mean prediction, so no held-out loss) |
 | `moe` | a mixture of experts in the image blocks' feed-forward layers (`src/models/layers/moe.py`: learned and fixed routes, Triton operators for the token sums), Muon for the experts under FSDP2; the infra log is `docs/moe.md` |
+| `moe-run2-noise-eval` | the code of the MoE runs that start from 2026-11-15 on: the screening's code plus the noise route's evaluation, which computes every token outside training (`tools/moe/tests/test_noise_eval.py`) |
+| `moe-run3-ewd` | `moe-run2-noise-eval` plus `GPIC_MOE_EXPERT_WD`, a factor on the experts' Muon weight decay (`tools/moe/tests/test_expert_wd.py`) |
 | `dist-step` | a distribution per step: notes and tests |
 | `energy-head` | an energy-score head over the whole image |
 | `ar` | autoregressive sampling of the image tokens |
@@ -105,7 +107,7 @@ Nine steps, in order. Each gives a decision and its evidence.
 
 **5. The batch against the steps.** Decision so far: batch 1024 at every size, as in the first Muon ladder, with the steps of one ladder within a factor of ten. At equal compute a larger batch is worse: doubling it raises the held-out loss by up to 0.60% (d9 and d14 from 512 to 4096 images, d16 at 5.7e19 FLOPs from 1024 to 2048). At d12 and 2.9e19 FLOPs, 512 and 1024 differ by 0.005% and 2048 is 0.10% higher.
 
-**6. Iso-FLOP curves.** Decision: the tokens per parameter of the best size, about 48 image tokens per block parameter so far. Evidence: with each size at its best rate, the best size is 120M, 171M and 248M block parameters at 3.6e18, 7.1e18 and 1.4e19 FLOPs (47 to 49 image tokens per parameter at all three budgets), and grows as compute to the power 0.53. At a fixed rate it had been 58, 36 and 30 tokens per parameter. The curves are being redone with the rate rule and the 50% cooldown, one rate per size, from 3.6e18 to 2.3e20 FLOPs, with two sizes added between the ladder's: d13, 1152 × (13+3), and d15, 1408 × (15+3). In the runs finished so far, the lowest held-out loss is at d12 at 1.4e19 FLOPs (0.06628; d13 is 0.14% and d14 0.35% above it), at d13 and d14 together at 2.9e19 (both 0.06558), at d14 at 5.7e19 (0.06487) and at d16 at 1.1e20 (0.06416, with d14 0.11% above). The rows at 3.6e18, 7.1e18 and 2.3e20 FLOPs are not finished.
+**6. Iso-FLOP curves.** Decision: about 50 image tokens per image parameter at every budget. Evidence: iso-FLOP curves with the rate rule and the 50% cooldown, one rate per size, from 3.6e18 to 2.3e20 FLOPs, with two sizes added between the ladder's: d13, 1152 × (13+3), and d15, 1408 × (15+3). One formula L(N, D) fitted to the 38 runs gives N\* ∝ C^0.52 [0.50, 0.53] and D\* ∝ C^0.48, with a loss error of 0.036%; fitted to the 34 runs up to 1.1e20 FLOPs, it predicted the four runs at 2.3e20 FLOPs (d15, d16, d18 and d20) within 0.09%. The tokens per parameter at the minima of the iso-FLOP parabolas lie between 47 and 52, with no measurable trend over 64× in compute; the formula's own small decline (55 to 48) is within the precision of the data. Extrapolated to 1e21 FLOPs, the optimum is about 1.9B image parameters and 88B image tokens.
 
 **7. The ladder itself.** Decision: one run per size at that ratio, each with its own cooldown, resumed across launches with fresh random streams. Evidence: a resume before the reseed fix raised FD by 4.8% to 5.6% and left the held-out loss unchanged (within 0.02%). From one saved state, the arm that continues and the arm resumed in a new process reach the same held-out loss and FD 808 against 851. A resumed launch now draws fresh random streams after its warm-up (`resume-fix-cap`, `resume-fix-sched`).
 
