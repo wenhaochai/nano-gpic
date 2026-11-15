@@ -73,6 +73,10 @@ def tag_muon_params(model, prefixes=("blocks.", "text_refine_blocks.")):
         assert p.shape[0] % parts == 0, (name, tuple(p.shape), parts)
         p._muon_parts = parts
         p._muon_name = name
+        # GPIC_MOE_EXPERT_WD (MoE line, 2026-11-15, owner popup 「专家权重衰减 ×1/8」): a factor on the decoupled weight decay of the MoE experts'
+        # stacked matrices (e12, e3t); an expert sees only G / n of the tokens, so the decay a dense layer gets may be too strong for it. Default 1.
+        if name.endswith((".e12", ".e3t")):
+            p._muon_wd = float(os.environ.get("GPIC_MOE_EXPERT_WD", "1"))
         n += 1
         numel += p.numel()
     return n, numel
@@ -257,8 +261,12 @@ class MuonAdamW(torch.optim.Optimizer):
             dist.all_gather_into_tensor(full, shard)
         else:
             full = shard
-        if wd:
-            torch._foreach_mul_(params, 1 - lr * wd)
+        if wd:   # one factor per decay multiple (p._muon_wd: the experts under GPIC_MOE_EXPERT_WD; 1 everywhere else)
+            by = {}
+            for p in params:
+                by.setdefault(getattr(p, "_muon_wd", 1.0), []).append(p)
+            for f, ps in by.items():
+                torch._foreach_mul_(ps, 1 - lr * wd * f)
         D, S_, A = [], [], []
         for u in plan["units"]:   # W <- W - lr * coef * O (update_coef), the bf16 O promoted to fp32 in the add
             o0 = u["owner"] * plan["shard"] + u["off"]
