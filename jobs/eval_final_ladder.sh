@@ -56,7 +56,8 @@ python -m torch.distributed.run --standalone --nproc_per_node 8 $HERE/tools/fast
 t2=$(date +%s)
 if [ -n "${GPIC_TF_PYTHON:-}" ]; then   # the official Inception metrics: TF features in 8 shards, one per GPU, joined in image order
   IFS=, read -ra G <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-  export XDG_CACHE_HOME=${XDG_CACHE_HOME:-$WC/cache/gpic_eval_xdg} TF_FORCE_GPU_ALLOW_GROWTH=true
+  # gpic_eval keeps the Inception graph (classify_image_graph_def.pb, downloaded on first use) under XDG_CACHE_HOME
+  export XDG_CACHE_HOME=${GPIC_XDG_CACHE:-$WC/cache/gpic_eval_xdg} TF_FORCE_GPU_ALLOW_GROWTH=true
   pids=()
   for s in $(seq 0 $((${#G[@]} - 1))); do
     CUDA_VISIBLE_DEVICES=${G[$s]} $GPIC_TF_PYTHON $HERE/tools/official_inception_sharded.py features "$NPZ" $s ${#G[@]} $OUT/inception_f$s.npy \
