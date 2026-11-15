@@ -1,116 +1,104 @@
 # nano-gpic: a compute ladder for pixel-space text-to-image
 
-This repository trains a compute ladder of PixelGen's JiT-T2I on [GPIC](https://gpic.stanford.edu) with 8 NVIDIA H100 GPUs per model. We use the ladder to measure scaling laws for pixel-space text-to-image before testing new methods against them.
+The code of the post [How to Scale Text-to-image Models: a Handbook](https://wenhaochai.com/blogs/scaling-generative-models-101.html). It trains a compute ladder of PixelGen's JiT-T2I on [GPIC](https://gpic.stanford.edu) (100M text-image pairs) with 8 NVIDIA H100 GPUs per model, scores each model by its held-out loss, and fits one scaling law to 38 runs from 3.6e18 to 2.3e20 FLOPs.
 
-The goal:
-
-1. Measure how image quality scales with model size, training compute and unique images, in the units of language-model scaling studies: FLOP budgets, iso-FLOP curves, tokens per parameter, unique and total tokens.
-2. Find how many passes over the data cost nothing, before fitting any optimum.
-3. Only then test new methods, each against the ladder at the same compute.
-
-This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026; its README is [GPIC_README.md](GPIC_README.md)). Every run, number and figure is on the experiment page, [wenhaochai.com/exps/gpic-speed.html](https://wenhaochai.com/exps/gpic-speed.html). Training logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed). The speed records, their rules and the speed work are in [docs/speedrun.md](docs/speedrun.md).
+Every run of the post, with its training logs and the commit it ran on, is on the [experiment page](https://wenhaochai.com/exps/gpic-speed.html); the logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed). This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026), whose README is [GPIC_README.md](GPIC_README.md).
 
 *Updated 2026-11-15.*
 
-## 1. The ladder
+## The final ladder
 
-### Models
+One model per budget, at the size the scaling law picks: about 50 image tokens per image parameter.
 
-- **Model.** PixelGen's JiT-T2I: x-prediction flow matching, 16-pixel patches (256 image tokens per 256 × 256 image), Qwen3-1.7B caption features.
-- **Sizes.** A model dN has N image blocks (plus 2 to 4 text blocks). We write a shape as width × (image blocks + text blocks). The ladder runs d9, d10, d11, d12, d14, d16 and d18 (widths 640, 768, 896, 1024, 1280, 1536 and 1792), from 109M to 1.68B parameters. The released GPIC model is d16.
-- **Budgets.** 3.6e18, 7.1e18, 1.4e19, 2.9e19, 5.7e19 and 1.1e20 FLOPs. The first Muon ladder trains d9, d10 and d11 to 1.4e19, 2.9e19 and 5.7e19 FLOPs and d12 to d18 to 1.1e20 FLOPs, about 5.6e20 FLOPs in all.
-- **Data.** GPIC Full: 99,975,623 training images in 8,000 shards. One pass is 97,632 steps at batch 1024. Every run reads one seeded random permutation of the 8,000 shards, a new one each pass, so a shorter run reads a uniform sample of shards. GPIC Lite has 10.01M images; the repetition arms use the first 80 shards (1.01M images) and the first 8 (101K).
-- **Scores.** The held-out loss first: the loss on 3072 held-out images at 16 noise levels with fixed noise. FD-DINOv2 as a reference, with the official evaluation (Euler at 50 steps, 50,000 test captions, one noise for all prompts, no CFG), plus the official Inception metrics (FD, precision, recall, density, coverage, MMD).
+| Size | d10 | d11 | d12 | d13 | d14 | d16 | d18 |
+|---|---|---|---|---|---|---|---|
+| Compute (FLOPs) | 3.6e18 | 7.1e18 | 1.4e19 | 2.9e19 | 5.7e19 | 1.1e20 | 2.3e20 |
+| Width | 768 | 896 | 1024 | 1152 | 1280 | 1536 | 1792 |
+| Image layers | 10 | 11 | 12 | 13 | 14 | 16 | 18 |
+| Text layers | 2 | 2 | 3 | 3 | 3 | 4 | 4 |
+| Image parameters | 106M | 159M | 226M | 311M | 413M | 679M | 1.04B |
+| Steps at batch 1024 | 21,248 | 28,800 | 40,192 | 59,136 | 89,600 | 108,800 | 143,872 |
+| Tokens per parameter | 52.5 | 47.5 | 46.5 | 49.9 | 56.9 | 42.0 | 36.2 |
+| Held-out loss | 0.06788 | 0.06707 | 0.06628 | 0.06558 | 0.06487 | 0.06416 | 0.06351 |
 
-### Recipe
+The recipe, the same at every size:
 
-- **The first Muon ladder.** MiniT2I's settings (Adam, batch 1024, β2 0.95), turned into the MuP version of Muon by lr × 0.2√d ([Su, 2025](https://kexue.fm/archives/11416)): Muon at 3.4e-3 for the transformer matrices (6.8e-3 from d14), Adam for the rest, 1000 warmup steps and a constant rate after them, EMA 0.9996 per step.
-- **The next ladder (no EMA).** The same optimizer split, 1% warmup, a linear cooldown over the last 50% of the steps to an absolute 3e-5, Muon weight decay, the raw weights scored. Its rate, weight decay, shape and tokens per parameter come from the nine steps in part 2; the tokens per parameter are about 50 (step 6).
-
-<img src="docs/readme/readme_muon_adamw.png" width="560" alt="FD at 1.4e19 FLOPs by parameters, Muon against AdamW">
-
-The Muon recipe beats the AdamW recipe at every point. On GPIC Full at the same images, Muon scores 14% to 24% lower FD than the official AdamW recipe at all twelve points tried (d9 to d12, 3.6e18 to 1.4e19 FLOPs). This compares recipe against recipe: the batch and the rates change with the optimizer.
-
-### Running it
-
-```bash
-# usage: jobs/train_muon_ladder.sh <full|lite> <size> <d> <blocks> <text blocks> <steps to 1.4e19 FLOPs> <multiple of that budget> <Adam lr> <Muon lr>
-bash jobs/train_muon_ladder.sh full d640  640  9  2 133600 1 6.4e-4 3.4e-3
-bash jobs/train_muon_ladder.sh full d768  768  10 2 85024  2 5.0e-4 3.4e-3
-bash jobs/train_muon_ladder.sh full d896  896  11 2 57600  4 4.1e-4 3.4e-3
-bash jobs/train_muon_ladder.sh full d1024 1024 12 3 40192  8 3.3e-4 3.4e-3
-bash jobs/train_muon_ladder.sh full d1280 1280 14 3 22400  8 2.4e-4 6.8e-3
-bash jobs/train_muon_ladder.sh full d1536 1536 16 4 13600  8 1.8e-4 6.8e-3
-bash jobs/train_muon_ladder.sh full d1792 1792 18 4 8992   8 1.4e-4 6.8e-3
-```
-
-Each line trains one model on one 8×H100 node, resumes from its last checkpoint, and carries the model's speed settings itself (the scripts name a model by its width). Before the first run: GPIC Full (`tools/download_full.py`) and its Qwen3-1.7B caption features (`jobs/encode_captions.sh`, checked by `tools/check_text_cache.py`). The scripts keep absolute paths and a job-queue wrapper, so set them to yours. The no-EMA runs launch from branch `launch-cutfix-cap`: it adds levers that cut the time to a launch's first step, and the cut fix (a cut right after a launch's first save leaves a whole checkpoint, and a failed launch leaves no process). Since 2026-11-11 they launch from `launch-retry-cap`, which adds a launch guard: a launch that fails or hangs before its first step is retried, and a rank whose fit raised leaves within seconds.
-
-### Results
-
-<img src="docs/readme/readme_all_points.png" width="560" alt="FD of every evaluation against training compute 6ND: the main-line ladder and the released model">
-
-Every evaluation of every run, against training compute 6ND. Blue is the main line, the Muon ladder on GPIC Full, and the light-blue line follows the lowest FD of each of its budgets. Red is the released GPIC model. Both use the standard evaluation (Euler 50, the official noise, no CFG). Grey is every other evaluation.
-
-<img src="docs/readme/readme_compute.png" width="560" alt="The lowest FD of each budget against training compute">
-
-In the held-out loss, the lowest point of each budget falls from 0.06857 at 3.6e18 FLOPs to 0.06446 at 1.1e20 FLOPs. The best size grows with compute, from d9 to d16. In FD it falls from 979.3 to 338.9 (d16). From 5.7e19 FLOPs on, the ladder beats the released GPIC model with less than half its compute. The released model is d16, AdamW, one pass over Full, 1.4e20 FLOPs; its held-out loss is 0.06536 with its own text path, and its FD 472.4.
-
-### Where the code is
-
-| Branch | Contents |
+| Setting | Value |
 |---|---|
-| `main` | the production line: the ladder (per-model speed settings, Muon also under FSDP2, the shared caption bucket), `jobs/train_muon_ladder.sh`, `configs_h100/muon_ladder.yaml`, and the job scripts of the learning-rate, EMA, caption-bucket and batch experiments |
-| `ladder-sweep` | the sweep without the EMA: a linear cooldown to an absolute floor (`WarmupFlatCooldown` min_lr) and Muon weight decay on the ladder's code |
-| `sweep-noema`, `sweep-noema-cap` | the same with no EMA update at all (`GPIC_MFU_NO_EMA=1`), and with the shared caption bucket's pools capped |
-| `sweep-noema-sched` | the cooldown's shape and length (`WarmupFlatCooldown` shape linear or 1−√): the cooldown sweep and the rate and batch checks at larger compute |
-| `resume-fix-cap`, `resume-fix-sched` | a resumed launch draws fresh random streams after its warm-up |
-| `save-on-term-cap`, `save-on-term-sched` | the training shell waits on a cut for main.py's save |
-| `ckpt-dedup-cap`, `ckpt-dedup-sched` | a checkpoint writes the raw weights once |
-| `launch-cutfix-cap` | the code of the runs launched on 2026-11-10: the above on the capped line, the launch levers and the cut fix |
-| `launch-retry-cap` | the code of the runs launched since 2026-11-11: the launch guard on top of `launch-cutfix-cap`, with its CPU test (`tools/mfu/tests/test_launch_guard.py`) |
-| `heldout-release` | `tools/heldout_release.py`: the released model's held-out loss with its own text path (captions padded to 300 tokens, no mask) |
-| `heldout-loss`, `heldout-loss-run5` | `tools/heldout_loss.py`: held-out and training loss at fixed noise, EMA and raw weights; run5 is the deployed version |
-| `eval-official`, `eval-official-run10`, `eval-official-run11` | the official evaluation with the Inception metrics on every run (`tools/official_inception.py`); run10 moves the DINOv2 transform to the GPU, bit for bit; run11 is the deployed version |
-| `ladder-pnsr`, `ladder-pnsr-ma` | the ladder's later segments: Newton-Schulz in the GEMMs, the GPU resize kernels, and Muon's per-part updates in one launch |
-| `mfu` | speed work: fused kernels, FSDP2, packed captions, FP8, GPU decoding; the log is `docs/mfu.md` |
-| `muon-search2` | job scripts of the learning-rate, EMA, caption-bucket and batch experiments |
-| `eval-par` | `jobs/evals_gmflow.sh --par`: one evaluation per GPU, eight side by side |
-| `ladder` | the first ladder: the official AdamW recipe on GPIC Lite, no caption dropout |
-| `muon` | the first optimizer ablation: Muon against AdamW at the official recipe |
-| `gmflow` | a Gaussian mixture of the velocity at each step (K = 1, 8, 16) |
-| `gmflow-ladder` | the Gaussian mixture on the final ladder's sizes and budgets (K = 1 and 8), its evaluation (`jobs/evals_gm_ladder.sh`); notes in `docs/gmflow_ladder_port.md` |
-| `artm-ladder` | autoregressive transitions between noise levels on the final ladder, judged by FD (no mean prediction, so no held-out loss) |
-| `moe` | a mixture of experts in the image blocks' feed-forward layers (`src/models/layers/moe.py`: learned and fixed routes, Triton operators for the token sums), Muon for the experts under FSDP2; the infra log is `docs/moe.md` |
-| `moe-run2-noise-eval` | the code of the MoE runs that start from 2026-11-15 on: the screening's code plus the noise route's evaluation, which computes every token outside training (`tools/moe/tests/test_noise_eval.py`) |
-| `moe-run3-ewd` | `moe-run2-noise-eval` plus `GPIC_MOE_EXPERT_WD`, a factor on the experts' Muon weight decay (`tools/moe/tests/test_expert_wd.py`) |
-| `dist-step` | a distribution per step: notes and tests |
-| `energy-head` | an energy-score head over the whole image |
-| `ar` | autoregressive sampling of the image tokens |
-| `implicit-nodrop` | a posterior sampler, and the point model without caption dropout |
+| Optimizer | Muon for the matrix parameters, AdamW for the rest |
+| Muon learning rate | 1.36e-2 × (C / 3.6e18)^−0.5 |
+| AdamW learning rate | 6.4e-4 × (all parameters / 109.4M)^−0.547 |
+| Weight decay | Muon: 5 / (Muon learning rate × steps); AdamW: 0 |
+| Batch | 1024 images |
+| Schedule | warmup over the first 1% of the steps, linear decay to 3e-5 over the last 50% |
+| EMA | none: the raw weights are scored |
+| Data | GPIC Full, 99.98M images, a new seeded shard order each pass |
+| Shape | width = 128 × (image layers − 4); 2 to 4 text layers |
 
-## 2. How the ladder is built
+N, the image parameters, is 18 × image layers × width², the matrices of the image layers (text layers, adaLN and embeddings left out). D counts image tokens: a 256 × 256 image is 256 tokens of 16 × 16 pixels. C = 6ND.
 
-Nine steps, in order. Each gives a decision and its evidence.
+## Running it
 
-**1. The recipe without the EMA.** Decision: an optimizer split, 1% warmup, a linear cooldown over the last 50% of the steps, the raw weights scored. Evidence: a 50% cooldown lowers the held-out loss by 0.22% to 0.24% against 20% (sweep CD). The EMA lags in short runs. It starts at the initial weights and keeps 0.9996^step of them. Above a 1% share its held-out loss is 4.5% to 590% above the raw weights'; below 0.2% it is 0.3% to 0.8% lower. Without weight decay, runs with a linear cooldown score 5% to 14% higher FD than the EMA ladder at the same compute.
+Each step runs on one node with 8 H100 GPUs, except the fit. Set `GPIC_WC` to a work root: the data go to `$GPIC_WC/data/gpic`, the runs to `$GPIC_WC/runs/final_ladder`.
 
-<img src="docs/readme/readme_ema_lag.png" width="560" alt="EMA over raw held-out loss against the EMA's share of the initial weights">
+1. **Environment.** Python with `baselines/PixelGen/requirements.txt`, FlashAttention 3 and the evaluation toolkit (`pip install -e gpic_eval`). The scripts activate `$GPIC_WC/envs/pixgen`; `GPIC_VENV` names another environment, and `GPIC_VENV=` uses the python on `PATH`. The text encoder, Qwen/Qwen3-1.7B, must be in `$GPIC_WC/cache/huggingface`: the jobs run with the Hugging Face hub offline.
+2. **Data.** GPIC Lite, the validation shards, the 50K test captions and the reference statistics, then the rest of GPIC Full; then the captions' Qwen3-1.7B features, once (about 36 GPU-hours and 16.6 TiB for GPIC Full), and a check:
+   ```bash
+   python tools/download_lite.py $GPIC_WC/data/gpic
+   python tools/download_full.py $GPIC_WC/data/gpic
+   export PYTHONPATH=$PWD/baselines/PixelGen
+   for r in 0 1 2 3 4 5 6 7; do
+     CUDA_VISIBLE_DEVICES=$r python tools/encode_captions.py --shards "$GPIC_WC/data/gpic/train/gpic_train_*.tar" \
+       --out $GPIC_WC/data/gpic/train_emb_qwen3_1.7b --rank $r --world 8 &
+   done; wait
+   python tools/check_text_cache.py $GPIC_WC/data/gpic/train_emb_qwen3_1.7b $GPIC_WC/data/gpic/train
+   ```
+3. **Train** one size. Started again after a stop, a run resumes from its last checkpoint.
+   ```bash
+   GPIC_WC=/path/to/work bash jobs/final_ladder.sh d12
+   ```
+4. **Held-out loss**, the post's main metric: the training loss of the raw weights on 3,072 held-out images at 16 fixed noise levels with fixed noise. Build the fixed data once, then score a checkpoint; `loss_val` of the line with `"weights": "raw"` is the post's number.
+   ```bash
+   python tools/heldout_loss.py prep --n-val 3072 --n-train 3072
+   python tools/heldout_loss.py work --ckpt $GPIC_WC/runs/final_ladder/d12/exp_ladder_d1024/ms-step=040192.ckpt --out heldout.jsonl
+   ```
+5. **FD**, with the official setup except CFG = 1 (50K test captions, one noise for all prompts, Euler at 50 steps): FD-DINOv2 with PRDC and MMD, and the official Inception metrics when `GPIC_TF_PYTHON` names a TensorFlow environment with gpic_eval.
+   ```bash
+   GPIC_WC=/path/to/work bash jobs/eval_final_ladder.sh d12
+   ```
+6. **Fit** the scaling law to the post's 38 runs (CPU, about a minute):
+   ```bash
+   python tools/fit/scaling_law.py --boot 200
+   ```
 
-**2. The learning rate.** Decision: a rate rule by size and compute. Evidence: at 3.6e18 FLOPs the best Muon rate is 1.36e-2 at all four sizes tried, up to 5.44e-2. Sweep X trains each size at three rates around the rule at 3.6e18, 7.1e18 and 1.4e19 FLOPs. At d16 and 5.7e19 FLOPs, each run in one piece, the held-out loss is 0.06501 at 1.7e-3, 0.06493 at the rule's 3.4e-3 and 0.06492 at 6.8e-3 (FD 461.6, 458.6 and 457.5). The rule's rate is within 0.02% of twice its rate; half its rate is 0.12% worse. Four times the rule, 1.36e-2, gives 0.06495 (FD 458.3): 0.03% above the rule, inside the 0.07% that four runs differing only in the seed span, so the rates from 3.4e-3 to 1.36e-2 are not separated. In the first Muon ladder (EMA, constant rate), the largest rate tried wins in short runs: at 1.4e19 FLOPs, 6.8e-3 beats 3.4e-3 by 5.9% at d14 (22.4k steps) and 3.1% at d12 (40.2k), and ties at d9 (133.6k). Smaller rates lose at every size: at 1.4e19 FLOPs, 1.7e-3 is 2.4%, 2.1% and 11.2% worse than 3.4e-3 at d9, d10 and d12, and 0.85e-3 is 11.6% worse at d9.
+## Results
 
-**3. Weight decay.** Decision: Muon weight decay, set as the decay timescale 1/(lr·wd) relative to the run. Evidence: at d11 and 7.1e18 FLOPs, 0.05 lowers FD from 906.6 to 804.3 (the EMA ladder: 810.8) and FID from 66.99 to 56.83. Its decay timescale is 0.2 of the run.
+<img src="docs/readme/optimum.png" width="760" alt="The optimal image parameters and images against training compute: the minima of the iso-FLOP parabolas and the fitted formula">
 
-<img src="docs/readme/readme_noema.png" width="440" alt="FD of runs without the EMA: by Muon weight decay at d11, and by parameters at 1.4e19 FLOPs">
+The held-out loss of the final ladder falls from 0.06788 at 3.6e18 FLOPs (d10) to 0.06351 at 2.3e20 FLOPs (d18). One formula fits the 38 runs with an RMS error of 0.036%:
 
-**4. The shape.** Decision: open. The optimum is not bracketed on the deep side; the ladder's shapes stay in use meanwhile. Evidence (sweep AR, depth against width at a fixed number of parameters): at about 110M parameters (1.5e18 FLOPs), 512 × (15+2) is best, with a held-out loss of 0.06891 against the ladder's 640 × (9+2) at 0.06897. At about 250M (7.9e18 FLOPs) and about 670M (5.4e19 FLOPs), the loss falls toward deeper, narrower shapes through the deepest tested: 640 × (23+2) 0.06679 against the ladder's 896 × (11+2) 0.06695, and 896 × (32+3) 0.06464 against 1280 × (14+3) 0.06492. At equal FLOPs the deepest shapes take 15% and 23% more H100-hours (wall time, launches included).
+L(N, D) = E + (A / N^α + B / D^β)^k, with E = 0.0481, A = 1.35e-4, B = 2.33e-3, α = 0.54, β = 0.57, k = 0.22.
 
-**5. The batch against the steps.** Decision so far: batch 1024 at every size, as in the first Muon ladder, with the steps of one ladder within a factor of ten. At equal compute a larger batch is worse: doubling it raises the held-out loss by up to 0.60% (d9 and d14 from 512 to 4096 images, d16 at 5.7e19 FLOPs from 1024 to 2048). At d12 and 2.9e19 FLOPs, 512 and 1024 differ by 0.005% and 2048 is 0.10% higher.
+The best model grows as N\* ∝ C^0.52 [0.50, 0.53] and its data as D\* ∝ C^0.48, at about 50 image tokens per image parameter with no measurable trend over 64× in compute. Fitted to the 34 runs up to 1.1e20 FLOPs, the formula predicted the four runs at 2.3e20 FLOPs within 0.09%. Extrapolated to 1e21 FLOPs, the optimum is about 1.9B image parameters and 88B image tokens.
 
-**6. Iso-FLOP curves.** Decision: about 50 image tokens per image parameter at every budget. Evidence: iso-FLOP curves with the rate rule and the 50% cooldown, one rate per size, from 3.6e18 to 2.3e20 FLOPs, with two sizes added between the ladder's: d13, 1152 × (13+3), and d15, 1408 × (15+3). One formula L(N, D) fitted to the 38 runs gives N\* ∝ C^0.52 [0.50, 0.53] and D\* ∝ C^0.48, with a loss error of 0.036%; fitted to the 34 runs up to 1.1e20 FLOPs, it predicted the four runs at 2.3e20 FLOPs (d15, d16, d18 and d20) within 0.09%. The tokens per parameter at the minima of the iso-FLOP parabolas lie between 47 and 52, with no measurable trend over 64× in compute; the formula's own small decline (55 to 48) is within the precision of the data. Extrapolated to 1e21 FLOPs, the optimum is about 1.9B image parameters and 88B image tokens.
+## How the ladder was built
 
-**7. The ladder itself.** Decision: one run per size at that ratio, each with its own cooldown, resumed across launches with fresh random streams. Evidence: a resume before the reseed fix raised FD by 4.8% to 5.6% and left the held-out loss unchanged (within 0.02%). From one saved state, the arm that continues and the arm resumed in a new process reach the same held-out loss and FD 808 against 851. A resumed launch now draws fresh random streams after its warm-up (`resume-fix-cap`, `resume-fix-sched`).
+Each setting of the recipe, and where the post shows its evidence:
 
-**8. Scoring and fit.** Decision: every rung scored as in part 1, the held-out loss first, and fitted as y = E + a·C^(−b) against the baseline's compute. Evidence: FD needs care. Nine runs of d9 whose held-out loss agrees to 0.07% span FD 949 to 1017. With one caption-length bucket per step, FD depends on the seed (966.6 to 1016.6) and averages 4% above runs with thirty-two buckets per step, which repeat within 0.3%. The ladder keeps the one-bucket setting, the fastest, and reads small FD gaps between single runs from the held-out loss.
+| Setting | Decision | In the post |
+|---|---|---|
+| Metric | the held-out loss decides; FD-DINOv2 is a reference | [Metric](https://wenhaochai.com/blogs/scaling-generative-models-101.html#metric) |
+| EMA | none | [Figure 7](https://wenhaochai.com/blogs/scaling-generative-models-101.html#fig-7) |
+| Optimizer | Muon for the matrices, AdamW for the rest | [Figure 8](https://wenhaochai.com/blogs/scaling-generative-models-101.html#fig-8) |
+| Learning rate | Muon 1.36e-2 × (C / 3.6e18)^−0.5 | [Figure 9](https://wenhaochai.com/blogs/scaling-generative-models-101.html#fig-9) |
+| Weight decay | Muon 5 / (learning rate × steps) | [Figure 10](https://wenhaochai.com/blogs/scaling-generative-models-101.html#fig-10) |
+| Batch | 1024 images | [Figure 11](https://wenhaochai.com/blogs/scaling-generative-models-101.html#fig-11) |
+| Cooldown | linear to 3e-5 over the last 50% of the steps | [Figure 12](https://wenhaochai.com/blogs/scaling-generative-models-101.html#fig-12) |
+| Repetition | up to about 50 passes the held-out loss does not change | [Figure 13](https://wenhaochai.com/blogs/scaling-generative-models-101.html#fig-13) |
+| Aspect ratio | width = 128 × (image layers − 4) | [Figure 14](https://wenhaochai.com/blogs/scaling-generative-models-101.html#fig-14) |
+| Text layers | 2 to 4 | [Figure 15](https://wenhaochai.com/blogs/scaling-generative-models-101.html#fig-15) |
+| Size and data | about 50 image tokens per image parameter | [Our Scaling Law](https://wenhaochai.com/blogs/scaling-generative-models-101.html#tpp) |
 
-**9. Repetition.** Decision: measure how many passes over the unique images cost nothing before fitting any optimum. Budgets above 97,632 steps repeat data; smaller ones do not. Evidence: without the EMA, the held-out loss does not move with the number of unique images at fixed compute. d12 at 2.9e19 FLOPs gives 0.06561 to 0.06562 from 0.8 to 6.6 passes (the first 8,000, 4,000, 2,000 or 1,000 shards), and d9 at 1.4e19 FLOPs gives 0.06704 to 0.06707 from 1.4 to 22 passes: spreads of 0.014% and 0.047%, under the 0.07% between seeds. On the AdamW ladders, GPIC Lite costs nothing up to 17 passes over its 10.01M images: its held-out loss is within −0.12% to +0.07% of Full's at the same model and step. Without the EMA, d10 at 7.1e18 FLOPs scores a lower FD on fewer unique images (101K: 827.5, against 892.9 on Full), which may reward copying the training images; the held-out loss decides.
+## Where the code is
+
+`main` holds the final ladder: `jobs/final_ladder.sh` (training, sizes in `jobs/final_ladder_sizes.sh`), `jobs/eval_final_ladder.sh` (FD), `tools/heldout_loss.py` (held-out loss, tests in `tools/test_heldout_loss.py`) and `tools/fit/` (the scaling law and its 38 runs). The experiment page links every run to the commit it ran on. Research lines have their own branches: `gmflow` and `gmflow-ladder` (a Gaussian mixture of the velocity), `artm-ladder` and `ar` (autoregressive variants), `dist-step`, `energy-head`, `implicit-nodrop`, and `moe`, `moe-run2-noise-eval`, `moe-run3-ewd` (mixtures of experts). The speed work is on `mfu` (log: `docs/mfu.md`); the first Muon ladder and its experiments are in the history of `main` and on `muon-search2`.

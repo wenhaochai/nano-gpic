@@ -1,6 +1,6 @@
 # Common environment for GPIC jobs on H100 compute nodes (sourced by job scripts).
-export WC=/scratch/gpfs/GROUP/USER
-export REPO=$WC/project/gpic
+export WC=${GPIC_WC:-/scratch/gpfs/GROUP/USER}   # the work root: data/gpic/, runs/, cache/ (and envs/ unless GPIC_VENV says otherwise)
+export REPO=${GPIC_REPO:-$WC/project/gpic}           # this repository (jobs/final_ladder.sh sets it to its own checkout)
 export PIXGEN=$REPO/baselines/PixelGen
 export JOBID=${FETCHED_JOB_ID:-${SLURM_JOB_ID:-}}
 # Per-job TMPDIR, removed at exit only by the shell that created it, and only when it is this job's own directory.
@@ -14,7 +14,8 @@ if [ -n "$JOBID" ] && [ -z "${GPIC_TMP_OWNER:-}" ]; then
 fi
 
 module load proxy/default 2>/dev/null || true
-source $WC/envs/pixgen/bin/activate
+GPIC_VENV=${GPIC_VENV-$WC/envs/pixgen}   # the Python environment to activate; empty (GPIC_VENV=): the python already on PATH
+[ -z "$GPIC_VENV" ] || source $GPIC_VENV/bin/activate
 
 export HF_HOME=$WC/cache/huggingface
 export HF_HUB_OFFLINE=1

@@ -51,7 +51,7 @@ SELF=$(readlink -f "$0") ARGS0=("$@") CWD0=$PWD
 mapfile -d '' ENV0 < /proc/$$/environ
 ATTEMPT=${GPIC_LAUNCH_ATTEMPT:-0}
 export GPIC_LAUNCH_T0=$(date +%s.%N)
-source /scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh
+source "${GPIC_ENV_SH:-/scratch/gpfs/GROUP/USER/project/gpic/jobs/env.sh}"   # jobs/final_ladder.sh points it at its own checkout's
 SIZE=$1 D=$2 NB=$3 NT=$4 STEPS=$5; shift 5
 WT=${LADDER_WT:-$WC/project/gpic-wt/ladder_full_run}
 ROOT=${LADDER_RUN_ROOT:-$WC/runs/gpic-speed}
