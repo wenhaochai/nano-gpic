@@ -20,6 +20,11 @@ class SimpleEMA(Callback):
         self._stream = None   # perf C3: created on the parameters' own device (was GPU 0 on every rank)
         self.previous_step = 0
         self.fused = False    # MFU lever H (GPIC_MFU_FUSED_OPT=2): the optimizer's kernel updates the EMA
+        # GPIC_MFU_NO_EMA=1 (owner 2026-11-08: 「ema是一定不能用」): no EMA. No update at any step; the EMA module is kept
+        # equal to the raw weights at every state_dict (mirror()), so every checkpoint's EMA slot holds the raw weights and
+        # tools that sample from ema_denoiser evaluate the raw model.
+        import os
+        self.off = os.environ.get("GPIC_MFU_NO_EMA") == "1"
 
     def setup_models(self, net: nn.Module, ema_net: nn.Module):
         self.net_params = list(net.parameters())
@@ -54,6 +59,16 @@ class SimpleEMA(Callback):
                 ema_update(ema_g, net_g, self.decay)
         assert self.ema_params[0].dtype == torch.float32
 
+    @torch.no_grad()
+    def mirror(self):
+        """GPIC_MFU_NO_EMA: the EMA parameters := the raw ones (local shards: both modules are sharded alike)."""
+        if not self.off or not hasattr(self, "_groups"):
+            return
+        from src.utils.fsdp_setup import _local
+        self._join()
+        for ema_g, net_g in self._groups:
+            torch._foreach_copy_(_local(ema_g), _local(net_g))
+
     def _join(self):
         """The default stream waits for the EMA update: the next optimizer step must not change the parameters the
         EMA is still reading, and a checkpoint must see the finished EMA (perf C3; both raced before)."""
@@ -79,7 +94,7 @@ class SimpleEMA(Callback):
         if trainer.global_step == self.previous_step:
             return
         self.previous_step = trainer.global_step
-        if self.fused:
+        if self.fused or self.off:
             return
         if trainer.global_step % self.every_n_steps == 0:
             self.ema_step()

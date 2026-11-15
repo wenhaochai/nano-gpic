@@ -51,3 +51,70 @@ try:
         _CWC.extra_parse_arg = _CWC.extra_parse_arg.replace("? Py_None", "? Py_NewRef(Py_None)")
 except Exception as _e:   # a newer torch without the template: nothing to fix here
     print(f"[patch] the Py_None fix of the C++ wrapper was not applied: {_e!r}", flush=True)
+
+# Launch lever E (gpic-28 2026-11-09). Before its first compile every rank asks torch._inductor.cpu_vec_isa which CPU
+# vector sets it may use (valid_vec_isa_list: AMX, AVX-512, AVX2). Each answer is VecISA.check_build: under a file lock
+# it starts a new Python that imports torch and loads a small test library, four times per rank and 8 ranks at once,
+# about 13 s of the warm-up of every launch (py-spy, w2441; the library itself is never used again). The answer depends
+# only on the compiler, the flags, the torch build, the interpreter and the CPU, so a True answer is kept as an empty
+# file named by a hash of all of them in $GPIC_VEC_ISA_MEMO (set by jobs/train_ladder.sh), and a later launch reads
+# it. A False answer is never stored, and any error here falls back to the real check, so the list of vector sets
+# (part of the compile cache key) is the one the real check gives. TORCHINDUCTOR_VEC_ISA_OK=1 is not used: it enters
+# the cache key and keeps the AMX check.
+VEC_ISA_MEMO_STATS = {"hit": 0, "miss": 0, "stored": 0, "error": 0}
+_VEC_ISA_MEMO = os.environ.get("GPIC_VEC_ISA_MEMO")
+if _VEC_ISA_MEMO:
+    try:
+        import hashlib
+        import platform
+        import sys
+        from torch._inductor import cpu_vec_isa as _cvi
+
+        _check_build_real = _cvi.VecISA.check_build
+
+        def _vec_isa_cpu():
+            model = flags = ""
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if not model and line.startswith("model name"):
+                        model = line
+                    elif not flags and line.startswith("flags"):
+                        flags = line
+                    if model and flags:
+                        break
+            if not (model and flags):
+                raise ValueError("no CPU model or flags in /proc/cpuinfo")
+            return model + flags
+
+        def _vec_isa_memo_path(isa, code):
+            parts = [code, _cvi._get_isa_dry_compile_fingerprint(isa._arch_flags), type(isa).__name__, str(isa),
+                     sys.executable, torch.__file__, torch.__version__, str(torch.version.git_version),
+                     platform.machine(), platform.release(), _vec_isa_cpu()]
+            return os.path.join(_VEC_ISA_MEMO, hashlib.sha256("\0".join(parts).encode()).hexdigest())
+
+        def _check_build_memo(self, code):
+            try:
+                path = _vec_isa_memo_path(self, code)
+                if os.path.isfile(path):
+                    VEC_ISA_MEMO_STATS["hit"] += 1
+                    return True
+            except Exception:
+                VEC_ISA_MEMO_STATS["error"] += 1
+                return _check_build_real(self, code)
+            VEC_ISA_MEMO_STATS["miss"] += 1
+            ok = _check_build_real(self, code)
+            if ok is True:
+                try:
+                    os.makedirs(_VEC_ISA_MEMO, exist_ok=True)
+                    tmp = f"{path}.{os.uname().nodename}.{os.getpid()}.tmp"
+                    with open(tmp, "w"):
+                        pass
+                    os.replace(tmp, path)
+                    VEC_ISA_MEMO_STATS["stored"] += 1
+                except Exception:
+                    VEC_ISA_MEMO_STATS["error"] += 1
+            return ok
+
+        _cvi.VecISA.check_build = _check_build_memo
+    except Exception as _e:   # a torch without this check: the launch runs as before
+        print(f"[patch] the vector-set memo is off: {_e!r}", flush=True)

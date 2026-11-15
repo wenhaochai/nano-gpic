@@ -100,7 +100,12 @@ class LightningModel(pl.LightningModule):
 
     def configure_model(self) -> None:
         self.trainer.strategy.barrier()
-        copy_params(src_model=self.denoiser, dst_model=self.ema_denoiser)
+        # Launch lever G1 (gpic-28 2026-11-09; jobs/train_ladder.sh GPIC_LAUNCH_SKIP_EMA_COPY=1): the EMA slot is a deepcopy of
+        # the denoiser since __init__, and under GPIC_MFU_NO_EMA nothing reads its values: no step updates it, and every
+        # state_dict first writes the raw weights over it (SimpleEMA.mirror). So this second copy of all the weights (4.2 s
+        # of rank 0 at width 1536, 8 ranks at once, w2441) is left out. With an EMA in use the copy stays.
+        if not (os.environ.get("GPIC_LAUNCH_SKIP_EMA_COPY") == "1" and os.environ.get("GPIC_MFU_NO_EMA") == "1"):
+            copy_params(src_model=self.denoiser, dst_model=self.ema_denoiser)
 
         # disable grad for conditioner and vae
         no_grad(self.conditioner)
@@ -401,6 +406,13 @@ class LightningModel(pl.LightningModule):
         return samples
 
     def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
+        # this definition shadows the earlier state_dict, so the EMA join of review S1 lives here; GPIC_MFU_NO_EMA: the EMA
+        # slot of every checkpoint holds the raw weights (SimpleEMA.mirror)
+        tracker = getattr(self, "ema_tracker", None)
+        if tracker is not None:
+            tracker._join()
+            if getattr(tracker, "off", False):
+                tracker.mirror()
         if destination is None:
             destination = {}
         self._save_to_state_dict(destination, prefix, keep_vars)

@@ -393,6 +393,12 @@ def make_shard_spec(tar_dir, tar_pattern):
 # GPIC WebDataset Pipeline
 # -------------------------
 
+def _ignore_term(worker_id):
+    """DataLoader workers ignore SIGTERM (src/callbacks/save_on_term.py); they still end with the main process."""
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
 class GPICWebDataset(IterableDataset):
 
     def __init__(
@@ -800,11 +806,14 @@ class GPICWebDataset(IterableDataset):
         # non_blocking=True), so it overlaps the previous step instead of stalling the device (perf C1)
         loader = wds.WebLoader(
             dataset,
+            worker_init_fn=_ignore_term,   # the pilot's cut TERMs the whole process group: the main process saves first (save_on_term.py)
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=num_workers > 0,
-            prefetch_factor=4 if num_workers > 0 else None,
+            # 2 batches ahead per worker (GPIC_TRAIN_PREFETCH; was 4): every prefetched batch sits in pinned host memory, and
+            # with 32 workers 4 ahead meant up to 128 batches per rank; the order of the batches does not depend on it
+            prefetch_factor=int(os.environ.get("GPIC_TRAIN_PREFETCH", "2")) if num_workers > 0 else None,
             **({"collate_fn": self._collate_cached if self.emb_dir else self._collate_grouped} if self.group_text_len else {}),
         )
         self._dataloader = loader.pipeline[0]
