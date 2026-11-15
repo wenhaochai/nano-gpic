@@ -250,8 +250,8 @@ class MoEFeedForward(nn.Module):
     def forward(self, x, t=None, cond=None, xn=None):
         """x [B, T, d] (the dense layer's input); t [B] raw timesteps (noise route); cond [B, 1, d] and xn [B, T, d] for
         router_in = plain."""
-        if not self.training and self.route in ("tc", "ecb"):
-            return self._forward_eval(x, cond, xn)
+        if not self.training and self.route in ("tc", "ecb", "noise"):   # noise: every image of an evaluation batch can share one bin
+            return self._forward_eval(x, cond, xn, t)
         B, T, d = x.shape
         idx, gate = self.slots(x, t, cond, xn)
         y = self._experts(x.reshape(B * T, d), idx, gate).view(B, T, d)
@@ -310,17 +310,24 @@ class MoEFeedForward(nn.Module):
         self.moe_stat.add_(v.detach())
 
     @torch.compiler.disable
-    def _forward_eval(self, x, cond, xn):
-        """tc and ecb outside training: every selected (token, expert) pair is computed; the slot table is as wide as the
+    def _forward_eval(self, x, cond, xn, t=None):
+        """tc, ecb and noise outside training: every selected (token, expert) pair is computed; the slot table is as wide as the
         busiest expert needs (rounded up to 256 tokens, so the GEMM sizes repeat). Not compiled: the width varies."""
         B, T, d = x.shape
-        idx, gate = self.slots_eval(x, cond, xn)
+        idx, gate = self.slots_eval(x, cond, xn, t)
         y = self._experts(x.reshape(B * T, d), idx, gate).view(B, T, d)
         return y if self.shared is None else y + self.shared(x)
 
-    def slots_eval(self, x, cond=None, xn=None):
+    def slots_eval(self, x, cond=None, xn=None, t=None):
         B, T, d = x.shape
         M, n, G = B * T, self.n, self.G
+        if self.route == "noise":   # 2026-11-15: a held-out level or a sampler's step puts every image in one bin; the training
+            # capacity (capacity x M / n) then dropped about (n - 1) / n of the tokens (tools/moe/tests/test_noise_eval.py)
+            e = (t.reshape(B, 1).float() > self.moe_edges[None, :]).sum(1)
+            sel = e[:, None].expand(B, T).reshape(M)[:, None] == torch.arange(n, device=x.device)[None, :]
+            cap = max(256, -(-int(sel.sum(0).max()) // 256) * 256)
+            idx, gate, _ = self._compact(sel, cap)
+            return idx, gate
         sig = torch.sigmoid(self._scores(x, xn, cond))
         if self.route == "tc":
             top = (sig + self.moe_bias).topk(G, dim=1).indices
