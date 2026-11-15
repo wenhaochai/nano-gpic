@@ -139,7 +139,7 @@ from torchvision import models
 from collections import namedtuple
 import os
 
-# 官方 LPIPS (VGG) 权重下载地址
+# the official LPIPS (VGG) weights' URL
 LPIPS_VGG_WEIGHTS_URL = "https://raw.githubusercontent.com/richzhang/PerceptualSimilarity/master/lpips/weights/v0.1/vgg.pth"
 
 def spatial_average(x, keepdim=True):
@@ -170,7 +170,7 @@ class NetLinLayer(nn.Module):
 class vgg16(torch.nn.Module):
     def __init__(self, requires_grad=False, pretrained=True):
         super(vgg16, self).__init__()
-        # 加载 torchvision 的预训练 VGG16
+        # torchvision's pretrained VGG16
         vgg_pretrained_features = models.vgg16(pretrained=pretrained).features
         
         self.slice1 = torch.nn.Sequential()
@@ -227,17 +227,17 @@ class LPIPS(nn.Module):
         if pretrained:
             self.load_from_pretrained()
             
-        # 冻结参数，因为通常只作为 Loss 使用
+        # frozen: it serves only as a loss
         for param in self.parameters():
             param.requires_grad = False
 
     def load_from_pretrained(self):
         """
-        自动下载并加载官方权重
+        Download and load the official weights.
         """
         try:
             print(f"Loading LPIPS weights from {LPIPS_VGG_WEIGHTS_URL}...")
-            # 使用 torch.hub 自动下载并缓存
+            # torch.hub downloads and caches them
             state_dict = torch.hub.load_state_dict_from_url(
                 LPIPS_VGG_WEIGHTS_URL, 
                 progress=True, 
@@ -250,7 +250,7 @@ class LPIPS(nn.Module):
             print("Running without trained linear weights (NOT RECOMMENDED for metric computation).")
 
     def forward(self, input, target):
-        # input, target 应该是范围在 [-1, 1] 的 tensor
+        # input and target are tensors in [-1, 1]
         in0_input, in1_input = (self.scaling_layer(input), self.scaling_layer(target))
         outs0, outs1 = self.net(in0_input), self.net(in1_input)
         feats0, feats1, diffs = {}, {}, {}
@@ -267,7 +267,7 @@ class LPIPS(nn.Module):
         return val
 
     def forward_with_feats(self, input, target):
-        # input, target 应该是范围在 [-1, 1] 的 tensor
+        # input and target are tensors in [-1, 1]
         in0_input, in1_input = (self.scaling_layer(input), self.scaling_layer(target))
         outs0, outs1 = self.net(in0_input), self.net(in1_input)
         feats0, feats1, diffs = {}, {}, {}

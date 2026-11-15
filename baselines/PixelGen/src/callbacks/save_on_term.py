@@ -1,4 +1,4 @@
-"""Save on the pilot's cut (gpic-28 2026-11-09; owner: 「修掉」 on genmodel's bug list).
+"""Save on the pilot's cut (gpic-28 2026-11-09; owner: fix it, on genmodel's bug list).
 
 fetch_pending runs a wq guest under `timeout --kill-after=300 <s>`: at the planned end, timeout sends SIGTERM to the guest's whole
 process group and SIGKILL 300 s later. Before this callback Lightning turned the TERM into a stop without a save, so a --partial

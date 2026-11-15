@@ -1,4 +1,4 @@
-"""tools/official_inception.py split over GPUs (gpic-28 2026-11-09, the eval idle-GPU work; owner: 「一定要处理空闲」): the one-GPU Inception pass
+"""tools/official_inception.py split over GPUs (gpic-28 2026-11-09, the eval idle-GPU work; owner: the idle GPUs must be dealt with): the one-GPU Inception pass
 took 58 s alone and 100-190 s beside DINOv2 and the next predict, and slowed that predict's rank on its GPU. Each shard computes the TF Inception-v3
 pool features of a contiguous block of whole 125-image batches (gpic_eval's batch for models=["inception"] at batch_size=500), so every batch,
 and with it every feature, is the one the one-GPU pass computes; the metrics step joins the shards in image order and calls the same metric code

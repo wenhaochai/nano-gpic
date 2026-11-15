@@ -72,7 +72,7 @@ class CompileWarmup(Callback):
         if trainer.is_global_zero:
             print("[warmup] done", flush=True)
         if trainer.global_step > 0:
-            # a resumed launch (gpic-28 2026-11-09, owner popups 「R3 和 C1 都做」/「做」): it seeds, builds the model and runs this
+            # a resumed launch (gpic-28 2026-11-09, owner popups: do both R3 and C1 / do it): it seeds, builds the model and runs this
             # warm-up exactly as the run's first launch did, so without this it replayed the run's first noise, timesteps and data-worker
             # seeds; a resume inside the cooldown then cost FD 5-9% at d16 (4 of 4 resumes 851-884 against 812.5 for one-piece runs; with
             # the streams reseeded here 814.4, w2421). Fresh streams from (seed, step), one for all ranks so they stay in step; a first

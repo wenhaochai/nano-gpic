@@ -26,7 +26,7 @@ def sde_preserve_step_fn(x, v, dt, s, w):
 def sid2_step_fn(x, v, dt, s, w):
     gamma = 1.0
     noise_scale = gamma* w * dt.abs() 
-    # 3. 组合
+    # 3. combine
     return x + v * dt + noise_scale * torch.randn_like(x)
 
 import logging

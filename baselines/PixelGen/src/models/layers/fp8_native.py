@@ -1,4 +1,4 @@
-"""Native FP8 GEMMs for the image blocks (GPIC_MFU_FP8=native; owner 2026-11-07: 「FP8要做」, 「直接做b」; docs/mfu.md F8b).
+"""Native FP8 GEMMs for the image blocks (GPIC_MFU_FP8=native; owner 2026-11-07: do FP8, go straight to b; docs/mfu.md F8b).
 
 torchao's Float8Linear (lever F8) swaps one nn.Linear at a time, so every GEMM pays its own passes over bf16 tensors
 (amax, cast, transposed copies), and with our fused kernels K and K2 Inductor cannot fold those passes into the producers:

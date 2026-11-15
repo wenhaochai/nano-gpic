@@ -1,12 +1,12 @@
 #!/bin/bash
-# Publish the project to the public page-linked repo wenhaochai/nano-gpic (a fresh repo since 2026-11-07, owner: 「wenhaochai/nano-gpic吧」; before it gpic-baseline; owner 2026-11-07: 「commit为什么不全啊，然后main要
-# 创建一个吧，然后要全吧」, 「公开仓库不要提及h100」, 「说H100就行」): every branch at once, each with its whole history; the
+# Publish the project to the public page-linked repo wenhaochai/nano-gpic (a fresh repo since 2026-11-07, owner: nano-gpic then; before it gpic-baseline; owner 2026-11-07: the commits are incomplete,
+# create a main and make it complete; do not name the cluster; just say H100): every branch at once, each with its whole history; the
 # production line prod (main with ladder, mfu and muon-search2 merged) becomes the public main. In every commit, file name
 # and message: cluster paths and user names replaced, the cluster's name replaced by H100 (configs_h100 -> configs_h100,
 # node names generic); then every blob, message and ref name scanned (secrets, cluster ids, the cluster's name); then a forced
 # push (the rewrite changes every hash). Prints the old -> new commit map for the page's Code links.
-# Run on a vis node (the scan runs Python). The public README is rewritten at every publish (owner 2026-11-07: 「readme每次commit
-# 都重写一下说明一下我们的ladder搭建和目标 和已经实现的东西 也要适当配图」): refuse unless README.md on prod was committed today.
+# Run on a vis node (the scan runs Python). The public README is rewritten at every publish (owner 2026-11-07: rewrite the
+# README at every commit: how the ladder is built, its goals, what works, with figures): refuse unless README.md on prod was committed today.
 # usage: tools/publish_public.sh [--dry]   (--dry: everything but the push)
 set -euo pipefail
 DRY=${1:-}
@@ -44,7 +44,7 @@ for m in "${MAP[@]}"; do
   git fetch -q --no-tags $SRC "refs/remotes/origin/$src:refs/heads/$dst"
   PUB+=("$dst")
 done
-# The GPIC authors out of the public Contributors (owner 2026-11-07: 「不想看到别人」, 「claude可以有，只是不要那三位原作者」): the
+# The GPIC authors out of the public Contributors (owner 2026-11-07: no other people; Claude may stay, but not the three original authors): the
 # GPIC release's 10 commits (b79f925..afa82da, keshik6/gpic's main when this fork started, by its authors) become one import commit
 # by the owner that names the source, grafted under every branch; its metadata is fixed, so the rewrite stays deterministic. LICENSE
 # and the README's credit stay as they are; the Co-Authored-By trailers stay. The checks refuse any other author or committer.

@@ -26,7 +26,7 @@ class ConstantWithWarmup:
 
 class WarmupFlatCooldown:
     """Linear warmup, a flat rate, then a linear cooldown over the last num_cooldown_steps of max_steps.
-    min_lr (owner 2026-11-07: 「学习率线性不降到0，而是降低到一个固定值3e-5」): the absolute rate every param group reaches at
+    min_lr (owner 2026-11-07: the learning rate decays linearly not to 0 but to a fixed 3e-5): the absolute rate every param group reaches at
     max_steps; each group gets its own lambda, ending at min_lr / its initial rate (the Muon and the Adam groups start at
     different rates). min_lr = 0 keeps the old schedule exactly (one lambda, down to 0)."""
     def __init__(self, num_warmup_steps: int, num_cooldown_steps: int, max_steps: int, min_lr: float = 0.0):

@@ -1,5 +1,5 @@
 """MFU lever F8 (GPIC_MFU_FP8=<recipe>, docs/mfu.md): FP8 training of the blocks' Linear layers with torchao's float8
-(owner, 2026-11-06 23:5x: 「FP8肯定是要上的」). Unlike every other MFU lever this changes the numerics: the GEMMs of
+(owner, 2026-11-06 23:5x: FP8 will certainly be used). Unlike every other MFU lever this changes the numerics: the GEMMs of
 the converted layers take FP8 inputs (dynamic scaling per tensor, or per row) and accumulate in fp32; a run takes it
 from its first step or not at all.
 

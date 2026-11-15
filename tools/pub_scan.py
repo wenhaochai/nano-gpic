@@ -17,10 +17,10 @@ RULES = {
     "password_assign": re.compile(r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)\b\s*[=:]\s*['\"]?([^\s'\"]{8,})"),
     "bearer": re.compile(r"(?i)authorization:\s*bearer\s+[A-Za-z0-9._-]{20,}"),
     "email": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
-    "cluster_ids": re.compile(r"USER|GROUP|group|USER|[Dd]ella|H100"),   # the cluster's name too (owner 2026-11-07: 公开仓库不要提及h100)
+    "cluster_ids": re.compile(r"USER|GROUP|group|USER|[Dd]ella|H100"),   # the cluster's name too (owner 2026-11-07: the public repo must not name the cluster)
 }
 # every object reachable from the refs given (all refs when none), each blob read once through one `git cat-file --batch`
-# (2026-11-08: two git processes per object, once per published branch, took ~8 min; owner: 「推送为什么那么慢」)
+# (2026-11-08: two git processes per object, once per published branch, took ~8 min; owner: why is the push so slow)
 refs = sys.argv[2:] or ["--all"]
 objs = subprocess.run(["git", "-C", repo, "rev-list", "--objects", *refs], capture_output=True, text=True, check=True).stdout.splitlines()
 paths = {}

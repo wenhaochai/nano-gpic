@@ -9,22 +9,22 @@ from PIL import Image
 from typing import List, Union
 
 def clean_filename(s):
-    # 去除首尾空格和点号
+    # strip leading and trailing spaces and dots
     s = s.strip().strip('.')
-    # 转换 Unicode 字符为 ASCII 形式
+    # convert Unicode characters to ASCII
     s = unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('ASCII')
     illegal_chars = r'[/]'
     reserved_names = set()
-    # 替换非法字符为下划线
+    # replace illegal characters with underscores
     s = re.sub(illegal_chars, '_', s)
-    # 合并连续的下划线
+    # merge runs of underscores
     s = re.sub(r'_{2,}', '_', s)
-    # 转换为小写
+    # lower case
     s = s.lower()
-    # 检查是否为保留文件名
+    # check for reserved file names
     if s.upper() in reserved_names:
         s = s + '_'
-    # 限制文件名长度
+    # limit the file name's length
     max_length = 200
     s = s[:max_length]
     if not s:

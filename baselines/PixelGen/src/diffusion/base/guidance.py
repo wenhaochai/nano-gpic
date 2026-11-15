@@ -7,15 +7,15 @@ def simple_guidance_fn(out, cfg):
 
 def guidance_fn_with_rescale(out, cfg, rescale_factor=0.7):
     """
-    对模型的原始输出应用Classifier-Free Guidance (CFG)，并加入方差重缩放 (rescale_cfg)。
+    Apply classifier-free guidance (CFG) to the model's raw output, with variance rescaling (rescale_cfg).
 
     Args:
-        out (torch.Tensor): 模型的原始输出，包含了unconditional和conditional两部分。
-        cfg (float): Guidance scale，即引导强度。
-        rescale_factor (float): 重缩放因子。常用的值在0.5到0.8之间，0.7是一个很好的起始值。
+        out (torch.Tensor): the model's raw output, its unconditional and conditional halves.
+        cfg (float): the guidance scale.
+        rescale_factor (float): the rescale factor; common values are 0.5 to 0.8, and 0.7 is a good start.
 
     Returns:
-        torch.Tensor: 应用了CFG和rescale_cfg之后的最终输出。
+        torch.Tensor: the output after CFG and rescale_cfg.
     """
     uncondition, condition = out.chunk(2, dim=0)
 

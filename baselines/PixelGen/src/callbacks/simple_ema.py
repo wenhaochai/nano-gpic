@@ -20,7 +20,7 @@ class SimpleEMA(Callback):
         self._stream = None   # perf C3: created on the parameters' own device (was GPU 0 on every rank)
         self.previous_step = 0
         self.fused = False    # MFU lever H (GPIC_MFU_FUSED_OPT=2): the optimizer's kernel updates the EMA
-        # GPIC_MFU_NO_EMA=1 (owner 2026-11-08: 「ema是一定不能用」): no EMA. No update at any step; the EMA module is kept
+        # GPIC_MFU_NO_EMA=1 (owner 2026-11-08: the EMA must not be used): no EMA. No update at any step; the EMA module is kept
         # equal to the raw weights at every state_dict (mirror()), so every checkpoint's EMA slot holds the raw weights and
         # tools that sample from ema_denoiser evaluate the raw model.
         import os

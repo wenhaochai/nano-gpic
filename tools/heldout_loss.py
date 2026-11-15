@@ -603,7 +603,7 @@ def run_task(spec, weights, data, a, device):
                 and twin_weights(ck["state_dict"]))
     nets = {w: build_denoiser(kw, ck["state_dict"], prefixes[w], device) for w in (("raw",) if one_pass else weights)}
     del ck
-    # owner 2026-11-09 (popup 「采用」): the denoiser compiled (probe w2407: 15-33% faster, losses within 2.8e-5 relative of the
+    # owner 2026-11-09 (popup: adopt): the denoiser compiled (probe w2407: 15-33% faster, losses within 2.8e-5 relative of the
     # eager values); every record says which (compiled), so old and new values can be told apart. GPIC_HELDOUT_COMPILE=0: eager.
     compiled = torch.device(device).type == "cuda" and os.environ.get("GPIC_HELDOUT_COMPILE", "1") == "1"
     if compiled:
