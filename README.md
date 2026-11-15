@@ -10,7 +10,7 @@ The goal:
 
 This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026; its README is [GPIC_README.md](GPIC_README.md)). Every run, number and figure is on the experiment page, [wenhaochai.com/exps/gpic-speed.html](https://wenhaochai.com/exps/gpic-speed.html). Training logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed). The speed records, their rules and the speed work are in [docs/speedrun.md](docs/speedrun.md).
 
-*Updated 2026-11-13.*
+*Updated 2026-11-14.*
 
 ## 1. The ladder
 
@@ -79,6 +79,9 @@ In the held-out loss, the lowest point of each budget falls from 0.06857 at 3.6e
 | `ladder` | the first ladder: the official AdamW recipe on GPIC Lite, no caption dropout |
 | `muon` | the first optimizer ablation: Muon against AdamW at the official recipe |
 | `gmflow` | a Gaussian mixture of the velocity at each step (K = 1, 8, 16) |
+| `gmflow-ladder` | the Gaussian mixture on the final ladder's sizes and budgets (K = 1 and 8), its evaluation (`jobs/evals_gm_ladder.sh`); notes in `docs/gmflow_ladder_port.md` |
+| `artm-ladder` | autoregressive transitions between noise levels on the final ladder, judged by FD (no mean prediction, so no held-out loss) |
+| `moe` | a mixture of experts in the image blocks' feed-forward layers (`src/models/layers/moe.py`: learned and fixed routes, Triton operators for the token sums), Muon for the experts under FSDP2; the infra log is `docs/moe.md` |
 | `dist-step` | a distribution per step: notes and tests |
 | `energy-head` | an energy-score head over the whole image |
 | `ar` | autoregressive sampling of the image tokens |
