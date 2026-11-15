@@ -99,7 +99,7 @@ for b in "${REFS[@]}"; do
     echo "$b: the scan found secrets or cluster ids:"; grep -A3 "^== " $f | head -20; fail=1
   fi
 done
-if git log --format=%B "${REFS[@]}" | grep -qi h100 || git for-each-ref --format='%(refname) %(contents)' | grep -qi h100; then
+if git log --format=%B "${REFS[@]}" | grep -qi h100 || git for-each-ref --format='%(refname) %(contents)' refs/heads refs/tags | grep -qi h100; then   # pushed refs only: refs/replace (the import graft) keeps original messages and is never pushed
   echo "a commit message or a ref name still names the cluster"; fail=1
 fi
 if git log --format='%an <%ae>%n%cn <%ce>' "${REFS[@]}" | sort -u | grep -vxF 'Wenhao Chai <USER@gmail.com>' | grep -q .; then
