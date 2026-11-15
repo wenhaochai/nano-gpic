@@ -1,5 +1,7 @@
 # nano-gpic: a compute ladder for pixel-space text-to-image
 
+<a href="https://wenhaochai.com/blogs/scaling-generative-models-101.html"><img src="docs/readme/cover.webp" width="760" alt="The post's opening video: the compute ladder and its scaling law"></a>
+
 The code of the post [How to Scale Text-to-image Models: a Handbook](https://wenhaochai.com/blogs/scaling-generative-models-101.html). It trains a compute ladder of PixelGen's JiT-T2I on [GPIC](https://gpic.stanford.edu) (100M text-image pairs) with 8 NVIDIA H100 GPUs per model, scores each model by its held-out loss, and fits one scaling law to 38 runs from 3.6e18 to 2.3e20 FLOPs.
 
 Every run of the post, with its training logs and the commit it ran on, is on the [experiment page](https://wenhaochai.com/exps/gpic-speed.html); the logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed). This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026), whose README is [GPIC_README.md](GPIC_README.md).
@@ -8,7 +10,7 @@ Every run of the post, with its training logs and the commit it ran on, is on th
 
 ## The final ladder
 
-One model per budget, at the size the scaling law picks: about 50 image tokens per image parameter.
+One model per budget: the run with the lowest held-out loss at that budget in the post's iso-FLOP curves. All seven use the recipe below.
 
 | Size | d10 | d11 | d12 | d13 | d14 | d16 | d18 |
 |---|---|---|---|---|---|---|---|
@@ -16,10 +18,16 @@ One model per budget, at the size the scaling law picks: about 50 image tokens p
 | Width | 768 | 896 | 1024 | 1152 | 1280 | 1536 | 1792 |
 | Image layers | 10 | 11 | 12 | 13 | 14 | 16 | 18 |
 | Text layers | 2 | 2 | 3 | 3 | 3 | 4 | 4 |
-| Image parameters | 106M | 159M | 226M | 311M | 413M | 679M | 1.04B |
-| Steps at batch 1024 | 21,248 | 28,800 | 40,192 | 59,136 | 89,600 | 108,800 | 143,872 |
-| Tokens per parameter | 52.5 | 47.5 | 46.5 | 49.9 | 56.9 | 42.0 | 36.2 |
+| Image parameters | 106M | 159M | 226M | 311M | 413M | 679M | 1040M |
+| All parameters | 171M | 252M | 376M | 507M | 665M | 1122M | 1680M |
+| Steps | 21,248 | 28,800 | 40,192 | 59,136 | 89,600 | 108,800 | 143,872 |
+| Training images | 21.8M | 29.5M | 41.2M | 60.6M | 91.8M | 111M | 147M |
+| Muon learning rate | 1.36e-2 | 9.62e-3 | 6.80e-3 | 4.81e-3 | 3.40e-3 | 2.40e-3 | 1.70e-3 |
+| AdamW learning rate | 5.01e-4 | 4.06e-4 | 3.26e-4 | 2.77e-4 | 2.38e-4 | 1.79e-4 | 1.44e-4 |
+| Muon weight decay | 0.0173 | 0.0181 | 0.0183 | 0.0176 | 0.0164 | 0.0191 | 0.0204 |
+| GPU-hours (H100) | 3.8 | 6.8 | 11.7 | 22.5 | 40.4 | 76.5 | 150 |
 | Held-out loss | 0.06788 | 0.06707 | 0.06628 | 0.06558 | 0.06487 | 0.06416 | 0.06351 |
+| FD-DINOv2 | 949.8 | 828.5 | 673.3 | 534.8 | 443.5 | 373.5 | 325.3 |
 
 The recipe, the same at every size:
 
@@ -101,4 +109,15 @@ Each setting of the recipe, and where the post shows its evidence:
 
 ## Where the code is
 
-`main` holds the final ladder: `jobs/final_ladder.sh` (training, sizes in `jobs/final_ladder_sizes.sh`), `jobs/eval_final_ladder.sh` (FD), `tools/heldout_loss.py` (held-out loss, tests in `tools/test_heldout_loss.py`) and `tools/fit/` (the scaling law and its 38 runs). The experiment page links every run to the commit it ran on. Research lines have their own branches: `gmflow` and `gmflow-ladder` (a Gaussian mixture of the velocity), `artm-ladder` and `ar` (autoregressive variants), `dist-step`, `energy-head`, `implicit-nodrop`, and `moe`, `moe-run2-noise-eval`, `moe-run3-ewd` (mixtures of experts). The speed work is on `mfu` (log: `docs/mfu.md`); the first Muon ladder and its experiments are in the history of `main` and on `muon-search2`.
+`main` holds what the steps above run, and nothing else of ours:
+
+| Path | What it does |
+|---|---|
+| `jobs/final_ladder.sh`, `jobs/final_ladder_sizes.sh` | train one size of the final ladder (through `jobs/train_ladder.sh` and `jobs/env.sh`) |
+| `jobs/eval_final_ladder.sh` | FD-DINOv2, PRDC and MMD, and the official Inception metrics (`tools/fast_eval.py`, `tools/official_inception*.py`) |
+| `tools/heldout_loss.py` | the held-out loss; CPU tests in `tools/test_heldout_loss.py` |
+| `tools/fit/` | the scaling law and the post's 38 runs |
+| `tools/download_*.py`, `tools/encode_captions.py`, `tools/check_text_cache.py` | GPIC and the captions' text features (`docs/text_cache.md`) |
+| `baselines/PixelGen/` | the model and the trainer (PixelGen's JiT-T2I with the ladder's changes); configs in `configs_h100/` |
+
+The experiment page links every run to the commit it ran on. Research lines have their own branches: `gmflow` and `gmflow-ladder` (a Gaussian mixture of the velocity), `artm-ladder` and `ar` (autoregressive variants), `dist-step`, `energy-head`, `implicit-nodrop`, and `moe`, `moe-run2-noise-eval`, `moe-run3-ewd` (mixtures of experts). The speed work is on `mfu`; the first Muon ladder and its experiments are in the history of `main` and on `muon-search2`.
