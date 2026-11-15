@@ -17,7 +17,7 @@ URL=https://github.com/wenhaochai/nano-gpic.git
 SCAN=$(cd "$(dirname "$0")" && pwd)/pub_scan.py   # this script's own scanner (the cluster's name included)
 # private branch -> public branch; main itself is not published (its content is in main); ladder-p is the code the
 # ladder runs from the FSDP2 widths on (3338a8c plus lever P)
-MAP=(prod:main ar:ar dist-step:dist-step energy-head:energy-head eval-par:eval-par gmflow:gmflow heldout-loss:heldout-loss
+MAP=(main:main ar:ar dist-step:dist-step energy-head:energy-head eval-par:eval-par gmflow:gmflow heldout-loss:heldout-loss
      implicit-nodrop:implicit-nodrop ladder:ladder ladder-p:ladder-p ladder-pns:ladder-pns mfu:mfu muon:muon muon-search2:muon-search2
      ladder-pnsr:ladder-pnsr ladder-pnsr-ma:ladder-pnsr-ma ladder-sweep:ladder-sweep sweep-noema:sweep-noema sweep-noema-cap:sweep-noema-cap
      ladder-noema:ladder-noema ladder-datamem:ladder-datamem eval-official:eval-official
@@ -33,17 +33,24 @@ MAP=(prod:main ar:ar dist-step:dist-step energy-head:energy-head eval-par:eval-p
      resume-fix-sched:resume-fix-sched ckpt-dedup-cap:ckpt-dedup-cap ckpt-dedup-sched:ckpt-dedup-sched
      gmflow-ladder:gmflow-ladder artm-ladder:artm-ladder moe:moe moe-run2-noise-eval:moe-run2-noise-eval moe-run3-ewd:moe-run3-ewd)   # 2026-11-15 (genmodel): the code of the MoE runs since 11-15 (the noise route's evaluation fix; the experts' decay factor); 2026-11-14 (genmodel): the code of the distribution runs on the final ladder and of the MoE line's runs; 2026-11-08: the code of every run the page records; 2026-11-09 (gpic-28): the deployed eval (run9), the compiled held-out tool, the optimization scan's probes; 2026-11-09 evening (genmodel): the FP8 resume checks (resume-isolate, resume-isolate-r4, resume-isolate-e12, resume-mech), the AR runs (resume-fix-cap) and the queued AR and XLR-1P runs (ckpt-onelast-cap, ckpt-onelast-sched); 2026-11-10 (genmodel): the code of today's finished runs (launch-cutfix-cap, be47945) and the fixes under it (save on TERM, the resume reseed for the schedule runs, one copy of the raw weights), the held-out run5 and evaluation run10 and run11 tools
 git -C $SRC fetch -q origin
-RD=$(git -C $SRC log -1 --format=%cs origin/prod -- README.md)
-[ "$RD" = "$(date +%F)" ] || { echo "README.md on prod was last rewritten on $RD: rewrite it (the ladder, the goals, what works, figures) first"; exit 1; }
+RD=$(git -C $SRC log -1 --format=%cs origin/main -- README.md)
+[ "$RD" = "$(date +%F)" ] || { echo "README.md on main was last rewritten on $RD: rewrite it (the ladder, the goals, what works, figures) first"; exit 1; }
 mkdir -p $T && cd $T
 case "$T/repo" in */tmp/gd_public/repo) rm -rf -- "$T/repo";; esac
 git init -q repo && cd repo
-PUB=()
+PUB=() TAGS=()
+# 2026-11-15 (owner popup, repo cleanup for collaborators): a line that is no longer a branch on origin is kept as the tag archive/<src>;
+# it is published as the tag archive/<dst>, so its commits (and the page's Code links to them) stay reachable without a branch.
 for m in "${MAP[@]}"; do
   src=${m%%:*}; dst=${m#*:}
-  git fetch -q --no-tags $SRC "refs/remotes/origin/$src:refs/heads/$dst"
-  PUB+=("$dst")
+  if git -C $SRC rev-parse -q --verify "refs/remotes/origin/$src" > /dev/null; then
+    git fetch -q --no-tags $SRC "refs/remotes/origin/$src:refs/heads/$dst"; PUB+=("$dst")
+  else
+    git -C $SRC rev-parse -q --verify "refs/tags/archive/$src" > /dev/null || { echo "$src: neither a branch on origin nor the tag archive/$src"; exit 1; }
+    git fetch -q --no-tags $SRC "refs/tags/archive/$src:refs/tags/archive/$dst"; TAGS+=("archive/$dst")
+  fi
 done
+REFS=("${PUB[@]/#/refs/heads/}" "${TAGS[@]/#/refs/tags/}")
 # The GPIC authors out of the public Contributors (owner 2026-11-07: no other people; Claude may stay, but not the three original authors): the
 # GPIC release's 10 commits (b79f925..afa82da, keshik6/gpic's main when this fork started, by its authors) become one import commit
 # by the owner that names the source, grafted under every branch; its metadata is fixed, so the rewrite stays deterministic. LICENSE
@@ -54,7 +61,7 @@ IMP=$(GIT_AUTHOR_NAME="Wenhao Chai" GIT_AUTHOR_EMAIL=USER@gmail.com GIT_COMMITTE
   GIT_COMMITTER_EMAIL=USER@gmail.com GIT_AUTHOR_DATE="$(git log -1 --format=%aI $UP)" GIT_COMMITTER_DATE="$(git log -1 --format=%cI $UP)" \
   git commit-tree "$UP^{tree}" -m "Import the GPIC code release" \
   -m "The code of github.com/keshik6/gpic at afa82da (GPIC; Chandrasegaran, Sargent et al., 2026) as one commit. LICENSE and the original README (GPIC_README.md) are kept.")
-git rev-list --parents "${PUB[@]}" --not $UP | while read -r c ps; do
+git rev-list --parents "${REFS[@]}" --not $UP | while read -r c ps; do
   np=(); hit=0
   for p in $ps; do case "$UPS" in *" $p "*) np+=("$IMP"); hit=1;; *) np+=("$p");; esac; done
   [ $hit = 0 ] || git replace --graft "$c" "${np[@]}"
@@ -71,7 +78,7 @@ def sub(b):
     b = NODE.sub(rb"node-\1", b)
     return b.replace(b"H100", b"H100").replace(b"H100", b"H100").replace(b"h100", b"h100")
 '
-"$FR" --force --refs "${PUB[@]}" --message-callback "$SUB
+"$FR" --force --refs "${REFS[@]}" --message-callback "$SUB
 m = sub(message).replace(b'; links moved to the rewritten public hashes', b'')
 if m.startswith(b'publish_public: the GPIC release'):   # the owner's quotes stay private (owner 2026-11-07)
     m = b'publish_public: the code release as one import commit; refuse any author or committer other than the owner' + m[m.index(b'\n'):]
@@ -82,22 +89,27 @@ if b'\x00' not in d[:8000]:
     blob.data = sub(d)
 "
 fail=0
-for b in "${PUB[@]}"; do
-  python3 -I $SCAN $T/repo $b > $T/scan_$b.txt
-  if grep -qE "^== (wandb|hf_token|openai|anthropic|google|github|slack|aws|private_key|overleaf|bearer|cluster_ids)" $T/scan_$b.txt; then
-    echo "$b: the scan found secrets or cluster ids:"; grep -A3 "^== " $T/scan_$b.txt | head -20; fail=1
+for b in "${REFS[@]}"; do
+  f=$T/scan_${b//\//_}.txt
+  python3 -I $SCAN $T/repo $b > $f
+  if grep -qE "^== (wandb|hf_token|openai|anthropic|google|github|slack|aws|private_key|overleaf|bearer|cluster_ids)" $f; then
+    echo "$b: the scan found secrets or cluster ids:"; grep -A3 "^== " $f | head -20; fail=1
   fi
 done
-if git log --format=%B "${PUB[@]}" | grep -qi h100 || git for-each-ref --format='%(refname)' | grep -qi h100; then
+if git log --format=%B "${REFS[@]}" | grep -qi h100 || git for-each-ref --format='%(refname) %(contents)' | grep -qi h100; then
   echo "a commit message or a ref name still names the cluster"; fail=1
 fi
-if git log --format='%an <%ae>%n%cn <%ce>' "${PUB[@]}" | sort -u | grep -vxF 'Wenhao Chai <USER@gmail.com>' | grep -q .; then
-  echo "a commit by someone other than the owner:"; git log --format='%an <%ae>%n%cn <%ce>' "${PUB[@]}" | sort | uniq -c; fail=1
+if git log --format='%an <%ae>%n%cn <%ce>' "${REFS[@]}" | sort -u | grep -vxF 'Wenhao Chai <USER@gmail.com>' | grep -q .; then
+  echo "a commit by someone other than the owner:"; git log --format='%an <%ae>%n%cn <%ce>' "${REFS[@]}" | sort | uniq -c; fail=1
 fi
-for b in "${PUB[@]}"; do [ "$(git rev-list --max-parents=0 $b | wc -l)" = 1 ] && [ "$(git log -1 --format=%s $(git rev-list --max-parents=0 $b))" = "Import the GPIC code release" ] || { echo "$b: the root is not the import commit"; fail=1; }; done
+for b in "${REFS[@]}"; do [ "$(git rev-list --max-parents=0 $b | wc -l)" = 1 ] && [ "$(git log -1 --format=%s $(git rev-list --max-parents=0 $b))" = "Import the GPIC code release" ] || { echo "$b: the root is not the import commit"; fail=1; }; done
 [ $fail = 0 ] || { echo "not pushing"; exit 1; }
-for b in "${PUB[@]}"; do echo "$b: $(git rev-list --count $b) commits"; done
+for b in "${REFS[@]}"; do echo "$b: $(git rev-list --count $b) commits"; done
 if [ "$DRY" = --dry ]; then echo "dry run: nothing pushed"; exit 0; fi
-git push -q --force $URL "${PUB[@]/#/refs/heads/}"
-echo "pushed ${#PUB[@]} branches; old -> new commit map: $T/repo/.git/filter-repo/commit-map"
+git push -q --force $URL "${REFS[@]}"
+# the public branches that are no longer in the set (archived: their tags were pushed above, so no commit becomes unreachable)
+for b in $(git ls-remote --heads $URL | sed "s|.*refs/heads/||"); do
+  printf "%s\n" "${PUB[@]}" | grep -qx "$b" || { git push -q $URL --delete "refs/heads/$b" && echo "removed the public branch $b"; }
+done
+echo "pushed ${#PUB[@]} branches and ${#TAGS[@]} archive tags; old -> new commit map: $T/repo/.git/filter-repo/commit-map"
 tail -3 .git/filter-repo/commit-map
