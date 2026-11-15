@@ -7,6 +7,7 @@
 # push (the rewrite changes every hash). Prints the old -> new commit map for the page's Code links.
 # Run on a vis node (the scan runs Python). The public README is rewritten at every publish (owner 2026-11-07: rewrite the
 # README at every commit: how the ladder is built, its goals, what works, with figures): refuse unless README.md on prod was committed today.
+# CONTRIBUTING.md and .github/ (the private repo's collaboration workflow, 2026-11-15) stay out of the public repo, which takes no pull requests.
 # usage: tools/publish_public.sh [--dry]   (--dry: everything but the push)
 set -euo pipefail
 DRY=${1:-}
@@ -78,7 +79,7 @@ def sub(b):
     b = NODE.sub(rb"node-\1", b)
     return b.replace(b"H100", b"H100").replace(b"H100", b"H100").replace(b"h100", b"h100")
 '
-"$FR" --force --refs "${REFS[@]}" --message-callback "$SUB
+"$FR" --force --refs "${REFS[@]}" --invert-paths --path CONTRIBUTING.md --path .github/ --message-callback "$SUB
 m = sub(message).replace(b'; links moved to the rewritten public hashes', b'')
 if m.startswith(b'publish_public: the GPIC release'):   # the owner's quotes stay private (owner 2026-11-07)
     m = b'publish_public: the code release as one import commit; refuse any author or committer other than the owner' + m[m.index(b'\n'):]
