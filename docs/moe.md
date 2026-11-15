@@ -226,8 +226,19 @@ The profiled arm (BMM_WT, ROUTER, FUSE) against the dense profile: 140.5 against
 gates about +3, the model's GEMMs +0.7 (the expert bmm runs about as fast as the dense FFN's GEMMs). Each remaining item is
 either the algorithm (Newton-Schulz), FSDP2's own copies, or kernels near the memory bandwidth.
 
-Validation before phase 2 uses the kept switches: w2749 (`tmp/ladder_prof/moe/val_p3_infra.sh`, d11 ecb:16:2, 3000 steps, two
-runs per code against phase 1's code, as w2725).
+### Validation (w2749, 2026-11-14)
+
+`tmp/ladder_prof/moe/val_p3_infra.sh`: d11 ecb:16:2 with phase 1's baseline line, 3000 steps, two runs per code (as w2725).
+
+| code | GPU ms/step | mean loss, last 500 steps |
+|---|---|---|
+| 83a88d9, phase 1's switches | 114.0, 113.9 | 0.07543, 0.07540 |
+| 2e6ea1a, + BMM_WT + ROUTER + FUSE | 110.9, 110.9 | 0.07519, 0.07544 |
+
+-3.0 ms (-2.7%). The largest gap between the 500-step mean losses of two runs of one code is 0.41% (phase 1's) and 0.33%
+(new); between the codes' means 0.14%. Routing healthy in every arm (MaxVio 0, normalized entropy 1.0000, no dead expert, no
+drops). PASS: the three switches can enter at phase 2; phase 1 and its 9 granularity runs stay on 83a88d9 (one code per
+comparison).
 
 ## Granularity: the shapes' cost (shape smoke w2732, 2026-11-14)
 
