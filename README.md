@@ -83,11 +83,11 @@ Each step runs on one node with 8 H100 GPUs, except the fit. Set `GPIC_WC` to a 
 
 <img src="docs/readme/optimum.png" width="760" alt="The optimal image parameters and images against training compute: the minima of the iso-FLOP parabolas and the fitted formula">
 
-The held-out loss of the final ladder falls from 0.06788 at 3.6e18 FLOPs (d10) to 0.06351 at 2.3e20 FLOPs (d18). One formula fits the 38 runs with an RMS error of 0.036%:
+The held-out loss of the final ladder falls from 0.06788 at 3.6e18 FLOPs (d10) to 0.06351 at 2.3e20 FLOPs (d18). One formula fits the 38 runs, each weighted toward the minimum of its iso-FLOP curve (a Gaussian of width 0.4 in ln N) and toward larger compute (∝ √C), with an RMS error of 0.057% (0.025% for the runs within 2× of a minimum):
 
-L(N, D) = E + (A / N^α + B / D^β)^k, with E = 0.0481, A = 1.35e-4, B = 2.33e-3, α = 0.54, β = 0.57, k = 0.22.
+L(N, D) = E + (A / N^α + B / D^β)^k, with E = 0.0457, A = 5.31e-5, B = 3.83e-4, α = 0.52, β = 0.52, k = 0.20.
 
-The best model grows as N\* ∝ C^0.52 [0.50, 0.53] and its data as D\* ∝ C^0.48, at about 50 image tokens per image parameter with no measurable trend over 64× in compute. Fitted to the 34 runs up to 1.1e20 FLOPs, the formula predicted the four runs at 2.3e20 FLOPs within 0.09%. Extrapolated to 1e21 FLOPs, the optimum is about 1.9B image parameters and 88B image tokens.
+The best model grows as N\* ∝ C^0.50 [0.49, 0.52] and its data as D\* ∝ C^0.50, at 50 to 51 image tokens per image parameter. Fitted to the 34 runs up to 1.1e20 FLOPs, the formula predicted the four runs at 2.3e20 FLOPs within 0.05%. Extrapolated to 1e21 FLOPs, the optimum is about 1.8B image parameters and 92B image tokens; there the recipe gives a Muon learning rate of 8.1e-4, an AdamW learning rate of 1.1e-4 and a Muon weight decay of 0.0175 (about the same at every budget). `python tools/fit/scaling_law.py` prints these values for each budget.
 
 ## How the ladder was built
 
