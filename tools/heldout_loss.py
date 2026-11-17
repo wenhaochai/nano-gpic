@@ -660,6 +660,8 @@ def cmd_work(a):
     torch.set_num_threads(2)
     data = load_data(a.data, device)
     assert (data["n_val"], data["n_train"]) == (a.n_val, a.n_train), (a.data, a.n_val, a.n_train)
+    for s in a.splits:   # resolution sweep: the prepared images must be GPIC_RES x GPIC_RES (catches a prep file of another size)
+        assert tuple(data[s]["img"].shape[1:3]) == (IMAGE, IMAGE), (a.data, s, tuple(data[s]["img"].shape), IMAGE)
     if a.tasks:
         with open(a.tasks) as f:
             tasks = [json.loads(line) for line in f if line.strip()]

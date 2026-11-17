@@ -27,7 +27,7 @@ heldout_run() {
   local work=$dir/work/$jid
   mkdir -p $work
   echo "[heldout] job $jid code $(git -C $WT rev-parse HEAD) $(git -C $WT status --porcelain --untracked-files=no | wc -l) modified tracked files; tool sha1 $(sha1sum < $tool | cut -c1-12)"
-  local data=$dir/data_v1_val${nv}_train${nt}_00787.pt
+  local data=$dir/data_v1_val${nv}_train${nt}_00787$([ "${GPIC_RES:-256}" = 256 ] || echo _r$GPIC_RES).pt   # resolution sweep: the tool's data_path name
   [ -f $data ] || python $tool prep --n-val $nv --n-train $nt --procs 32 --data $data
   local all=(); [ $# -eq 0 ] || all=(--ckpt "$@")
   local ck=("${all[@]}") rc=0 pass n sk=()
