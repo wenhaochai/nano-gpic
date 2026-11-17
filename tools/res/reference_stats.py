@@ -33,10 +33,11 @@ def build(dino, rows, out, shards):
 def compare(a, b, max_rel=None):
     from gpic_eval.metrics.fd import compute_FD_with_stats
     A, B = np.load(a), np.load(b)
-    pos = {k: i for i, k in enumerate(B["key"].tolist())}
-    ia = [i for i, k in enumerate(A["key"].tolist()) if k in pos]
-    ib = [pos[A["key"][i]] for i in ia]
-    res, ok = {"a": a, "b": b, "shared_keys": len(ia), "keys_a": int(len(A["key"])), "keys_b": int(len(B["key"]))}, True
+    ka, kb = A["key"].tolist(), B["key"].tolist()   # once: an NpzFile reads a member from the file at every access (13.5 ms for 50K keys)
+    pos = {k: i for i, k in enumerate(kb)}
+    ia = [i for i, k in enumerate(ka) if k in pos]
+    ib = [pos[ka[i]] for i in ia]
+    res, ok = {"a": a, "b": b, "shared_keys": len(ia), "keys_a": len(ka), "keys_b": len(kb)}, True
     for name in ("dino", "inception"):
         fd, fd_mu, fd_sigma = compute_FD_with_stats(A[f"{name}_mu"], B[f"{name}_mu"], A[f"{name}_sigma"], B[f"{name}_sigma"])
         ea, eb = A[f"{name}_embeddings"][ia].astype(np.float64), B[f"{name}_embeddings"][ib].astype(np.float64)
