@@ -41,7 +41,12 @@ class CompileWarmup(Callback):
                 metadata = {"text_emb": torch.zeros(sum(lens), pl_module.conditioner.embed_dim, dtype=torch.bfloat16,
                                                     device=dev), "text_lens": lens, "global_step": trainer.global_step}
                 pack_plan = Rebalancer(rebalance=False).host_plan(lens)
-            x = torch.zeros(B, 3, self.image_size, self.image_size, device=dev)
+            # resolution sweep (2026-11-17): the dummy images take the denoiser's own size (token grid x patch), so a run at another
+            # input_size warms up the shapes it trains on; the configured image_size (default 256) is the fallback
+            den = getattr(pl_module, "denoiser", None)
+            side = (int(round(den.num_patches ** 0.5)) * den.patch_size
+                    if den is not None and hasattr(den, "num_patches") and hasattr(den, "patch_size") else self.image_size)
+            x = torch.zeros(B, 3, side, side, device=dev)
             with trainer.precision_plugin.train_step_context():
                 with torch.no_grad():
                     x = pl_module.vae.encode(x)

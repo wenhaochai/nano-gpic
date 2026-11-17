@@ -43,6 +43,7 @@ for R, p in ((64, 16), (128, 16), (256, 16), (512, 16), (64, 4), (128, 8), (512,
         for prm in m.parameters():
             prm.add_(0.02 * torch.randn_like(prm))   # the final layer starts at zero: perturb so the output carries the whole path
     assert m.pos_embed.shape[1] == (R // p) ** 2, (R, p, m.pos_embed.shape)
+    assert int(round(m.num_patches ** 0.5)) * m.patch_size == R, (R, p)   # compile_warmup.py's dummy image side
     x, t, y = torch.randn(2, 3, R, R), torch.rand(2), torch.randn(2, 8, 32)
     with torch.no_grad():
         M._PATCHIFY = False
