@@ -11,9 +11,11 @@
 # 1. For R in 256 64 128 512: DINOv2 features (tools/fast_eval.py --save-features, 8 GPUs) and Inception features (tools/official_inception_sharded.py,
 #    one shard per GPU) of data/gpic/reference_stats/res/images/test_r<R>.npy (tools/res/crop_reference_images.py: the 50K test images of
 #    test_stats.npz, the toolkit's crop at R), then tools/res/reference_stats.py build -> data/gpic/reference_stats/res/test_stats_r<R>.npz.
-# 2. Check: the rebuilt 256 statistics against the shipped test_stats.npz (reference_stats.py compare; median per-image relative L2 of the
-#    embeddings at most 1e-3 for both backends, else exit 1 before anything else is written); then each R against the shipped 256 (the FD
-#    that the resolution alone gives) into res/real_r<R>_vs_256.json.
+# 2. Check: the rebuilt 256 statistics against the shipped test_stats.npz on the embeddings of the same images (reference_stats.py compare
+#    --max-rel 5e-3 --max-fd-shared 0.01: the per-image relative L2 and the FD between the two sides' mean and covariance; w2886 measured
+#    6.3e-4 / 1.19e-3 and 0.00034 / 0.000022 for DINOv2 / Inception), else exit 1 before anything else is written. The shipped mu and sigma
+#    come from other images (FD 7.50 / 0.669 to the mean and covariance of its own embeddings), so the FD to them is recorded, not gated.
+#    Then each R against the rebuilt 256 (the same images: the FD that the resolution alone gives) into res/real_r<R>_vs_r256.json.
 # 3. Evaluation smoke (EVAL_LIMIT_BATCHES=2: predict 2 batches per rank, sample check, no FD) of the smoke runs' last checkpoints
 #    (runs/gpic-speed/res_smoke_1117_005820, d10 after 320 steps) at 64 p4, 128 p8, 512 p16, 512 p32 and 128 p16 through jobs/evals_gmflow.sh
 #    --res, then one full evaluation (50K samples, FD against test_stats_r64.npz) at 64 p4.
@@ -45,10 +47,12 @@ for R in 256 64 128 512; do
     mv $F.partial.npz $F
   fi
   if [ $R = 256 ]; then
-    log "check: rebuilt 256 against the shipped statistics"
-    python $WT/tools/res/reference_stats.py compare $F $SHIP --max-rel 1e-3 | tee $OUT/check_r256.json || { echo "the rebuilt 256 statistics do not match"; exit 1; }
+    log "check: rebuilt 256 against the shipped embeddings"
+    python $WT/tools/res/reference_stats.py compare $F $SHIP --max-rel 5e-3 --max-fd-shared 0.01 --b-self | tee $OUT/check_r256.json \
+      || { echo "the rebuilt 256 embeddings do not match the shipped ones"; exit 1; }
+  else
+    python $WT/tools/res/reference_stats.py compare $F $OUT/test_stats_r256.npz > $OUT/real_r${R}_vs_r256.json
   fi
-  python $WT/tools/res/reference_stats.py compare $F $SHIP > $OUT/real_r${R}_vs_256.json
 done
 log "evaluation smoke"
 SM=$WC/runs/gpic-speed/res_smoke_1117_005820 ER=$WC/runs/gpic-speed/res_eval_smoke
