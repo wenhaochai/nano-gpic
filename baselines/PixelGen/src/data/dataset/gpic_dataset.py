@@ -24,16 +24,21 @@ _GPU_RESIZE = os.environ.get("GPIC_MFU_GPU_RESIZE") == "1"
 # tests only (MFU parity runs): the grouping RNG and the sample shuffle seeded from the shard seed (production seeds them from
 # the PID and the clock), so two runs read the same batches and their per-step losses can be compared
 _DET = os.environ.get("GPIC_MFU_DET_DATA") == "1"
+# Resolution sweep (owner 2026-11-17, tmp/ladder_prof/res/PLAN.md): the crop size R of the training and evaluation transforms and of lever C's
+# crop plan; only the size changes (training: short side to a random size in [R, 1.25 R], a random R x R crop, no flip; evaluation: the centre
+# R x R). 256 = the ladder.
+RES = int(os.environ.get("GPIC_RES", "256"))
+assert RES in (64, 128, 256, 512), f"GPIC_RES={RES}"
 assert not _GPU_RESIZE or os.environ.get("GPIC_REGION_CROP") == "1", "GPIC_MFU_GPU_RESIZE needs GPIC_REGION_CROP=1"
 train_transform = T.Compose([
-    T.Lambda(lambda pil_image: _train_crop(pil_image, 256)),
+    T.Lambda(lambda pil_image: _train_crop(pil_image, RES)),
     T.ToTensor(),
     T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
 ])
 print(f"Defined train_transform function (from dataset.augmentation import {_train_crop.__name__}) :", train_transform)
 
 val_transform = T.Compose([
-        T.Lambda(lambda pil_image: center_crop_arr(pil_image, 256)),
+        T.Lambda(lambda pil_image: center_crop_arr(pil_image, RES)),
         T.ToTensor(),
         T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
@@ -531,7 +536,7 @@ class GPICWebDataset(IterableDataset):
                 img = _DECODE_PIL(k, sample[k]).convert("RGB")
                 if _GPU_RESIZE:
                     from .pil_exact import plan_region_crop
-                    src, passes = plan_region_crop(img, 256)
+                    src, passes = plan_region_crop(img, RES)
                     return np.ascontiguousarray(src), passes
                 return np.asarray(self._pre(img), dtype=np.uint8)
         raise ValueError("no image")
