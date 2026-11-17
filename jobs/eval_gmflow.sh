@@ -18,6 +18,9 @@
 # EVAL_SPREAD (image | pixel, default image: gm_spread of the model; the checkpoint must hold the per-pixel offset head if and only if it is pixel);
 # EVAL_DEVICES (default 8): the GPUs one evaluation uses, for prediction and for the FD (jobs/evals_gmflow.sh --par runs one evaluation per GPU).
 # EVAL_LIMIT_BATCHES (smoke test only: predict only that many batches per rank, keep the samples, skip the FD).
+# EVAL_RES, EVAL_PATCH (resolution sweep, tmp/ladder_prof/res/PLAN.md; default 256 and 16, the command line of before): the model's input size and patch,
+# the noise tensor [3, R, R] (the official noise: one tensor per resolution), and the reference: test_stats.npz at 256, else
+# data/gpic/reference_stats/res/test_stats_r<R>.npz (the same 50K test images, cropped by the toolkit's resize_center_crop at R; jobs/res_reference_stats.sh).
 # EVAL_NOISE (official | prompt, default official; owner 2026-11-06: the official evaluation setup, except that CFG stays 1): official is the official noise, one
 # noise tensor for all prompts (gpic_jsonl_dataset noise_per_prompt false), and adds _official to the output directory; prompt is each prompt's own noise, the
 # protocol of every result before 2026-11-06, with the old directory names.
@@ -48,6 +51,16 @@ case $SPREAD in image|pixel) ;; *) echo "EVAL_SPREAD must be image or pixel"; ex
 NOISE=${EVAL_NOISE:-official}
 case $NOISE in official) NPP=false NTAG=official ;; prompt) NPP=true NTAG="" ;; *) echo "EVAL_NOISE must be official or prompt"; exit 2 ;; esac
 if [ $K -eq 0 ] && [ $SPREAD = pixel ]; then echo "the per-pixel spread needs a mixture (K > 0)"; exit 2; fi
+RES=${EVAL_RES:-256} PATCH=${EVAL_PATCH:-16}
+[[ $RES =~ ^(64|128|256|512)$ ]] || { echo "EVAL_RES must be 64, 128, 256 or 512"; exit 2; }
+[[ $PATCH =~ ^(4|8|16|32)$ ]] && [ $((RES % PATCH)) -eq 0 ] || { echo "EVAL_PATCH must be 4, 8, 16 or 32 and divide EVAL_RES"; exit 2; }
+REF=$WC/data/gpic/reference_stats/test_stats.npz
+[ $RES = 256 ] || REF=$WC/data/gpic/reference_stats/res/test_stats_r$RES.npz
+[ -f $REF ] || { echo "no reference statistics $REF (jobs/res_reference_stats.sh)"; exit 2; }
+RES_ARGS=()   # 256 / 16: the command line of before
+[ $RES = 256 ] && [ $PATCH = 16 ] || RES_ARGS=(--model.denoiser.init_args.input_size $RES --model.denoiser.init_args.patch_size $PATCH
+                                              --data.pred_dataset.init_args.latent_shape "[3, $RES, $RES]")
+SHM_NEED=$(( RES > 256 ? 40 * RES * RES / 65536 : 40 ))   # GB free in /dev/shm before samples go there: 40 at 256 (9.8 GB of samples), x4 at 512
 SUBSTEPS=$(( (128 + CALLS - 1) / CALLS )); [ $SUBSTEPS -ge 2 ] || SUBSTEPS=2
 NSUF=""
 if [ -n "${EVAL_SUBSTEPS:-}" ]; then
@@ -97,21 +110,24 @@ if [ $SAMPLER = gm_ode_cal ]; then   # the table belongs to this checkpoint and 
   python -m src.diffusion.flow_matching.gm_spread check "$TABLE" $STEP $CALLS || exit 2
 fi
 # the checkpoint loads with strict=False, so a wrong head or size would give a wrong FD and no error
-python - "$CKPT" $K $WD $NB $NT $SPREAD <<'PY'
+python - "$CKPT" $K $WD $NB $NT $SPREAD $RES $PATCH <<'PY'
 import re, sys, torch
 sd = torch.load(sys.argv[1], map_location="cpu", mmap=True, weights_only=False)["state_dict"]
 k, d, nb, nt = map(int, sys.argv[2:6])
 spread = sys.argv[6]
+res, patch = map(int, sys.argv[7:9])
+pe = sd["ema_denoiser.pos_embed"].shape[1]
+assert pe == (res // patch) ** 2, f"checkpoint has {pe} image tokens, EVAL_RES / EVAL_PATCH give {(res // patch) ** 2}"
 out = sd["ema_denoiser.final_layer.linear.weight"].shape[0]
 n = lambda part: len({m.group(1) for key in sd for m in [re.match(rf"ema_denoiser\.{part}\.(\d+)\.", key)] if m})
 got = (sd["ema_denoiser.y_pos_embedding"].shape[-1], n("blocks"), n("text_refine_blocks"))
 assert got == (d, nb, nt), f"checkpoint has d, nb, nt = {got}, arguments {(d, nb, nt)}"
-assert out == (k * 4 * 256 if k else 768), f"final layer has {out} outputs, K = {k}"
+assert out == (k * 4 * patch ** 2 if k else 3 * patch ** 2), f"final layer has {out} outputs, K = {k}, patch {patch}"
 assert any(n.startswith("ema_denoiser.gm_logstd") for n in sd) == (k > 0), "s-MLP presence does not match K"
 assert ("ema_denoiser.gm_spread_head.weight" in sd) == (spread == "pixel"), f"per-pixel offset head presence does not match EVAL_SPREAD={spread}"
 PY
 mkdir -p $OUT
-echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K spread=$SPREAD sampler=$SAMPLER calls=$CALLS substeps=$SUBSTEPS noise=$NOISE" | tee $OUT/ckpt.txt
+echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K spread=$SPREAD sampler=$SAMPLER calls=$CALLS substeps=$SUBSTEPS noise=$NOISE res=$RES patch=$PATCH ref=$REF" | tee $OUT/ckpt.txt
 [ $SAMPLER != gm_ode_cal ] || { echo "spread_table=$TABLE sha1=$(sha1sum < "$TABLE" | cut -c1-40)" | tee -a $OUT/ckpt.txt; cp "$TABLE" $OUT/spread_table.json; }
 SPREAD_ARGS=(); [ $SPREAD = image ] || SPREAD_ARGS=(--model.denoiser.init_args.gm_spread $SPREAD)   # image: the command line of before this option
 LIMIT=(); [ -z "${EVAL_LIMIT_BATCHES:-}" ] || LIMIT=(--trainer.limit_predict_batches $EVAL_LIMIT_BATCHES)
@@ -125,10 +141,10 @@ export GPIC_EVAL_TE_EAGER=1
 export GPIC_EVAL_SAMPLES_NPY=1 NCCL_NVLS_ENABLE=0
 PRED_ROOT=$OUT/pred
 if [ $PHASE = predict ]; then   # the samples must outlive this script: node memory only in the caller's EVAL_SHM_ROOT (removed by the
-  if [ -d "${EVAL_SHM_ROOT:-}" ] && [ "$(df --output=avail -BG /dev/shm | tail -1 | tr -dc 0-9)" -gt 40 ]; then   # score phase, and at the caller's exit)
+  if [ -d "${EVAL_SHM_ROOT:-}" ] && [ "$(df --output=avail -BG /dev/shm | tail -1 | tr -dc 0-9)" -gt $SHM_NEED ]; then   # score phase, and at the caller's exit)
     SHM_DIR=$(mktemp -d $EVAL_SHM_ROOT/task_XXXXXX); PRED_ROOT=$SHM_DIR/pred
   fi
-elif [ -d /dev/shm ] && [ "$(df --output=avail -BG /dev/shm | tail -1 | tr -dc 0-9)" -gt 40 ]; then
+elif [ -d /dev/shm ] && [ "$(df --output=avail -BG /dev/shm | tail -1 | tr -dc 0-9)" -gt $SHM_NEED ]; then
   find /dev/shm -maxdepth 1 -name 'gpic_eval_*' -user "$USER" -mmin +120 -exec rm -rf {} + 2>/dev/null || true
   SHM_DIR=$(mktemp -d /dev/shm/gpic_eval_XXXXXX)
   _prev_exit_cmd=$(trap -p EXIT | sed -E "s/^trap -- '(.*)' EXIT$/\1/; s/'\\\\''/'/g")
@@ -141,7 +157,7 @@ WANDB_MODE=disabled python main.py predict --config configs_h100/lite_ladder_sam
   --trainer.default_root_dir "$PRED_ROOT" --ckpt_path "$CKPT" --model.diffusion_sampler.init_args.num_steps $CALLS \
   --model.denoiser.init_args.hidden_size $WD --model.denoiser.init_args.num_groups $((WD / 64)) \
   --model.denoiser.init_args.num_blocks $NB --model.denoiser.init_args.num_text_blocks $NT --model.denoiser.init_args.gm_k $K "${SPREAD_ARGS[@]}" \
-  --data.pred_dataset.init_args.noise_per_prompt $NPP "${LIMIT[@]}" > $OUT/predict.log 2>&1
+  --data.pred_dataset.init_args.noise_per_prompt $NPP "${RES_ARGS[@]}" "${LIMIT[@]}" > $OUT/predict.log 2>&1
 t1=$(date +%s)
 NPZ=$(find "$PRED_ROOT" -name "output.np[yz]" | head -1)
 [ -n "$NPZ" ] || { echo "no output.npy or output.npz"; exit 4; }
@@ -187,13 +203,13 @@ IFD=$(mktemp -d)
       > $OUT/inception_shard$s.log 2>&1 & pids+=($!)
   done
   for p in "${pids[@]}"; do wait $p || ok=0; done
-  if [ $ok = 1 ] && $WC/envs/gpic-eval-tf/bin/python $WT/tools/official_inception_sharded.py metrics $WC/data/gpic/reference_stats/test_stats.npz \
+  if [ $ok = 1 ] && $WC/envs/gpic-eval-tf/bin/python $WT/tools/official_inception_sharded.py metrics $REF \
        $OUT/metrics_inception.json $(for s in $(seq 0 $((NIS - 1))); do echo $IFD/f$s.npy; done) > $OUT/inception.log 2>&1; then :
   else echo "inception metrics failed (see $OUT/inception*.log)"; fi
   rm -rf "$IFD"; date +%s > $OUT/.inception_end ) &
 IPID=$!
 if ! python -m torch.distributed.run --standalone --nproc_per_node ${EVAL_DEVICES:-8} $WT/tools/fast_eval.py "$NPZ" \
-  $WC/data/gpic/reference_stats/test_stats.npz $OUT/metrics.json --workers ${EVAL_FAST_WORKERS:-6} > $OUT/eval.log 2>&1; then   # 6 x 8 ranks (was 11): the Inception pass beside it starved for CPU (58 -> 100 s)
+  $REF $OUT/metrics.json --workers ${EVAL_FAST_WORKERS:-6} > $OUT/eval.log 2>&1; then   # 6 x 8 ranks (was 11): the Inception pass beside it starved for CPU (58 -> 100 s)
   kill $IPID 2>/dev/null || true; wait $IPID 2>/dev/null || true; exit 1
 fi
 t2=$(date +%s)

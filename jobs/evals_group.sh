@@ -26,16 +26,18 @@ WC=/scratch/gpfs/GROUP/USER
 source $WC/project/gpic/jobs/env.sh
 WTN=eval_official_run11
 if [ "$1" = "--wt" ]; then WTN=$2; shift 2; [[ $WTN =~ ^[A-Za-z0-9_-]+$ ]] || { echo "--wt takes a worktree name under gpic-wt/"; exit 2; }; fi
-[ $# -ge 1 ] || { echo "usage: evals_group.sh [--wt <worktree>] <rel>:<size>:<d>:<nb>:<nt>:<step> ..."; exit 2; }
+[ $# -ge 1 ] || { echo "usage: evals_group.sh [--wt <worktree>] <rel>:<size>:<d>:<nb>:<nt>:<step>[:<res>:<patch>] ..."; exit 2; }
 WT=$WC/project/gpic-wt/$WTN
 [ -z "$(git -C $WT status --porcelain --untracked-files=no)" ] || { echo "$WT has local changes"; exit 2; }
 SHA=$(git -C $WT rev-parse HEAD)
 R=$WC/runs/gpic-speed
-TASK=() REL=() SZ=() D=() NB=() NT=() ST=() SRC=() RAW=() OUTD=()
+TASK=() REL=() SZ=() D=() NB=() NT=() ST=() RP=() SRC=() RAW=() OUTD=()
 for t in "$@"; do   # every task is checked before any GPU work
-  IFS=: read -r rel sz d nb nt st extra <<< "$t"
+  IFS=: read -r rel sz d nb nt st res patch extra <<< "$t"
   [[ -z "$extra" && $rel =~ ^[A-Za-z0-9_.+-]+(/[A-Za-z0-9_.+-]+)*$ && $sz =~ ^[A-Za-z0-9_-]+$ && $d =~ ^[0-9]+$ && $nb =~ ^[0-9]+$ && $nt =~ ^[0-9]+$ && $st =~ ^[0-9]+$ ]] \
-    || { echo "task $t is not <rel>:<size>:<d>:<nb>:<nt>:<step>"; exit 2; }
+    || { echo "task $t is not <rel>:<size>:<d>:<nb>:<nt>:<step>[:<res>:<patch>]"; exit 2; }
+  [[ -z "$res$patch" || ( $res =~ ^(64|128|256|512)$ && $patch =~ ^(4|8|16|32)$ ) ]] || { echo "task $t: <res>:<patch> must be <64|128|256|512>:<4|8|16|32>"; exit 2; }
+  RP+=("${res:+$res:$patch}")   # resolution sweep (eval_gmflow.sh EVAL_RES, EVAL_PATCH); empty = 256:16
   s6=$(printf %06d $((10#$st)))
   TASK+=("$t") REL+=($rel) SZ+=($sz) D+=($d) NB+=($nb) NT+=($nt) ST+=($((10#$st)))
   SRC+=($R/$rel/exp_ladder_$sz/ms-step=$s6.ckpt) RAW+=($R/raw_view/$rel/exp_ladder_$sz/ms-step=$s6.ckpt)
@@ -74,7 +76,8 @@ chain_next() {   # the next task whose raw view is ready; a missing checkpoint o
   CHAIN_I=-1
 }
 chain_cmd() {   # <phase> <i>
-  EVAL_PHASE=$1 bash $WT/jobs/evals_gmflow.sh 0 ${SZ[$2]} ${D[$2]} ${NB[$2]} ${NT[$2]} $R/raw_view/${REL[$2]} --wt $WTN ${ST[$2]}:euler:50
+  local ra=(); [ -z "${RP[$2]}" ] || ra=(--res ${RP[$2]})
+  EVAL_PHASE=$1 bash $WT/jobs/evals_gmflow.sh 0 ${SZ[$2]} ${D[$2]} ${NB[$2]} ${NT[$2]} $R/raw_view/${REL[$2]} --wt $WTN "${ra[@]}" ${ST[$2]}:euler:50
 }
 source $WT/jobs/eval_chain_lib.sh
 chain_run

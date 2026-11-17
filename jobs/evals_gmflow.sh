@@ -11,7 +11,7 @@
 # official noise (--noise below), EMA, no CFG. Finished tasks are skipped, so a rerun does only the rest.
 # K = 0 evaluates a point model. --link <run dir> links that run's ms checkpoints into <root>/exp_ladder_<size>, so nothing is written in its directory (the ladder's
 # own evaluations, official noise and Euler at 50 steps, have no other call counts, so the ladder's checkpoints are evaluated again here).
-# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--par] <step:sampler:calls[:substeps]> ...
+# usage: evals_gmflow.sh <K> <size> <d> <nb> <nt> <root> [--link <run dir>] [--wt <worktree>] [--spread pixel] [--table <json>] [--noise official|prompt] [--res <R>:<patch>] [--par] <step:sampler:calls[:substeps]> ...
 # --par: one evaluation per GPU, 8 side by side (EVAL_DEVICES=1), for short evaluations whose sampling is a small part of the time.
 # --noise: official (the default since 2026-11-06, owner: the official evaluation setup except CFG = 1; one noise for all prompts, directories end in _official) or
 # prompt (each prompt's own noise, the protocol of every result before; the old directory names); eval_gmflow.sh EVAL_NOISE.
@@ -34,6 +34,11 @@ if [ "$1" = "--table" ]; then TABLE=$2; shift 2; [ -f "$TABLE" ] || { echo "no t
 NOISE=official
 if [ "$1" = "--noise" ]; then NOISE=$2; shift 2; case $NOISE in official|prompt) ;; *) echo "--noise must be official or prompt"; exit 2 ;; esac; fi
 NTAG=""; [ $NOISE = prompt ] || NTAG=official
+RES=256 PATCH=16   # --res <R>:<patch> (resolution sweep): eval_gmflow.sh EVAL_RES and EVAL_PATCH; the run directory tells runs apart, so output names stay
+if [ "$1" = "--res" ]; then
+  [[ $2 =~ ^(64|128|256|512):(4|8|16|32)$ ]] || { echo "--res takes <64|128|256|512>:<4|8|16|32>"; exit 2; }
+  RES=${2%%:*} PATCH=${2#*:}; shift 2
+fi
 PAR=0
 if [ "$1" = "--par" ]; then PAR=1; shift; fi
 [ $# -ge 1 ] || { echo "no tasks"; exit 2; }
@@ -57,7 +62,7 @@ for t in "$@"; do
   fi
 done
 [ -f $ROOT/commit.txt ] || echo $SHA > $ROOT/commit.txt
-export GMFLOW_WT=$WT LADDER_RUN_ROOT=$ROOT EVAL_SIZE=$SIZE EVAL_D=$WD EVAL_NB=$NB EVAL_NT=$NT EVAL_SPREAD=$SPREAD EVAL_NOISE=$NOISE
+export GMFLOW_WT=$WT LADDER_RUN_ROOT=$ROOT EVAL_SIZE=$SIZE EVAL_D=$WD EVAL_NB=$NB EVAL_NT=$NT EVAL_SPREAD=$SPREAD EVAL_NOISE=$NOISE EVAL_RES=$RES EVAL_PATCH=$PATCH
 run_task() {   # <task>: one evaluation, skipped if it has its metrics.json; returns its exit status
   local t=$1 STEP rest S C N D LOG
   STEP=${t%%:*} rest=${t#*:}; S=${rest%%:*} C=${rest#*:}
