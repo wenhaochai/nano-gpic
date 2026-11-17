@@ -75,7 +75,10 @@ TRAIN_EMB = os.path.join(WC, "data/gpic/train_emb_qwen3_1.7b")
 OUT_DIR = os.path.join(WC, "tmp", "heldout_loss")
 NUM_T, SEED, BATCH = 16, 0, 128
 SPLITS = ("val", "train", "train_reenc")
-IMAGE, PAD_MULTIPLE, TEXT_MAX, EMB_DIM = 256, 8, 320, 2048
+# resolution sweep (genmodel 2026-11-17, tmp/ladder_prof/res/PLAN.md): GPIC_RES sets the centre crop of the prepared images (default 256, the
+# ladder); the prep file of another size carries _r<R> in its name, and a checkpoint is scored only on images of its own input size
+IMAGE, PAD_MULTIPLE, TEXT_MAX, EMB_DIM = int(os.environ.get("GPIC_RES", "256")), 8, 320, 2048
+assert IMAGE in (64, 128, 256, 512), f"GPIC_RES={IMAGE}"
 IMAGE_SUFFIXES = ("jpg", "jpeg", "png", "webp")
 WEIGHTS = (("ema", "ema_denoiser."), ("raw", "denoiser."))
 GLOBAL_BATCH = 256   # images per optimizer step in both ladders (8 GPUs x 32)
@@ -153,7 +156,8 @@ def text_batch(split, idx, device):
 
 
 def data_path(n_val, n_train):
-    return os.path.join(OUT_DIR, f"data_v1_val{n_val}_train{n_train}_{os.path.basename(TRAIN_SHARD)[11:16]}.pt")
+    return os.path.join(OUT_DIR, f"data_v1_val{n_val}_train{n_train}_{os.path.basename(TRAIN_SHARD)[11:16]}"
+                                 f"{'' if IMAGE == 256 else f'_r{IMAGE}'}.pt")
 
 
 def pack_split(samples_or_none, img, embs, extra):
@@ -612,7 +616,11 @@ def run_task(spec, weights, data, a, device):
     load_s = time.time() - t0
     log(f"loaded {','.join(nets)}{' (the EMA slot holds the same bytes: one pass)' if one_pass else ''} in {load_s:.0f} s")
     autocast = torch.device(device).type == "cuda"
-    res = {s: evaluate(nets, tr, data[s], ts, SEED, a.batch, device, autocast, a.threads, log=lambda m, s=s: log(f"{s} {m}"))
+    # resolution sweep: the images must be the checkpoint's input size, and the forward batch keeps --batch x 256 image tokens
+    assert kw.get("input_size", 256) == IMAGE, f"{spec['ckpt']}: input_size {kw.get('input_size')} but GPIC_RES={IMAGE}"
+    tokens = (IMAGE // kw.get("patch_size", 16)) ** 2
+    batch = max(1, a.batch * 256 // tokens)
+    res = {s: evaluate(nets, tr, data[s], ts, SEED, batch, device, autocast, a.threads, log=lambda m, s=s: log(f"{s} {m}"))
            for s in a.splits}
     elapsed = time.time() - t0
     gpu = torch.cuda.get_device_name(device) if autocast else "cpu"
@@ -623,6 +631,10 @@ def run_task(spec, weights, data, a, device):
         r.update(weights=w, n_val=a.n_val, n_train=a.n_train, num_t=NUM_T, seed=SEED, data=data["tag"],
                  train_shard=os.path.basename(data["train_shard"]), t=ts.tolist(),
                  d=kw["hidden_size"], nb=kw["num_blocks"], nt=kw["num_text_blocks"])
+        if IMAGE != 256 or kw.get("patch_size", 16) != 16:   # resolution sweep: C = 6 N D, N = 18 nb d^2, D = steps x 262,144 image tokens
+            r.update(res=IMAGE, patch=kw.get("patch_size", 16), tokens_per_image=tokens,
+                     train_flops=6.0 * 18 * kw["num_blocks"] * kw["hidden_size"] ** 2 * spec["step"] * 262144,
+                     flops_source="6ND, N = 18 nb d^2, D = steps x 262,144 image tokens (resolution sweep)")
         for s in a.splits:
             lm, im = (res[s]["raw" if one_pass else w][k] for k in ("level_mean", "image_mean"))
             r[f"loss_{s}"] = float(lm.mean())
