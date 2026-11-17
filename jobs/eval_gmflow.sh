@@ -56,6 +56,18 @@ RES=${EVAL_RES:-256} PATCH=${EVAL_PATCH:-16}
 [[ $PATCH =~ ^(4|8|16|32)$ ]] && [ $((RES % PATCH)) -eq 0 ] || { echo "EVAL_PATCH must be 4, 8, 16 or 32 and divide EVAL_RES"; exit 2; }
 REF=$WC/data/gpic/reference_stats/test_stats.npz
 [ $RES = 256 ] || REF=$WC/data/gpic/reference_stats/res/test_stats_r$RES.npz
+# EVAL_REFSET (shipped | rebuilt, default shipped; owner popup 2026-11-17): rebuilt scores a 256 evaluation against res/test_stats_r256.npz, the
+# statistics of the same 49,987 stored test images that 64/128/512 use (the shipped file's mu and sigma come from other images: FD 7.50 DINOv2,
+# 0.669 Inception to its own embeddings), into a directory with _rebuiltref after the noise tag, so the official result stays as it is.
+case ${EVAL_REFSET:-shipped} in
+  shipped) ;;
+  rebuilt) [ $RES = 256 ] || { echo "EVAL_REFSET=rebuilt is for 256: the other sizes use the rebuilt statistics already"; exit 2; }
+           REF=$WC/data/gpic/reference_stats/res/test_stats_r256.npz NTAG=${NTAG:+${NTAG}_}rebuiltref ;;
+  *) echo "EVAL_REFSET must be shipped or rebuilt"; exit 2 ;;
+esac
+# EVAL_SAVE_FEATURES=1 (owner popup 2026-11-17): keep the samples' DINOv2 features (features/dino.npy, image order) and Inception features
+# (features/inception_shard<s>.npy, the shards in order) beside metrics.json, about 0.6 GB, so a later re-scoring needs no new sampling.
+FEAT=""; [ "${EVAL_SAVE_FEATURES:-0}" != 1 ] || FEAT=1
 [ -f $REF ] || { echo "no reference statistics $REF (jobs/res_reference_stats.sh)"; exit 2; }
 RES_ARGS=()   # 256 / 16: the command line of before
 [ $RES = 256 ] && [ $PATCH = 16 ] || RES_ARGS=(--model.denoiser.init_args.input_size $RES --model.denoiser.init_args.patch_size $PATCH
@@ -196,6 +208,7 @@ fi
 # the same batches and features as the one-GPU pass), then the same metric code on the joined features.
 IFS=, read -ra IGA <<< "${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"; NIS=${#IGA[@]}
 IFD=$(mktemp -d)
+[ -z "$FEAT" ] || mkdir -p $OUT/features
 ( export XDG_CACHE_HOME=$WC/cache/gpic_eval_xdg TF_FORCE_GPU_ALLOW_GROWTH=true
   ok=1; pids=()
   for s in $(seq 0 $((NIS - 1))); do
@@ -206,10 +219,11 @@ IFD=$(mktemp -d)
   if [ $ok = 1 ] && $WC/envs/gpic-eval-tf/bin/python $WT/tools/official_inception_sharded.py metrics $REF \
        $OUT/metrics_inception.json $(for s in $(seq 0 $((NIS - 1))); do echo $IFD/f$s.npy; done) > $OUT/inception.log 2>&1; then :
   else echo "inception metrics failed (see $OUT/inception*.log)"; fi
+  if [ -n "$FEAT" ] && [ $ok = 1 ]; then for s in $(seq 0 $((NIS - 1))); do cp $IFD/f$s.npy $OUT/features/inception_shard$s.npy; done; fi
   rm -rf "$IFD"; date +%s > $OUT/.inception_end ) &
 IPID=$!
 if ! python -m torch.distributed.run --standalone --nproc_per_node ${EVAL_DEVICES:-8} $WT/tools/fast_eval.py "$NPZ" \
-  $REF $OUT/metrics.json --workers ${EVAL_FAST_WORKERS:-6} > $OUT/eval.log 2>&1; then   # 6 x 8 ranks (was 11): the Inception pass beside it starved for CPU (58 -> 100 s)
+  $REF $OUT/metrics.json --workers ${EVAL_FAST_WORKERS:-6} ${FEAT:+--save-features $OUT/features/dino.npy} > $OUT/eval.log 2>&1; then   # 6 x 8 ranks (was 11): the Inception pass beside it starved for CPU (58 -> 100 s)
   kill $IPID 2>/dev/null || true; wait $IPID 2>/dev/null || true; exit 1
 fi
 t2=$(date +%s)

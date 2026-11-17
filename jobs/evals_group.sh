@@ -32,6 +32,7 @@ WT=$WC/project/gpic-wt/$WTN
 SHA=$(git -C $WT rev-parse HEAD)
 R=$WC/runs/gpic-speed
 TASK=() REL=() SZ=() D=() NB=() NT=() ST=() RP=() SRC=() RAW=() OUTD=()
+RTAG=""; [ "${EVAL_REFSET:-shipped}" != rebuilt ] || RTAG=_rebuiltref   # eval_gmflow.sh EVAL_REFSET (environment): its directory name
 for t in "$@"; do   # every task is checked before any GPU work
   IFS=: read -r rel sz d nb nt st res patch extra <<< "$t"
   [[ -z "$extra" && $rel =~ ^[A-Za-z0-9_.+-]+(/[A-Za-z0-9_.+-]+)*$ && $sz =~ ^[A-Za-z0-9_-]+$ && $d =~ ^[0-9]+$ && $nb =~ ^[0-9]+$ && $nt =~ ^[0-9]+$ && $st =~ ^[0-9]+$ ]] \
@@ -41,7 +42,7 @@ for t in "$@"; do   # every task is checked before any GPU work
   s6=$(printf %06d $((10#$st)))
   TASK+=("$t") REL+=($rel) SZ+=($sz) D+=($d) NB+=($nb) NT+=($nt) ST+=($((10#$st)))
   SRC+=($R/$rel/exp_ladder_$sz/ms-step=$s6.ckpt) RAW+=($R/raw_view/$rel/exp_ladder_$sz/ms-step=$s6.ckpt)
-  OUTD+=($R/raw_view/$rel/exp_ladder_$sz/eval_${s6}_euler_calls50_official)   # evals_gmflow.sh eval_dir with the official noise
+  OUTD+=($R/raw_view/$rel/exp_ladder_$sz/eval_${s6}_euler_calls50_official$RTAG)   # evals_gmflow.sh eval_dir with the official noise (and EVAL_REFSET)
 done
 N=${#TASK[@]}
 MK=$(mktemp -d)   # per task: ok, missing or failed, written by the raw-view loop below

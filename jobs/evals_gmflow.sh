@@ -34,6 +34,7 @@ if [ "$1" = "--table" ]; then TABLE=$2; shift 2; [ -f "$TABLE" ] || { echo "no t
 NOISE=official
 if [ "$1" = "--noise" ]; then NOISE=$2; shift 2; case $NOISE in official|prompt) ;; *) echo "--noise must be official or prompt"; exit 2 ;; esac; fi
 NTAG=""; [ $NOISE = prompt ] || NTAG=official
+[ "${EVAL_REFSET:-shipped}" != rebuilt ] || NTAG=${NTAG:+${NTAG}_}rebuiltref   # eval_gmflow.sh EVAL_REFSET: the same directory name
 RES=256 PATCH=16   # --res <R>:<patch> (resolution sweep): eval_gmflow.sh EVAL_RES and EVAL_PATCH; the run directory tells runs apart, so output names stay
 if [ "$1" = "--res" ]; then
   [[ $2 =~ ^(64|128|256|512):(4|8|16|32)$ ]] || { echo "--res takes <64|128|256|512>:<4|8|16|32>"; exit 2; }
