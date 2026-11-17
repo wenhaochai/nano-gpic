@@ -6,7 +6,7 @@ The code of the post [How to Scale Text-to-image Models: a Handbook](https://wen
 
 Every run of the post, with its training logs and the commit it ran on, is on the [experiment page](https://wenhaochai.com/exps/gpic-speed.html); the logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed). This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026), whose model and trainer come from [PixelGen](https://github.com/Zehong-Ma/PixelGen) (Ma et al.); the parts of both that the ladder does not use are left out.
 
-*Updated 2026-11-15.*
+*Updated 2026-11-17.*
 
 ## The final ladder
 
@@ -120,4 +120,4 @@ Each setting of the recipe, and where the post shows its evidence:
 | `tools/download_*.py`, `tools/encode_captions.py`, `tools/check_text_cache.py` | GPIC and the captions' text features (`docs/text_cache.md`) |
 | `baselines/PixelGen/` | the model and the trainer (PixelGen's JiT-T2I with the ladder's changes); configs in `configs_h100/` |
 
-The experiment page links every run to the commit it ran on. Research lines have their own branches: `gmflow` and `gmflow-ladder` (a Gaussian mixture of the velocity), `artm-ladder` and `ar` (autoregressive variants), `dist-step`, `energy-head`, `implicit-nodrop`, and `moe`, `moe-run2-noise-eval`, `moe-run3-ewd` (mixtures of experts). The speed work is on `mfu`; the first Muon ladder and its experiments are in the history of `main` and on `muon-search2`.
+The experiment page links every run to the commit it ran on. Research lines have their own branches: `gmflow` and `gmflow-ladder` (a Gaussian mixture of the velocity), `artm-ladder` and `ar` (autoregressive variants), `dist-step`, `energy-head`, `implicit-nodrop`, `moe`, `moe-run2-noise-eval`, `moe-run3-ewd` (mixtures of experts), and `res-sweep` with `heldout-res` and `eval-res` (the ladder trained and scored at 64, 128 and 512 pixels). The speed work is on `mfu`; the first Muon ladder and its experiments are in the history of `main` and on `muon-search2`.
