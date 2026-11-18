@@ -4,11 +4,14 @@
 # recipe: Muon for the matrices, AdamW for the rest; Muon lr 1.36e-2 x (C / 3.6e18)^-0.5; AdamW lr 6.4e-4 x (parameters / 109.4M)^-0.547;
 # Muon weight decay 5 / (Muon lr x steps), AdamW 0; batch 1024 images; warmup over the first 1% of the steps and a linear decay to 3e-5
 # over the last 50%; no EMA (the raw weights are scored); GPIC Full, one seeded shard order per pass.
-# jobs/final_ladder_sizes.sh holds the values of the post's seven runs (W&B reself/gpic-speed); this script passes them to
-# jobs/train_ladder.sh with the speed settings those runs used (FSDP2 from width 1280, fused norms, FlashAttention 3).
-# One 8-GPU node per run. Started again with the same arguments, a run resumes from its newest last*.ckpt.
+# jobs/final_ladder_sizes.sh holds the values of the post's seven runs (W&B reself/gpic-speed) and of the next rungs d24, d26 and d28
+# (issues #1-#3); this script passes them to jobs/train_ladder.sh with the speed settings those runs used (FSDP2 from width 1280, fused
+# norms, FlashAttention 3). d10-d18: one 8-GPU node per run, batch 1024. d24, d26, d28: batch 2048, 4096, 6144 over 128, 256, 384 GPUs
+# (16 images per GPU, no accumulation); the launch across nodes is the caller's: GPIC_GPUS gives the GPU count it starts (default: the
+# table's), and main.py arguments such as --trainer.num_nodes go after the size. Started again with the same arguments, a run resumes from
+# its newest last*.ckpt.
 #
-# usage: GPIC_WC=<work root> bash jobs/final_ladder.sh <d10|d11|d12|d13|d14|d16|d18> [main.py arguments...]
+# usage: GPIC_WC=<work root> bash jobs/final_ladder.sh <d10|d11|d12|d13|d14|d16|d18|d24|d26|d28> [main.py arguments...]
 #   <work root>/data/gpic/train/      GPIC Full's 8,000 training shards gpic_train_00000.tar ... gpic_train_07999.tar
 #   <work root>/data/gpic/val/        the validation shards gpic_val_*.tar
 #   <work root>/data/gpic/train_emb_qwen3_1.7b/   the captions' Qwen3-1.7B features (jobs/encode_captions.sh)
@@ -18,16 +21,19 @@
 #   Extra arguments go to main.py after the recipe's, e.g. --trainer.max_steps 320 for a short test (the schedule keeps the full
 #   run's length; set LADDER_PARTIAL_OK=1 so that a launch stopped early counts as done).
 set -eo pipefail
-SIZE=${1:?usage: final_ladder.sh <d10|d11|d12|d13|d14|d16|d18> [main.py arguments...]}; shift
+SIZE=${1:?usage: final_ladder.sh <d10|d11|d12|d13|d14|d16|d18|d24|d26|d28> [main.py arguments...]}; shift
 HERE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 WC=${GPIC_WC:?set GPIC_WC to the work root (see the usage above)}
 DATA=${GPIC_DATA:-$WC/data/gpic}
 source $HERE/jobs/final_ladder_sizes.sh
 final_ladder_size $SIZE || { echo "unknown size $SIZE: $FINAL_LADDER_SIZES"; exit 2; }
 for d in train val train_emb_qwen3_1.7b; do [ -d "$DATA/$d" ] || { echo "missing $DATA/$d"; exit 2; }; done
-WU=$((S / 100)) CD=$((S / 2 / 32 * 32)) ACC=$((1024 / 8 / MB))
-# FSDP2 from width 1280 (width 1280 shards in groups of 7 blocks), DDP below it, as the post's runs
-case $D in 1280) FS=1 G=7 ;; 1536|1792) FS=1 G=1 ;; *) FS=0 G=1 ;; esac
+NGPU=${GPIC_GPUS:-$NG}   # the GPUs the batch is spread over (the caller's launch; the table's count by default)
+[ $((GB % (NGPU * MB))) -eq 0 ] || { echo "batch $GB does not split into $NGPU GPUs x $MB images per pass"; exit 2; }
+WU=$((S / 100)) CD=$((S / 2 / 32 * 32)) ACC=$((GB / NGPU / MB))
+# FSDP2 from width 1280 (width 1280 shards in groups of 7 blocks, wider ones block by block), DDP below it, as the post's runs and the
+# owner's d20-d24 runs (a model of 3B to 8B parameters does not fit on one GPU under DDP)
+case $D in 768|896|1024|1152) FS=0 G=1 ;; 1280) FS=1 G=7 ;; *) FS=1 G=1 ;; esac
 export GPIC_WC=$WC GPIC_REPO=$HERE GPIC_ENV_SH=$HERE/jobs/env.sh
 export GPIC_MFU_NO_EMA=1   # no EMA update: the checkpoints' EMA slot holds the raw weights
 export GPIC_MFU_FSDP=$FS GPIC_MFU_FSDP_GROUP=$G GPIC_MFU_FSDP_NOSYNC=1 GPIC_MFU_LOCAL_OPT=$FS GPIC_MFU_PATCHIFY=$FS \
