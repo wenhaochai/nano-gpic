@@ -56,6 +56,7 @@ fi
 case $D in 768|896|1024|1152) FS=0 G=1 ;; 1280) FS=1 G=7 ;; *) FS=1 G=1 ;; esac
 export GPIC_WC=$WC GPIC_REPO=$HERE GPIC_ENV_SH=$HERE/jobs/env.sh
 export GPIC_MFU_NO_EMA=1   # no EMA update: the checkpoints' EMA slot holds the raw weights
+export GPIC_RANK_SEED=$RS   # d24-d28: each rank its own noise levels and noise (jobs/final_ladder_sizes.sh)
 export GPIC_MFU_FSDP=$FS GPIC_MFU_FSDP_GROUP=$G GPIC_MFU_FSDP_NOSYNC=1 GPIC_MFU_LOCAL_OPT=$FS GPIC_MFU_PATCHIFY=$FS \
        GPIC_MFU_FUSED_NORM=1 GPIC_MFU_FUSED_QK=1 GPIC_MFU_NS_FUSED=1 GPIC_MFU_MUON_ADD=1
 export NCCL_NVLS_ENABLE=0   # NCCL 2.26's NVLS all-gather can permute rank blocks (NVIDIA/nccl #1906)
