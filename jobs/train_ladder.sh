@@ -104,10 +104,19 @@ if [ -n "$LASTCK" ]; then
 fi
 [ -s $SEEDF ] || date +%s > $SEEDF
 GPIC_SHARD_SEED=$(cat $SEEDF)
-for f in $RUN/shards_started_rank*.txt; do
-  [ -f "$f" ] || continue
-  awk -v T=$KEEP_T '$1 <= T' "$f" > "$f.tmp" && mv "$f.tmp" "$f" || { echo "cannot filter $f"; exit 2; }
-done
+# Across nodes (GPIC_NNODES from jobs/final_ladder.sh) every node runs this script on the same run directory: node 0 alone cuts the
+# shard log, then leaves a marker; the other nodes wait for it (two nodes rewriting one file through the same .tmp can lose lines).
+CUTF=$RUN/.shard_log_cut_${KEEP_T:-none}
+if [ "${NODE_RANK:-0}" = 0 ]; then
+  for f in $RUN/shards_started_rank*.txt; do
+    [ -f "$f" ] || continue
+    awk -v T=$KEEP_T '$1 <= T' "$f" > "$f.tmp" && mv "$f.tmp" "$f" || { echo "cannot filter $f"; exit 2; }
+  done
+  [ "${GPIC_NNODES:-1}" -gt 1 ] && touch "$CUTF"
+else
+  for i in $(seq 600); do [ -f "$CUTF" ] && break; sleep 1; done
+  [ -f "$CUTF" ] || { echo "node $NODE_RANK: node 0 did not cut the shard log within 600 s"; exit 2; }
+fi
 echo "$(date -u +%FT%TZ) shard seed $GPIC_SHARD_SEED, shard log kept up to $KEEP_T (checkpoint step $CK_STEP): $(cat $RUN/shards_started_rank*.txt 2>/dev/null | wc -l) lines" >> $RUN/launches.txt
 BENCH_CB=""
 # launch guard (top): the first-step marker, when this worktree has it
@@ -151,7 +160,9 @@ FSDP_CLS=lightning.pytorch.strategies.ModelParallelStrategy
 [ "$GPIC_MFU_FSDP_FLAT" = 1 ] && FSDP_CLS=src.utils.fsdp_setup.FlatModelParallelStrategy   # checkpoints keep the per-parameter keys
 # new ladders (global batch 1024 by accumulation): no FSDP2 reduce-scatter or reshard before the last micro-batch
 [ "${GPIC_MFU_FSDP_NOSYNC:-0}" = 1 ] && FSDP_CLS=src.utils.fsdp_setup.NoSyncModelParallelStrategy
-[ "$GPIC_MFU_FSDP" = 1 ] && MFU_ARGS+=(--trainer.strategy '{"class_path":"'$FSDP_CLS'","init_args":{"data_parallel_size":8,"tensor_parallel_size":1,"save_distributed_checkpoint":false}}')
+# GPIC_DP: the FSDP2 mesh spans every GPU of the run (jobs/final_ladder.sh sets it; 8 for one node). The model, ShardMuonAdamW and the
+# gradient clipping use one flat mesh over all ranks, so tensor parallelism stays 1.
+[ "$GPIC_MFU_FSDP" = 1 ] && MFU_ARGS+=(--trainer.strategy '{"class_path":"'$FSDP_CLS'","init_args":{"data_parallel_size":'${GPIC_DP:-8}',"tensor_parallel_size":1,"save_distributed_checkpoint":false}}')
 [ "$GPIC_MFU_ASYNC_CKPT" = 1 ] && MFU_ARGS+=(--trainer.plugins+='{"class_path":"src.plugins.async_ckpt_io.AsyncShmCheckpointIO"}')
 echo "$(date -u +%FT%TZ) MFU levers: attn=$GPIC_MFU_ATTN fsdp=$GPIC_MFU_FSDP gpu_resize=$GPIC_MFU_GPU_RESIZE uint8=$GPIC_MFU_UINT8 pack=$GPIC_MFU_PACK rebalance=$GPIC_MFU_REBALANCE async_ckpt=$GPIC_MFU_ASYNC_CKPT local_opt=$GPIC_MFU_LOCAL_OPT fsdp_group=$GPIC_MFU_FSDP_GROUP fsdp_flat=$GPIC_MFU_FSDP_FLAT fused_opt=$GPIC_MFU_FUSED_OPT fused_norm=$GPIC_MFU_FUSED_NORM fused_qk=$GPIC_MFU_FUSED_QK fp8=${GPIC_MFU_FP8:-none} fsdp_nosync=${GPIC_MFU_FSDP_NOSYNC:-0}" >> $RUN/launches.txt
 # the main thread spent 14.5% of its CPU time in glibc malloc; the threshold keeps tcmalloc's large-alloc report out of the log

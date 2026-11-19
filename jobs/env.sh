@@ -6,11 +6,14 @@ export JOBID=${FETCHED_JOB_ID:-${SLURM_JOB_ID:-}}
 # Per-job TMPDIR, removed at exit only by the shell that created it, and only when it is this job's own directory.
 # Without a job id (vis node, login shell) nothing is created or removed: on 2026-11-01 an empty JOBID turned
 # TMPDIR into $WC/tmp/job/ and the exit trap deleted every job's temporary directory for 7 minutes.
+# A run across nodes (GPIC_NNODES, jobs/final_ladder.sh) gets one directory per node, so the first node to exit does not delete the
+# directories (DataLoader sockets, gate files) of the nodes still running.
 if [ -n "$JOBID" ] && [ -z "${GPIC_TMP_OWNER:-}" ]; then
-  export TMPDIR=$WC/tmp/job/$JOBID
+  GPIC_TMP_SUB=$JOBID${GPIC_NNODES:+_node${NODE_RANK:-0}}
+  export TMPDIR=$WC/tmp/job/$GPIC_TMP_SUB
   mkdir -p "$TMPDIR"
   export GPIC_TMP_OWNER=$$ GPIC_TMP_DIR=$TMPDIR
-  trap 'if [ "${GPIC_TMP_OWNER:-}" = "$$" ] && [ -n "$JOBID" ] && [ "$GPIC_TMP_DIR" = "$WC/tmp/job/$JOBID" ]; then rm -rf -- "$GPIC_TMP_DIR"; fi' EXIT
+  trap 'if [ "${GPIC_TMP_OWNER:-}" = "$$" ] && [ -n "$JOBID" ] && [ "$GPIC_TMP_DIR" = "$WC/tmp/job/$GPIC_TMP_SUB" ]; then rm -rf -- "$GPIC_TMP_DIR"; fi' EXIT
 fi
 
 module load proxy/default 2>/dev/null || true
