@@ -30,7 +30,8 @@ Routes (route=):
 Gates (learned routes): expert e's output for token i is weighted G * sigmoid(s_ie) / sum of sigmoid(s_ij) over the token's
 selected experts, so the weights of a token sum to G (one dense layer's worth) whatever the number of experts it got.
 router_in: "mod" = the layer's input (normalized and modulated by the timestep); "plain" = the normalized token before the
-modulation plus the timestep embedding (Nucleus-Image's decoupled routing, 2604.12163).
+modulation plus the timestep embedding (Nucleus-Image's decoupled routing, 2604.12163); "modt" = the modulated input plus the timestep
+embedding (the router sees the noise level directly as well as through the modulation; owner 2026-11-19, router-input ablation).
 
 Statistics (training only) go to the non-persistent buffer moe_stat = [load per expert (n), boundary score per expert (n),
 dropped assignments, tokens, calls]; src/callbacks/moe_balance.py sums it over ranks, updates moe_bias / moe_thr and logs.
@@ -55,7 +56,7 @@ class MoEFeedForward(nn.Module):
                  t_edges=None, tokens=256, bias_rate=1e-3, lr_mult=1.0):
         super().__init__()
         assert route in ROUTES, route
-        assert router_in in ("mod", "plain"), router_in
+        assert router_in in ("mod", "plain", "modt"), router_in
         assert experts >= 1 and active >= 1 and (hidden_dim - shared_hidden) % active == 0, (hidden_dim, shared_hidden, active)
         self.dim, self.hidden_dim, self.n, self.G = dim, hidden_dim, experts, active
         self.h = (hidden_dim - shared_hidden) // active
@@ -185,7 +186,7 @@ class MoEFeedForward(nn.Module):
         return idx, gate, kept
 
     def _scores(self, x, xn, cond):
-        r = x if self.router_in == "mod" else xn + cond
+        r = x if self.router_in == "mod" else xn + cond if self.router_in == "plain" else x + cond
         with torch.autocast(device_type=x.device.type, enabled=False):
             s = F.linear(r.reshape(-1, self.dim).float(), self.router.weight.float())      # [M, n] fp32
         return s

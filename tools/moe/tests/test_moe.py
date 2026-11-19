@@ -258,7 +258,8 @@ check("8 JiT_T2I, 1 expert per block = dense (training, evaluation)", (a - b).ab
 # ---- 9. every option runs ----
 EDGES = [0.25, 0.5, 0.75]
 for kw in (dict(moe_route="tc"), dict(moe_route="ecb"), dict(moe_route="eci"), dict(moe_route="noise", moe_active=1, moe_t_edges=EDGES),
-           dict(moe_route="pos", moe_active=1), dict(moe_route="hash", moe_active=1), dict(moe_route="tc", moe_router_in="plain"),
+           dict(moe_route="pos", moe_active=1), dict(moe_route="hash", moe_active=1), dict(moe_route="tc", moe_router_in="plain"), dict(moe_route="tc", moe_router_in="modt"),
+           dict(moe_route="tc", moe_router_in="modt", moe_shared_hidden=128),
            dict(moe_route="tc", moe_shared_hidden=128), dict(moe_route="ecb", moe_first_dense=1), dict(moe_route="tc", moe_every=2)):
     net = JiT_T2I(**SMALL, moe_experts=4, **{"moe_active": 2, **kw})
     for p in net.final_layer.parameters():   # the final layer starts at zero: give the blocks a gradient
@@ -271,6 +272,21 @@ for kw in (dict(moe_route="tc"), dict(moe_route="ecb"), dict(moe_route="eci"), d
     ev = net.eval()(xi, ti, yi)
     check(f"9 {kw}: blocks {net.moe_blocks}", bool(torch.isfinite(out).all()) and bool(torch.isfinite(ev).all())
           and all(g_ is not None and bool(torch.isfinite(g_).all()) and float(g_.abs().max()) > 0 for g_ in gr))
+
+
+# ---- 10. router_in = modt: the router scores the modulated input plus the timestep embedding (owner 2026-11-19) ----
+lay_m = make("tc", n=8, G=2, router_in="mod"); lay_t = make("tc", n=8, G=2, router_in="modt"); lay_p = make("tc", n=8, G=2, router_in="plain")
+lay_t.router.weight.data.copy_(lay_m.router.weight.data); lay_p.router.weight.data.copy_(lay_m.router.weight.data)
+x10, c10, xn10 = torch.randn(2, 6, lay_m.dim), torch.randn(2, 1, lay_m.dim), torch.randn(2, 6, lay_m.dim)
+s_m, s_t, s_p = lay_m._scores(x10, None, c10), lay_t._scores(x10, None, c10), lay_p._scores(x10, xn10, c10)
+want = torch.nn.functional.linear((x10 + c10).reshape(-1, lay_m.dim), lay_m.router.weight)
+check("10 modt scores = W (x + cond); mod unchanged (W x); plain unchanged (W (xn + cond))",
+      (s_t - want).abs().max() < 1e-5 and (s_m - torch.nn.functional.linear(x10.reshape(-1, lay_m.dim), lay_m.router.weight)).abs().max() < 1e-5
+      and (s_p - torch.nn.functional.linear((xn10 + c10).reshape(-1, lay_m.dim), lay_m.router.weight)).abs().max() < 1e-5,
+      f"max |diff| {float((s_t - want).abs().max()):.1e}")
+c10r = c10.clone().requires_grad_(True)
+lay_t._scores(x10, None, c10r).sum().backward()
+check("10 modt: the timestep embedding gets a gradient through the router", c10r.grad is not None and float(c10r.grad.abs().sum()) > 0)
 
 print("MOE_TEST " + ("PASS" if OK else "FAIL"), flush=True)
 sys.exit(0 if OK else 1)
