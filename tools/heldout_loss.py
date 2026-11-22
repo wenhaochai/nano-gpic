@@ -44,6 +44,16 @@ held-out negative log-likelihood per dimension, in nats, in v space (v = (x - x_
   gauss_nll_<split>_t[k] = 0.5 log(2 pi e MSE_k), MSE_k = loss_<split>_t[k]: the NLL of the best fixed-variance Gaussian around
   the model's mean (one variance per level, fitted on this data), the point model's counterpart; recorded for both models.
 The NLL lines carry nll = true and go to their own done keys (a line without it is a loss-only line, as before).
+
+ddm (2026-11-22, docs/ddm.md): a run of the distributional denoiser (ImplicitJiTTrainer, xi_mode "cat") is scored by DDM_DRAWS = 4 draws per image and
+level, with the noise of image j drawn from a generator seeded XI_SEED * 1_000_003 + j on the evaluation device, level after level (so it does not depend
+on the batch); every net sees the same draws. Its loss is the squared error of the draws' mean in v space with the draws' variance removed,
+  loss = mean_pixels (v_mean - v)^2 - mean_pixels s^2 / DDM_DRAWS,   s^2 = the draws' unbiased variance per pixel,
+an unbiased estimate of the squared error of the model's own mean, the quantity the point model's loss measures. `work --es` adds, per level, the energy
+score per token (iDDM's local kernel at the model's patch size, beta = 1, lambda = 1, each token's norm its root mean square, as ImplicitJiTTrainer):
+  es_<split>_t[k] = mean over images and tokens of E ||v_draw - v|| - 1/2 E ||v_draw - v_draw'||;
+a point model's es is its single prediction's mean over tokens of ||v_hat - v||, the same score of the distribution that puts all its mass there. Both
+are strictly proper, so a lower es is a better predicted distribution. A ddm run must be scored with --es; the lines carry es = true and own done keys.
 """
 import argparse
 import fcntl
@@ -86,6 +96,7 @@ TRAIN_SHARD = os.path.join(WC, "data/gpic/train/gpic_train_00787.tar")
 TRAIN_EMB = os.path.join(WC, "data/gpic/train_emb_qwen3_1.7b")
 OUT_DIR = os.path.join(WC, "tmp", "heldout_loss")
 NUM_T, SEED, BATCH = 16, 0, 128
+DDM_DRAWS, XI_SEED = 4, 1   # ddm: draws per image and level, and the seed base of their noise (module docstring)
 SPLITS = ("val", "train", "train_reenc")
 IMAGE, PAD_MULTIPLE, TEXT_MAX, EMB_DIM = 256, 8, 320, 2048
 IMAGE_SUFFIXES = ("jpg", "jpeg", "png", "webp")
@@ -274,13 +285,37 @@ def image_noise(seed, j, num_t, shape, out=None):
     return torch.randn((num_t, *shape), generator=g, out=out)
 
 
-def level_loss(net, tr, x, y, y_mask, t, noise, autocast, nll=False):
+def token_rms(d, p):
+    """d: [..., C, H, W] -> [...] the mean over p x p tokens of each token's root mean square (with 1e-8, as ImplicitJiTTrainer)."""
+    *lead, C, H, W = d.shape
+    return d.square().reshape(*lead, C, H // p, p, W // p, p).mean((-5, -3, -1)).add(1e-8).sqrt().mean((-2, -1))
+
+
+def level_loss(net, tr, x, y, y_mask, t, noise, autocast, nll=False, xi=None, es=False, patch=16):
     """Per-image loss at one level t (0-d tensor): FixedValLoss._loss's body, which is JiTTrainer._impl_trainstep's
-    with t and the noise given."""
+    with t and the noise given. ddm (xi given, [B * draws, tokens, xi_dim]): the loss of the draws' mean and the energy score (module docstring);
+    es with a point model: also its energy score. Returns the loss, or (loss, nll) with nll, or (loss, es) with xi or es."""
     t = t.expand(x.shape[0])
     alpha, sigma = tr.scheduler.alpha(t), tr.scheduler.sigma(t)
     x_t = alpha * x + noise * sigma
     v_t = (x - x_t) / (1 - t.view(-1, 1, 1, 1)).clamp_min(tr.t_eps)
+    if xi is not None:
+        B, m = x.shape[0], xi.shape[0] // x.shape[0]
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
+            g = net.forward(x_t, t, y, y_mask=y_mask, m=m, xi=xi)
+        s = (1 - t.view(-1, 1, 1, 1, 1)).clamp_min(tr.t_eps)
+        v = (g.float().view(B, m, *x.shape[1:]) - x_t[:, None]) / s   # the draws in v space
+        vm = v.mean(1)
+        var = (v - vm[:, None]).square().sum(1).mean(dim=(1, 2, 3)) / (m - 1)
+        loss = (tr.loss_weight_fn(alpha, sigma) * (vm - v_t) ** 2).mean(dim=(1, 2, 3)) - var / m
+        i, j = torch.triu_indices(m, m, 1, device=v.device)
+        score = token_rms(v - v_t[:, None], patch).mean(1) - 0.5 * token_rms(v[:, i] - v[:, j], patch).mean(1)
+        return loss, score
+    if es:
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
+            pred = net.forward(x_t, t, y, y_mask=y_mask)
+        out = (pred.float() - x_t) / (1 - t.view(-1, 1, 1, 1)).clamp_min(tr.t_eps)
+        return (tr.loss_weight_fn(alpha, sigma) * (out - v_t) ** 2).mean(dim=(1, 2, 3)), token_rms(out - v_t, patch)
     if not nll:
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
             pred = net.forward(x_t, t, y, y_mask=y_mask)
@@ -345,10 +380,13 @@ def _noise_feed(batches, seed, num_t, shape, threads, pin):
 
 
 @torch.no_grad()
-def evaluate(nets, tr, split, ts, seed=SEED, batch=BATCH, device="cpu", autocast=False, threads=4, log=None, nll=False):
+def evaluate(nets, tr, split, ts, seed=SEED, batch=BATCH, device="cpu", autocast=False, threads=4, log=None, nll=False, es=False, draws=0, xi_dim=0,
+             patch=16):
     """Sums over images of the per-image loss at every level, for every net, on one data split; all nets see the same
     x_t. Returns {name: dict(level_mean [num_t], image_mean [N] (the mean over levels per image))} in float64.
-    nll (a mixture's nets only): also nll_level_mean [num_t] and nll_image_mean [N], the NLL per dimension in v space."""
+    nll (a mixture's nets only): also nll_level_mean [num_t] and nll_image_mean [N], the NLL per dimension in v space.
+    es: also the energy score, in the nll_* entries; draws > 0 (ddm nets): each image's draws at every level, with noise of xi_dim channels per
+    token (module docstring)."""
     N, num_t = len(split["lens"]), len(ts)
     shape = tuple(split["img"].shape[i] for i in (3, 1, 2))
     order = split["order"]
@@ -365,10 +403,15 @@ def evaluate(nets, tr, split, ts, seed=SEED, batch=BATCH, device="cpu", autocast
         it = torch.tensor(idx, device=device)
         x = to_input(split["img"][it])
         y, mask = text_batch(split, idx, device)
+        if draws:   # one generator per image, drawn level after level: the values do not depend on the batch
+            gens = [torch.Generator(device=device).manual_seed(XI_SEED * 1_000_003 + int(j)) for j in idx]
+            n_tok = x.shape[-2] * x.shape[-1] // patch ** 2
         for k in range(num_t):
+            xi = None if not draws else torch.stack([torch.randn((draws, n_tok, xi_dim), generator=g_, device=device) for g_ in gens]).flatten(0, 1)
             for name, net in nets.items():
-                if nll:
-                    l, n = level_loss(net, tr, x, y, mask, ts[k], noise[:, k], autocast, nll=True)
+                if nll or es:
+                    l, n = (level_loss(net, tr, x, y, mask, ts[k], noise[:, k], autocast, xi=xi, es=es, patch=patch) if es else
+                            level_loss(net, tr, x, y, mask, ts[k], noise[:, k], autocast, nll=True))
                     n = n.double()
                     nsums[name][k] += n.sum()
                     nper[name].index_add_(0, it, n)
@@ -380,7 +423,7 @@ def evaluate(nets, tr, split, ts, seed=SEED, batch=BATCH, device="cpu", autocast
         if log and (b + 1) % max(1, len(batches) // 4) == 0:
             log(f"batch {b + 1}/{len(batches)} {time.time() - t0:.0f} s")
     out = {k: dict(level_mean=(sums[k] / N).cpu(), image_mean=(per[k] / num_t).cpu()) for k in nets}
-    if nll:
+    if nll or es:
         for k in nets:
             out[k].update(nll_level_mean=(nsums[k] / N).cpu(), nll_image_mean=(nper[k] / num_t).cpu())
     return out
@@ -416,14 +459,18 @@ def run_config(run_dir):
         den, trn = m["denoiser"], m["diffusion_trainer"]
         assert den["class_path"] == "src.models.transformer.JiT_T2I.JiT_T2I", (c, den["class_path"])
         kw = dict(den["init_args"])
+        ddm = kw.get("xi_mode") == "cat"
         if kw.get("gm_k"):   # gmflow-ladder: the per-pixel mixture, scored by its mean (and with --nll by its NLL)
             assert trn["class_path"] == "src.diffusion.flow_matching.training_gmflow.GMFlowTrainer", (c, trn["class_path"])
             assert kw.get("gm_spread", "image") == "image" and kw.get("gm_scope", "pixel") == "pixel", \
                 f"{c}: gm_spread {kw.get('gm_spread')}, gm_scope {kw.get('gm_scope')}: only the per-pixel mixture with one s_u per image is scored"
+        elif ddm:   # ddm: the distributional denoiser, scored by its draws (module docstring)
+            assert trn["class_path"] == "src.diffusion.flow_matching.training_implicit.ImplicitJiTTrainer", (c, trn["class_path"])
+            assert kw.get("xi_dim") and kw.get("xi_block"), (c, kw.get("xi_dim"), kw.get("xi_block"))
         else:
             assert trn["class_path"] == "src.diffusion.flow_matching.training_JiT.JiTTrainer", (c, trn["class_path"])
-        for k in ("xi_dim", "code_dim", "head_width"):
-            assert not kw.get(k), f"{c}: {k} = {kw.get(k)}: not the point model or the per-pixel mixture"
+        for k in ("code_dim", "head_width") + (() if ddm else ("xi_dim",)):
+            assert not kw.get(k), f"{c}: {k} = {kw.get(k)}: not the point model, the per-pixel mixture or the distributional denoiser"
         ta = trn["init_args"]
         loss = dict(scheduler=ta["scheduler"]["class_path"], loss_weight_fn=ta["loss_weight_fn"],
                     lognorm_t=ta["lognorm_t"], timeshift=ta["timeshift"], P_mean=ta["P_mean"], P_std=ta["P_std"],
@@ -527,12 +574,13 @@ def done_keys(out):
                     except json.JSONDecodeError:   # a writer killed inside its write; that entry is redone
                         print(f"[heldout] {out}: skips an unreadable line: {line[:80]!r}", file=sys.stderr, flush=True)
                         continue
-                    keys.add((r["ckpt"], r["weights"], r["n_val"], r["n_train"], r["num_t"], r["seed"], r["data"], bool(r.get("nll"))))
+                    keys.add((r["ckpt"], r["weights"], r["n_val"], r["n_train"], r["num_t"], r["seed"], r["data"], bool(r.get("nll")), bool(r.get("es"))))
     return keys
 
 
 def todo_weights(spec, done, a, tag):
-    return [w for w, _ in WEIGHTS if (spec["ckpt"], w, a.n_val, a.n_train, NUM_T, SEED, tag, bool(getattr(a, "nll", False))) not in done]
+    return [w for w, _ in WEIGHTS if (spec["ckpt"], w, a.n_val, a.n_train, NUM_T, SEED, tag, bool(getattr(a, "nll", False)), bool(getattr(a, "es", False)))
+            not in done]
 
 
 # Seconds per eager forward of 128 images at T = 56 (bf16 autocast, both nets alike), measured on a vis2 A40 with `bench`
@@ -658,7 +706,11 @@ def run_task(spec, weights, data, a, device):
     autocast = torch.device(device).type == "cuda"
     nll = bool(getattr(a, "nll", False))
     mix = nll and bool(kw.get("gm_k"))   # the point model's NLL is the Gaussian one, from its per-level loss
-    res = {s: evaluate(nets, tr, data[s], ts, SEED, a.batch, device, autocast, a.threads, log=lambda m, s=s: log(f"{s} {m}"), nll=mix)
+    es, ddm = bool(getattr(a, "es", False)), kw.get("xi_mode") == "cat"
+    assert not ddm or (es and not nll), "a ddm run is scored with --es and without --nll (module docstring)"
+    assert not (mix and es), "--es and --nll share the second sum: not both on a mixture"
+    res = {s: evaluate(nets, tr, data[s], ts, SEED, a.batch, device, autocast, a.threads, log=lambda m, s=s: log(f"{s} {m}"), nll=mix, es=es,
+                       draws=DDM_DRAWS if ddm else 0, xi_dim=kw.get("xi_dim") or 0, patch=kw["patch_size"] if es else 16)
            for s in a.splits}
     elapsed = time.time() - t0
     gpu = torch.cuda.get_device_name(device) if autocast else "cpu"
@@ -666,7 +718,8 @@ def run_task(spec, weights, data, a, device):
     for w in weights:
         r = dict(spec)
         r.pop("est_min", None)
-        r.update(weights=w, n_val=a.n_val, n_train=a.n_train, num_t=NUM_T, seed=SEED, data=data["tag"], nll=nll, gm_k=int(kw.get("gm_k") or 0),
+        r.update(weights=w, n_val=a.n_val, n_train=a.n_train, num_t=NUM_T, seed=SEED, data=data["tag"], nll=nll, gm_k=int(kw.get("gm_k") or 0), es=es,
+                 ddm=ddm, draws=DDM_DRAWS if ddm else 1,
                  train_shard=os.path.basename(data["train_shard"]), t=ts.tolist(),
                  d=kw["hidden_size"], nb=kw["num_blocks"], nt=kw["num_text_blocks"])
         for s in a.splits:
@@ -683,6 +736,11 @@ def run_task(spec, weights, data, a, device):
                     r[f"nll_{s}_t"] = nl.tolist()
                     r[f"nll_{s}"] = float(nl.mean())
                     r[f"nll_{s}_se"] = float(ni.std() / math.sqrt(len(ni)))
+            if es:
+                el, ei = (res[s]["raw" if one_pass else w][k] for k in ("nll_level_mean", "nll_image_mean"))
+                r[f"es_{s}_t"] = el.tolist()
+                r[f"es_{s}"] = float(el.mean())
+                r[f"es_{s}_se"] = float(ei.std() / math.sqrt(len(ei)))
         r.update(elapsed_s=round(elapsed, 1), load_s=round(load_s, 1), weights_in_task=list(weights), one_pass=one_pass, gpu=gpu,
                  compiled=compiled,
                  host=socket.gethostname(), job=os.environ.get("FETCHED_JOB_ID") or os.environ.get("SLURM_JOB_ID", ""),
@@ -790,6 +848,7 @@ def main(argv=None):
             p.add_argument("--splits", default="val,train", help="comma-separated, of " + ",".join(SPLITS))
         if name in ("list", "work"):
             p.add_argument("--nll", action="store_true", help="gmflow-ladder: also the NLL per dimension per level (module docstring)")
+            p.add_argument("--es", action="store_true", help="ddm: also the energy score per level; required for a ddm run (module docstring)")
         if name == "bench":
             for k, v in (("d", 1792), ("nb", 18), ("nt", 4), ("T", 56), ("iters", 10), ("gpu", 0), ("batch", BATCH)):
                 p.add_argument(f"--{k}", type=int, default=v)

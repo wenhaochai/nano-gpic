@@ -1,5 +1,6 @@
 # Shared by jobs/eval_heldout_loss.sh and jobs/smoke_heldout_loss.sh (sourced, after env.sh and PYTHONPATH).
 # gmflow-ladder: HELDOUT_NLL (any non-empty value) passes --nll to list and work (tools/heldout_loss.py: the NLL per dimension per level; its own done keys).
+# ddm: HELDOUT_ES (any non-empty value) passes --es to list and work (the energy score per level; required for a ddm run; its own done keys).
 # heldout_run <out.jsonl> <n_val> <n_train> <gpus> [checkpoints...]: prep the data if missing (GPU 0, about 2 min),
 # list the tasks (all ladders, or the given checkpoints), run one worker per GPU on a shared counter, then list again:
 # returns 0 only if no task is left.
@@ -14,7 +15,7 @@ _heldout_pass() {   # <pass> <tasks.jsonl>: one worker per GPU on a shared count
   rm -f $work/counter
   for ((i = 0; i < ng; i++)); do
     python $tool work --out $out --data $data --n-val $nv --n-train $nt --tasks $tasks --counter $work/counter \
-      --gpu $i --threads 8 ${HELDOUT_SPLITS:+--splits $HELDOUT_SPLITS} ${HELDOUT_NLL:+--nll} > $work/gpu$i$sfx.log 2>&1 &
+      --gpu $i --threads 8 ${HELDOUT_SPLITS:+--splits $HELDOUT_SPLITS} ${HELDOUT_NLL:+--nll} ${HELDOUT_ES:+--es} > $work/gpu$i$sfx.log 2>&1 &
     pids+=($!)
   done
   for i in "${!pids[@]}"; do wait ${pids[$i]} || { echo "[heldout] worker $i exit $? (log $work/gpu$i$sfx.log)"; rc=1; }; done
@@ -34,7 +35,7 @@ heldout_run() {
   local ck=("${all[@]}") rc=0 pass n sk=()
   : > $work/tasks.jsonl
   for pass in 1 2; do
-    python $tool list ${HELDOUT_NLL:+--nll} --out $out --data $data --n-val $nv --n-train $nt --skipped $work/skipped.txt "${ck[@]}" > $work/tasks$pass.jsonl
+    python $tool list ${HELDOUT_NLL:+--nll} ${HELDOUT_ES:+--es} --out $out --data $data --n-val $nv --n-train $nt --skipped $work/skipped.txt "${ck[@]}" > $work/tasks$pass.jsonl
     cat $work/tasks$pass.jsonl >> $work/tasks.jsonl
     n=$(wc -l < $work/tasks$pass.jsonl)
     mapfile -t sk < $work/skipped.txt
@@ -45,7 +46,7 @@ heldout_run() {
   done
   printf '%s\n' "${sk[@]}" > $work/skipped.txt
   # what this job was to score and still lacks a line: its tasks, and the checkpoints it left out as still being written
-  local left=$(python $tool list ${HELDOUT_NLL:+--nll} --out $out --data $data --n-val $nv --n-train $nt --min-age 0 "${all[@]}" 2>/dev/null \
+  local left=$(python $tool list ${HELDOUT_NLL:+--nll} ${HELDOUT_ES:+--es} --out $out --data $data --n-val $nv --n-train $nt --min-age 0 "${all[@]}" 2>/dev/null \
     | python -c "
 import json, sys
 mine = {json.loads(l)['ckpt'] for l in open('$work/tasks.jsonl')} | {l.strip() for l in open('$work/skipped.txt') if l.strip()}

@@ -120,25 +120,31 @@ class Attention(nn.Module):
             qkv_bias: bool = False,
             attn_drop: float = 0.,
             proj_drop: float = 0.,
+            in_dim: int = 0,
     ) -> None:
+        """in_dim > dim (ddm, xi_mode "cat"): the image tokens' residual stream is in_dim wide; q, k, v, the attention and
+        the output projection's input stay dim wide (iDDM's fixed inner width, arXiv 2609.37147 App. E.1). The caption
+        tokens stay dim wide. in_dim = 0 is the official block, unchanged."""
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
 
         self.dim = dim
+        in_dim = in_dim or dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.qkv_x = nn.Linear(dim, dim*3, bias=qkv_bias)
+        self.qkv_x = nn.Linear(in_dim, dim*3, bias=qkv_bias)
         self.kv_y = nn.Linear(dim, dim*2, bias=qkv_bias)
 
         self.q_norm = Norm(self.head_dim)
         self.k_norm = Norm(self.head_dim)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, in_dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x: torch.Tensor, y, pos, mask=None) -> torch.Tensor:
-        B, N, C = x.shape
+        B, N, _ = x.shape
+        C = self.dim   # the inner width (x.shape[-1] in the official block, where the two are equal)
         if isinstance(mask, dict):   # lever E: packed captions, y [S, C]
             H, Hc, Tp = self.num_heads, C // self.num_heads, mask["kmask"].shape[1]
             q, kx, vx = self.qkv_x(x).view(B, N, 3, H, Hc).unbind(2)
@@ -184,15 +190,20 @@ class Attention(nn.Module):
         return x
 
 class FlattenDiTBlock(nn.Module):
-    def __init__(self, hidden_size, groups,  mlp_ratio=4, ):
+    def __init__(self, hidden_size, groups,  mlp_ratio=4, extra=0):
+        """extra > 0 (ddm, xi_mode "cat"): the residual stream is hidden_size + extra wide (the particle noise rides in the last
+        extra channels); the norms, the modulation and the projections in and out of attention and the MLP follow that width,
+        while attention and the MLP's hidden layer keep the official widths (iDDM's fixed inner width). extra = 0 is the
+        official block, unchanged."""
         super().__init__()
-        self.norm1 = Norm(hidden_size, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=groups, qkv_bias=False)
-        self.norm2 = Norm(hidden_size, eps=1e-6)
+        width = hidden_size + extra
+        self.norm1 = Norm(width, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=groups, qkv_bias=False, in_dim=width)
+        self.norm2 = Norm(width, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = FeedForward(hidden_size, mlp_hidden_dim)
+        self.mlp = FeedForward(width, mlp_hidden_dim)
         self.adaLN_modulation = nn.Sequential(
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            nn.Linear(hidden_size, 6 * width, bias=True)
         )
 
     def forward(self, x, y, c, pos, mask=None):
@@ -447,6 +458,7 @@ class JiT_T2I(nn.Module):
             gm_k=0,
             gm_spread="image",
             gm_scope="pixel",
+            xi_mode="add",
     ):
         """xi_dim > 0 makes the model an implicit sampler of p(x | x_t, y) (docs/distribution_step.md): before block xi_block the batch
         forks into m copies, and each copy gets its own noise. xi_dim = 0 is the official point model, unchanged.
@@ -461,12 +473,19 @@ class JiT_T2I(nn.Module):
         K components of a pixel. "image" is the model before this option, unchanged.
         gm_scope (gm_k > 0 only, docs/gmflow.md section 15, owner 2026-11-06): "pixel" = K weights per pixel, the model before this option, unchanged; "image" = one
         mixture per image: the K per-pixel logits are averaged over the image before the softmax, so each image has one set of K weights (no new parameter), and
-        the K means are K whole candidate images. Needs gm_spread "image"."""
+        the K means are K whole candidate images. Needs gm_spread "image".
+        xi_mode (xi_dim > 0 only; ddm, docs/ddm.md): "add" = the implicit sampler above, unchanged; "cat" = iDDM's injection (arXiv 2609.37147,
+        section 3.1 and App. E): after the fork each sample appends its own noise xi, xi_dim channels per token drawn from N(0, I), scaled
+        by a gate 1 + W c (W zero at init, c = the blocks' conditioning input) to the residual stream; blocks xi_block.. run at width
+        hidden_size + xi_dim with their attention and MLP at the official inner widths, and the final layer reads the first hidden_size
+        channels."""
         super().__init__()
         assert not (head_width and xi_dim), "the energy head and the implicit fork are two different models"
         assert not (gm_k and (head_width or xi_dim or code_dim)), "the GMFlow head is a model of its own"
         assert gm_spread in ("image", "pixel") and (gm_spread == "image" or gm_k), (gm_spread, gm_k)
         assert gm_scope in ("pixel", "image") and (gm_scope == "pixel" or (gm_k and gm_spread == "image")), (gm_scope, gm_k, gm_spread)
+        assert xi_mode in ("add", "cat") and (xi_mode == "add" or (xi_dim and 0 < xi_block < num_blocks)), (xi_mode, xi_dim, xi_block)
+        self.xi_mode = xi_mode
         self.gm_k = gm_k
         self.gm_spread = gm_spread
         self.gm_scope = gm_scope
@@ -496,7 +515,8 @@ class JiT_T2I(nn.Module):
         )
 
         self.blocks = nn.ModuleList([
-            FlattenDiTBlock(self.hidden_size, self.num_groups) for _ in range(self.num_blocks)
+            FlattenDiTBlock(self.hidden_size, self.num_groups, extra=xi_dim if xi_mode == "cat" and i >= xi_block else 0)
+            for i in range(self.num_blocks)
         ])
         
         self.text_refine_blocks = nn.ModuleList([
@@ -510,7 +530,9 @@ class JiT_T2I(nn.Module):
             self.gm_logstd = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 1024), nn.SiLU(), nn.Linear(1024, 1))
         else:
             self.final_layer = FinalLayer(self.hidden_size, in_channels*patch_size**2)
-        if xi_dim:
+        if xi_dim and xi_mode == "cat":
+            self.xi_gate = nn.Linear(hidden_size, xi_dim)     # iDDM's t-adaptive gate (their eq. 24): xi * (1 + W c), zero at init
+        elif xi_dim:
             self.xi_global = nn.Linear(xi_dim, hidden_size)   # one noise vector per sample, through the blocks' conditioning: the whole image
             self.xi_token = nn.Linear(xi_dim, hidden_size)    # one noise vector per token: local detail
         if code_dim:
@@ -593,7 +615,10 @@ class JiT_T2I(nn.Module):
             for layer in (self.final_layer.xi_global, self.final_layer.xi_token):
                 nn.init.normal_(layer.weight, std=0.02)
                 nn.init.constant_(layer.bias, 0)
-        if self.xi_dim:   # small, not zero: with zero the samples start equal, and the energy score's repulsion has no direction
+        if self.xi_dim and self.xi_mode == "cat":   # the gate starts at 1 (iDDM App. E)
+            nn.init.constant_(self.xi_gate.weight, 0)
+            nn.init.constant_(self.xi_gate.bias, 0)
+        elif self.xi_dim:   # small, not zero: with zero the samples start equal, and the energy score's repulsion has no direction
             for layer in (self.xi_global, self.xi_token):
                 nn.init.normal_(layer.weight, std=0.02)
                 nn.init.constant_(layer.bias, 0)
@@ -650,13 +675,15 @@ class JiT_T2I(nn.Module):
         means, logits = x.split([K * C, K], dim=1)
         return means.reshape(B, K, C, H, W), logits.reshape(B, K, 1, H, W)
 
-    def forward(self, x, t, y, return_layer=None, y_mask=None, y_pack=None, m=1, z=None, gm_mode="mean"):
+    def forward(self, x, t, y, return_layer=None, y_mask=None, y_pack=None, m=1, z=None, gm_mode="mean", xi=None):
         """y_mask (ladder option B): [B, T] bool, True = a real caption token, T <= txt_max_length; None = the
         official unmasked path (y padded to txt_max_length). y_pack (lever E): packed captions, y [S, txt_embed_dim]. m: samples per input of the implicit sampler; the
         output is [B * m, C, H, W], each input's samples next to each other. z: plan A's code, [B, code_dim].
         gm_mode (gm_k > 0 only): "mean" returns the mixture mean sum_k A_k mu_k as the x prediction, so the point model's samplers run on it unchanged;
         "full" returns dict(means (B, K, C, H, W), logweights (B, K, 1, H, W), log-softmax over K, fp32, logstd (B, 1, 1, 1, 1) = log s_u, fp32; (B, 1, 1, H, W) with gm_spread "pixel").
-        With gm_scope "image", logweights is (B, K, 1, 1, 1): one set of weights per image."""
+        With gm_scope "image", logweights is (B, K, 1, 1, 1): one set of weights per image.
+        xi (xi_mode "cat" only): the samples' noise, [B * m, tokens, xi_dim], each input's samples next to each other; None draws it.
+        It lets a caller fix the noise (the held-out tool draws it from a seeded CPU generator)."""
         B, _, H, W = x.shape
         if _PATCHIFY:
             x = patchify(x, self.patch_size)
@@ -702,12 +729,20 @@ class JiT_T2I(nn.Module):
             if self.xi_dim and i == self.xi_block:   # the blocks before this one run once per input
                 x, y, condition = x.repeat_interleave(m, 0), y.repeat_interleave(m, 0), condition.repeat_interleave(m, 0)
                 full_mask = None if full_mask is None else full_mask.repeat_interleave(m, 0)
-                x = x + self.xi_token(torch.randn(x.shape[0], x.shape[1], self.xi_dim, device=x.device, dtype=x.dtype))
-                condition = condition + self.xi_global(torch.randn(x.shape[0], 1, self.xi_dim, device=x.device, dtype=x.dtype))
+                if self.xi_mode == "cat":
+                    if xi is None:
+                        xi = torch.randn(x.shape[0], x.shape[1], self.xi_dim, device=x.device, dtype=x.dtype)
+                    assert xi.shape == (x.shape[0], x.shape[1], self.xi_dim), (tuple(xi.shape), x.shape[0], x.shape[1], self.xi_dim)
+                    x = torch.cat([x, xi.to(x.dtype) * (1 + self.xi_gate(condition)).to(x.dtype)], dim=-1)
+                else:
+                    x = x + self.xi_token(torch.randn(x.shape[0], x.shape[1], self.xi_dim, device=x.device, dtype=x.dtype))
+                    condition = condition + self.xi_global(torch.randn(x.shape[0], 1, self.xi_dim, device=x.device, dtype=x.dtype))
             if return_layer is not None and i==return_layer:
                 feat = x
             x = block(x, y, condition, xpos) if full_mask is None else block(x, y, condition, xpos, full_mask)
-            
+        if self.xi_dim and self.xi_mode == "cat":   # the output is read from the first hidden_size channels (iDDM eq. 25)
+            x = x[..., :self.hidden_size]
+
         spread = None
         if self.gm_k and self.gm_spread == "pixel" and gm_mode == "full":   # FinalLayer has no adaLN: its linear's input is norm_final(x)
             h = self.final_layer.norm_final(x)

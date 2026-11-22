@@ -9,7 +9,9 @@
 #FETCHABLE
 # GPIC evaluation of one GMFlow checkpoint (docs/gmflow.md) with one sampler at one number of network calls: 50K test captions, the official noise (EVAL_NOISE below), EMA net, no CFG, FD-DINOv2 / PRDC / MMD
 # (the protocol of jobs/eval_energy.sh). K = 0 evaluates the point model w1147 (runs/gpic-speed/point_nodrop_d640) with the same samplers.
-# usage: eval_gmflow.sh <K: 0 or the run's K> <step> <sampler: gm_sde | gm_sde_final_mean | gm_draw | gm_ode | gm_sde2 | gm_ode2 | gm_ode_cal | euler_mean | euler> <calls>
+# usage: eval_gmflow.sh <K: 0 or the run's K> <step> <sampler: gm_sde | gm_sde_final_mean | gm_draw | gm_ode | gm_sde2 | gm_ode2 | gm_ode_cal | euler_mean | euler | ddm> <calls>
+#   ddm (K = 0; docs/ddm.md): the distributional denoiser (configs_h100/ddm_sample.yaml), one fresh noise per call and the straight step along the drawn
+#   sample; the run's last 2 blocks are the per-sample ones (xi_block = nb - 2, jobs/train_ddm_ladder.sh).
 #   gm_sde: GM-SDE, first order, the last step returns a draw (for K = 0: DDPM with the small variance). gm_sde_final_mean: the last step returns the mixture mean.
 #   gm_draw: the owner's sampler (docs/gmflow.md section 14): one draw per pixel from the mixture at every call, the straight step along its velocity, no fresh noise (for K = 0: the exact one step).
 #   gm_ode: GM-ODE, first order, ceil(128 / calls) analytic sub-steps per call (3 at 50, 16 at 8). euler_mean / euler: the official Euler on the mixture mean (for K = 0: the official Euler).
@@ -75,6 +77,7 @@ case $SAMPLER in
   gm_sde2) SARGS=(--config configs_h100/gmflow_sde_sample.yaml --model.diffusion_sampler.init_args.order 2) ;;
   gm_ode2) SARGS=(--config configs_h100/gmflow_ode_sample.yaml --model.diffusion_sampler.init_args.substeps $SUBSTEPS --model.diffusion_sampler.init_args.order 2) ;;
   euler_mean|euler) SARGS=(--config configs_h100/gmflow_euler_sample.yaml) ;;
+  ddm) SARGS=(--config configs_h100/ddm_sample.yaml --model.denoiser.init_args.xi_block $((NB - 2))) ;;
   gm_ode_cal)
     [ $K -eq 0 ] || { echo "gm_ode_cal is for a point model (K = 0); use gm_ode"; exit 2; }
     [ -f "${EVAL_SPREAD_TABLE:-}" ] || { echo "gm_ode_cal needs EVAL_SPREAD_TABLE=<table.json>"; exit 2; }
@@ -84,7 +87,8 @@ case $SAMPLER in
            --model.diffusion_sampler.init_args.spread_table "$TABLE") ;;
   *) echo "unknown sampler $SAMPLER"; exit 2 ;;
 esac
-case $K:$SAMPLER in 0:gm_ode|0:gm_sde_final_mean|0:gm_sde2|0:gm_ode2) echo "$SAMPLER needs a mixture (K > 0)"; exit 2 ;; esac   # order 2 on a point model is order 1
+case $K:$SAMPLER in 0:gm_ode|0:gm_sde_final_mean|0:gm_sde2|0:gm_ode2) echo "$SAMPLER needs a mixture (K > 0)"; exit 2 ;; esac
+if [ $K -gt 0 ] && [ $SAMPLER = ddm ]; then echo "ddm is the distributional denoiser: K = 0"; exit 2; fi   # order 2 on a point model is order 1
 if [ $K -gt 0 ] && [ $SAMPLER = euler ]; then echo "use euler_mean for K > 0"; exit 2; fi
 [ -f "$WT/baselines/PixelGen/src/diffusion/flow_matching/sampling_gmflow.py" ] || { echo "$WT holds old code"; exit 2; }
 if [ $SPREAD = pixel ] || [ ${SAMPLER%2} != $SAMPLER ]; then
@@ -110,11 +114,11 @@ if [ $SAMPLER = gm_ode_cal ]; then   # the table belongs to this checkpoint and 
   python -m src.diffusion.flow_matching.gm_spread check "$TABLE" $STEP $CALLS || exit 2
 fi
 # the checkpoint loads with strict=False, so a wrong head or size would give a wrong FD and no error
-python - "$CKPT" $K $WD $NB $NT $SPREAD <<'PY'
+python - "$CKPT" $K $WD $NB $NT $SPREAD $SAMPLER <<'PY'
 import re, sys, torch
 sd = torch.load(sys.argv[1], map_location="cpu", mmap=True, weights_only=False)["state_dict"]
 k, d, nb, nt = map(int, sys.argv[2:6])
-spread = sys.argv[6]
+spread, sampler = sys.argv[6], sys.argv[7]
 out = sd["ema_denoiser.final_layer.linear.weight"].shape[0]
 n = lambda part: len({m.group(1) for key in sd for m in [re.match(rf"ema_denoiser\.{part}\.(\d+)\.", key)] if m})
 got = (sd["ema_denoiser.y_pos_embedding"].shape[-1], n("blocks"), n("text_refine_blocks"))
@@ -122,6 +126,11 @@ assert got == (d, nb, nt), f"checkpoint has d, nb, nt = {got}, arguments {(d, nb
 assert out == (k * 4 * 256 if k else 768), f"final layer has {out} outputs, K = {k}"
 assert any(n.startswith("ema_denoiser.gm_logstd") for n in sd) == (k > 0), "s-MLP presence does not match K"
 assert ("ema_denoiser.gm_spread_head.weight" in sd) == (spread == "pixel"), f"per-pixel offset head presence does not match EVAL_SPREAD={spread}"
+assert ("ema_denoiser.xi_gate.weight" in sd) == (sampler == "ddm"), f"the noise gate's presence does not match the sampler {sampler}"
+if sampler == "ddm":   # 256 noise channels in the last 2 blocks (configs_h100/ddm_sample.yaml, xi_block = nb - 2)
+    assert sd["ema_denoiser.xi_gate.weight"].shape == (256, d), sd["ema_denoiser.xi_gate.weight"].shape
+    widths = [sd[f"ema_denoiser.blocks.{i}.norm1.weight"].shape[0] for i in range(nb)]
+    assert widths == [d] * (nb - 2) + [d + 256] * 2, widths
 PY
 mkdir -p $OUT
 echo "ckpt=$CKPT code=$(git -C $WT rev-parse HEAD) K=$K spread=$SPREAD scope=$SCOPE sampler=$SAMPLER calls=$CALLS substeps=$SUBSTEPS noise=$NOISE" | tee $OUT/ckpt.txt

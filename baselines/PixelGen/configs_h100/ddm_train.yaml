@@ -1,0 +1,27 @@
+# Overlay on lite_ladder.yaml (+ muon_ladder.yaml): the distributional denoiser (docs/ddm.md), iDDM's recipe (arXiv 2609.37147, Tables 5 and 1, config F) on the
+# final ladder: the batch forks into 4 samples before the last 2 blocks (jobs/train_ddm_ladder.sh sets xi_block = num_blocks - 2), each sample appends 256
+# noise channels per token through iDDM's t-adaptive gate (fixed inner width), and the loss is the generalized energy score per token (local kernel) with
+# iDDM's linear schedules lambda(t) = 1 - t, beta(t) = 2 - 1.9 (1 - t). The time sampler, noise and no caption dropout are the point model's (lite_ladder.yaml).
+model:
+  denoiser:
+    init_args:
+      xi_mode: cat
+      xi_dim: 256
+      xi_block: 8
+  diffusion_trainer:
+    class_path: src.diffusion.flow_matching.training_implicit.ImplicitJiTTrainer
+    init_args:
+      scheduler:
+        class_path: src.diffusion.flow_matching.scheduling.LinearScheduler
+      loss_weight_fn: src.diffusion.flow_matching.training_JiT.constant
+      lognorm_t: true
+      timeshift: 1.0
+      P_mean: -0.8
+      P_std: 0.8
+      t_eps: 0.05
+      null_condition_p: 0.0   # owner 2026-11-04: no CFG, so no caption dropout
+      samples: 4
+      beta: 0.1
+      lam: 1.0
+      kernel_patch: 16
+      schedule: linear
