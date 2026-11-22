@@ -82,7 +82,11 @@ def sub(b):
     b = NODE.sub(rb"node-\1", b)
     return b.replace(b"H100", b"H100").replace(b"H100", b"H100").replace(b"h100", b"h100")
 '
-"$FR" --force --refs "${REFS[@]}" --invert-paths --path CONTRIBUTING.md --path .github/ --message-callback "$SUB
+# Pull requests (since 2026-11-18) add the owner's GitHub identities: the web merge commits are committed by "GitHub <noreply@github.com>" and authored
+# with the account's capitalized address. The mailmap writes both as the owner, so the check below stays exact (owner 2026-11-07: no other people).
+MM=$T/mailmap
+printf '%s\n' 'Wenhao Chai <USER@gmail.com> <ReselfChai@Gmail.com>' 'Wenhao Chai <USER@gmail.com> GitHub <noreply@github.com>' > $MM
+"$FR" --force --refs "${REFS[@]}" --mailmap $MM --invert-paths --path CONTRIBUTING.md --path .github/ --message-callback "$SUB
 m = sub(message).replace(b'; links moved to the rewritten public hashes', b'')
 if m.startswith(b'publish_public: the GPIC release'):   # the owner's quotes stay private (owner 2026-11-07)
     m = b'publish_public: the code release as one import commit; refuse any author or committer other than the owner' + m[m.index(b'\n'):]
