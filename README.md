@@ -4,9 +4,9 @@
 
 The code of the post [How to Scale Text-to-image Models: a Handbook](https://wenhaochai.com/blogs/scaling-generative-models-101.html). It trains a compute ladder of PixelGen's JiT-T2I on [GPIC](https://gpic.stanford.edu) (100M text-image pairs) with 8 NVIDIA H100 GPUs per model, scores each model by its held-out loss, and fits one scaling law to 38 runs from 3.6e18 to 2.3e20 FLOPs.
 
-Every run of the post, with its training logs and the commit it ran on, is on the [experiment page](https://wenhaochai.com/exps/gpic-speed.html); the logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed). This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026), whose model and trainer come from [PixelGen](https://github.com/Zehong-Ma/PixelGen) (Ma et al.); the parts of both that the ladder does not use are left out.
+Every run of the post, with its training logs and the commit it ran on, is on the [experiment page](https://wenhaochai.com/exps/gpic-speed.html); the logs are in [W&B reself/gpic-speed](https://wandb.ai/reself/gpic-speed). The weights of all twelve models, the final ladder and the five larger runs below, are on Hugging Face at [wchai/gpic-ladder](https://huggingface.co/wchai/gpic-ladder): the raw weights at the last step (the recipe uses no EMA) with each network's config. This is a fork of the GPIC code release ([keshik6/gpic](https://github.com/keshik6/gpic); Chandrasegaran, Sargent et al., 2026), whose model and trainer come from [PixelGen](https://github.com/Zehong-Ma/PixelGen) (Ma et al.); the parts of both that the ladder does not use are left out.
 
-*Updated 2026-11-17.*
+*Updated 2026-11-27.*
 
 ## The final ladder
 
@@ -28,6 +28,7 @@ One model per budget: the run with the lowest held-out loss at that budget in th
 | GPU-hours (H100) | 3.8 | 6.8 | 11.7 | 22.5 | 40.4 | 76.5 | 150 |
 | Held-out loss | 0.06788 | 0.06707 | 0.06628 | 0.06558 | 0.06487 | 0.06416 | 0.06351 |
 | FD-DINOv2 | 949.8 | 828.5 | 673.3 | 534.8 | 443.5 | 373.5 | 325.3 |
+| Weights | [d10](https://huggingface.co/wchai/gpic-ladder/tree/main/d10) | [d11](https://huggingface.co/wchai/gpic-ladder/tree/main/d11) | [d12](https://huggingface.co/wchai/gpic-ladder/tree/main/d12) | [d13](https://huggingface.co/wchai/gpic-ladder/tree/main/d13) | [d14](https://huggingface.co/wchai/gpic-ladder/tree/main/d14) | [d16](https://huggingface.co/wchai/gpic-ladder/tree/main/d16) | [d18](https://huggingface.co/wchai/gpic-ladder/tree/main/d18) |
 
 The recipe, the same at every size:
 
@@ -88,6 +89,46 @@ The held-out loss of the final ladder falls from 0.06788 at 3.6e18 FLOPs (d10) t
 L(N, D) = E + (A / N^α + B / D^β)^k, with E = 0.0457, A = 5.31e-5, B = 3.83e-4, α = 0.52, β = 0.52, k = 0.20.
 
 The best model grows as N\* ∝ C^0.50 [0.49, 0.52] and its data as D\* ∝ C^0.50, at 50 to 51 image tokens per image parameter. Fitted to the 34 runs up to 1.1e20 FLOPs, the formula predicted the four runs at 2.3e20 FLOPs within 0.05%. Extrapolated to 1e21 FLOPs, the optimum is about 1.8B image parameters and 92B image tokens; there the recipe gives a Muon learning rate of 8.1e-4, an AdamW learning rate of 1.1e-4 and a Muon weight decay of 0.0175 (about the same at every budget). `python tools/fit/scaling_law.py` prints these values for each budget.
+
+## Past the fitted range
+
+Five more models, trained with the same recipe at budgets past the 38 runs of the fit (up to 2.3e20 FLOPs): three sizes at 4.7e20, d22 at 9.5e20 and d24 at 1.9e21. The scaling law predicts each held-out loss within 0.2%.
+
+| Model | d18-4.7e20 | d20-4.7e20 | d22-4.7e20 | d22-9.5e20 | d24-1.9e21 |
+|---|---|---|---|---|---|
+| Compute (FLOPs) | 4.7e20 | 4.7e20 | 4.7e20 | 9.5e20 | 1.9e21 |
+| Width | 1792 | 2048 | 2304 | 2304 | 2560 |
+| Image layers | 18 | 20 | 22 | 22 | 24 |
+| Text layers | 4 | 4 | 5 | 5 | 5 |
+| Image parameters | 1040M | 1510M | 2102M | 2102M | 2831M |
+| All parameters | 1.68B | 2.40B | 3.40B | 3.40B | 4.51B |
+| Steps | 287,744 | 199,680 | 143,040 | 286,144 | 427,200 |
+| Training images | 295M | 204M | 146M | 293M | 437M |
+| Muon learning rate | 1.20e-3 | 1.20e-3 | 1.20e-3 | 8.50e-4 | 6.01e-4 |
+| AdamW learning rate | 1.44e-4 | 1.18e-4 | 9.77e-5 | 9.77e-5 | 8.37e-5 |
+| Muon weight decay | 0.0145 | 0.0208 | 0.0291 | 0.0206 | 0.0195 |
+| Held-out loss | 0.06285 | 0.06286 | 0.06299 | 0.06223 | 0.06154 |
+| Law | 0.06287 | 0.06287 | 0.06298 | 0.06225 | 0.06165 |
+| FD-DINOv2 | 255.7 | 287.0 | 298.9 | 234.8 | 193.8 |
+| Weights | [d18-4.7e20](https://huggingface.co/wchai/gpic-ladder/tree/main/d18-4.7e20) | [d20-4.7e20](https://huggingface.co/wchai/gpic-ladder/tree/main/d20-4.7e20) | [d22-4.7e20](https://huggingface.co/wchai/gpic-ladder/tree/main/d22-4.7e20) | [d22-9.5e20](https://huggingface.co/wchai/gpic-ladder/tree/main/d22-9.5e20) | [d24-1.9e21](https://huggingface.co/wchai/gpic-ladder/tree/main/d24-1.9e21) |
+
+Law is the held-out loss the fitted formula gives for each model's N and D.
+
+## Loading the weights
+
+Each folder of [wchai/gpic-ladder](https://huggingface.co/wchai/gpic-ladder) holds `model.safetensors` (fp32) and `config.yaml` (the network's arguments, the run's recipe and its scores). From `baselines/PixelGen`:
+
+```python
+import yaml
+from safetensors.torch import load_file
+from src.models.transformer.JiT_T2I import JiT_T2I
+
+cfg = yaml.safe_load(open("d18/config.yaml"))
+net = JiT_T2I(**cfg["denoiser"]["init_args"])
+net.load_state_dict(load_file("d18/model.safetensors"))
+```
+
+Download one folder with `hf download wchai/gpic-ladder --include "d18/*" --local-dir .`. Caption features come from `tools/encode_captions.py`; sampling and scoring from `jobs/eval_final_ladder.sh`.
 
 ## How the ladder was built
 
